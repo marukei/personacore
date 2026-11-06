@@ -102,7 +102,11 @@ pull request 的運作方式、commit 訊息的撰寫方式，以及如何記錄
 
 `MIT OR Apache-2.0 OR LicenseRef-ACCRL-0.3`
 
-personacore 可由你自行選擇，依 MIT License（LICENSE-MIT）、Apache License, Version 2.0（LICENSE-APACHE），或 AI Collective Creativity Respect License (ACCRL) v0.3-PROTOTYPE（LICENSE-ACCRL.md）取得授權。
+下列段落照錄 LICENSE 的英文原文，不另行翻譯，以免與作者簽署的文字產生出入：
+
+personacore is available under your choice of the MIT License (LICENSE-MIT),
+the Apache License, Version 2.0 (LICENSE-APACHE), or the AI Collective Creativity
+Respect License (ACCRL) v0.3-PROTOTYPE (LICENSE-ACCRL.md).
 
 - MIT License（[LICENSE-MIT](LICENSE-MIT)）
 - Apache License, Version 2.0（[LICENSE-APACHE](LICENSE-APACHE)）
