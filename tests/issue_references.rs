@@ -11,13 +11,6 @@
 //!
 //! - **リンクされた**: 行頭・空白の後・`（` `、` `「` `〜` の後・漢字の直後（`作業単位#31`）・`~~` `**` の中・
 //!   `/` `.` `-` `=` `:` `"` `(` の後・`owner/repo#31`。
-//!
-//! `owner/repo#N` は拾う（改名や移転の後に指す先が変わりうるし、origin を指すものは公開側で辿れない）。
-//! ただし**公開側の `marukei/personacore#N` だけは通す**（[`PUBLIC_REPO`]）—— O-6 の後は名前が変わらず、
-//! どこで描画しても（origin の中でも）公開側を指すため。決まりは ADR-0048 の追記 決定5・CLAUDE.md §4「公開の後の運用」。
-//! 比較は `owner` と `repo` の完全一致（大文字小文字も区別）で、`Marukei/Personacore`・`xmarukei/personacore`・
-//! `marukei/personacore.git`・`marukei/personacore-origin` などは安全側に倒して拾う。通すのはその直後の `#数字` だけで、
-//! 同じ行の他の参照は拾う。
 //! - **リンクされなかった**: 英数字と `_` の直後（`abc#31` / `_#31` / `origin#31`）・数字の直後に英字（`#31a`）・
 //!   `&#31;`（文字参照。**セミコロンで閉じたときだけ**で、`&#31 x` はリンクされる）・コードスパンの中・`#31の`（直後が日本語）・`#666`（その番号の Issue が無い）。
 //!
@@ -25,6 +18,13 @@
 //! すべて拾う（直後が日本語のもの、コードスパンの中のもの、いま Issue が無い番号も拾う —— 追跡ファイルは
 //! Issue や PR の本文へ写されうるし、番号はいつか埋まる）。
 //! Rust の属性（`#[`）・Markdown の見出し（`# `）・`#fff` のような英字で始まる色は、`#` の直後が数字でないので当たらない。
+//!
+//! `owner/repo#N` は拾う（改名や移転の後に指す先が変わりうるし、origin を指すものは公開側で辿れない）。
+//! ただし**公開側の `marukei/personacore#N` だけは通す**（[`PUBLIC_REPO`]）—— O-6 の後は名前が変わらず、
+//! どこで描画しても（origin の中でも）公開側を指すため。決まりは ADR-0048 の追記 決定5・CLAUDE.md §4「公開の後の運用」。
+//! 比較は `owner` と `repo` の完全一致（大文字小文字も区別）で、`Marukei/Personacore`・`xmarukei/personacore`・
+//! `marukei/personacore.git`・`marukei/personacore-origin` などは安全側に倒して拾う。通すのはその直後の `#数字` だけで、
+//! 同じ行の他の参照は拾う。
 //!
 //! **見ていない形**: GitHub は `GH-31` / `gh-31` もリンクする。この走査はそれを拾わない（いまリポジトリに無く、
 //! Issue の参照にこの書き方を使っていない）。
@@ -382,6 +382,16 @@ fn planted_references_are_found_and_look_alikes_are_not_in_both_newline_styles()
         issue(33)
     );
     for text in both_newlines(&mixed) {
+        let (found, _) = scan([("x.md", text.as_str())], &[]);
+        assert_eq!(found, vec![format!("x.md:1:{}", issue(33))]);
+    }
+    // 逆順（素の参照が先）でも、拾うのは素の参照だけ。
+    let reversed = format!(
+        "素の {} と公開側 marukei/personacore{}\n",
+        issue(33),
+        issue(31)
+    );
+    for text in both_newlines(&reversed) {
         let (found, _) = scan([("x.md", text.as_str())], &[]);
         assert_eq!(found, vec![format!("x.md:1:{}", issue(33))]);
     }
