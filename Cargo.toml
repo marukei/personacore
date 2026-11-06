@@ -1,0 +1,117 @@
+[package]
+name = "personacore"
+version = "0.3.1"
+edition = "2024"
+# 三択（ADR-0048 §1 / 作業単位 O-2）。綴りは LICENSE・web/package.json・README と同じであること
+# （見張り番は tests/license.rs の every_place_names_the_same_license_expression）。
+license = "MIT OR Apache-2.0 OR LicenseRef-ACCRL-0.3"
+# crates.io へは出さない（配るのは zip）。scripts/notices/about.toml の private = { ignore = true } が
+# これを見て、第三者の著作権表示から personacore 自身を外す（O-2）。
+publish = false
+# **素の `cargo run` が何を起こすか**（作業単位 F-4b-1 のレビュー2周目 / 2026-09-19）。
+#
+# ⚠ **`[[bin]]` が2つ以上あると、`cargo run` は「どれを走らせるか決められない」と言って
+#   exit 101 で止まる。** `required-features` は**候補から外す効果を持たない** ——
+#   条件を満たさない bin も、曖昧さの数には入る。
+#
+# **実機で踏んだ**: 偽の `llama`（`tests/support/fake_llama.rs`）を `[[bin]]` に足した瞬間、
+# `pwsh ./scripts/start.ps1 -Upstream …` が exit 101 になった。
+# **統合テストは `CARGO_BIN_EXE_personacore` で実行ファイルを直に起こす**ので、
+# **`cargo run` を通る唯一の経路（`start.ps1`）を誰も走らせていなかった。**
+#
+# **`start.ps1` を `cargo run --bin personacore` にする形は採らない** ——
+# **素の `cargo run` が動くことが F-1 の約束**で、手で立てる案内（`scripts/README-start.md`）も
+# その綴りで書いてある。**曖昧さは、ここで一度だけ畳む。**
+#
+# 見張り番は `tests/readme.rs::
+# the_manifest_names_a_default_binary_when_more_than_one_exists`。
+default-run = "personacore"
+
+[features]
+# テスト専用の抜け穴（`Store::pool` / `CharacterId::from_raw_for_tests`）を開けるフィーチャ。
+# 下の dev-dependencies で自分自身に依存することで、`tests/` からのみ有効になる。
+# 本番ビルド（`cargo build` / `cargo run`）では無効なので、抜け穴は存在しない。
+testing = []
+
+# **偽の `llama`**（ADR-0042 §見張り番 / 作業単位 F-4b-1）。
+#
+# **本物の `llama serve` は GPU を掴むので、テストからは絶対に起こさない。**
+# 代わりに「何もしない同名の実行ファイルを PATH の先頭に置く」
+#（CLAUDE.md §4「本物を起こせない経路は偽物で起こすこと」）。
+#
+# **`required-features` で素の `cargo build` からは作られない** ——
+# 配布物（ADR-0041）には入らない。`testing` は dev-dependency の自己参照でだけ立つ。
+[[bin]]
+name = "fake_llama"
+path = "tests/support/fake_llama.rs"
+required-features = ["testing"]
+
+# **呼ばれた引数を書き残して、すぐ終わる偽物**（作業単位 F-4c）。
+#
+# **ブラウザを開くコマンドの代わり**（`PERSONACORE_TEST_BROWSER` が指す）と、
+# **「一度も呼ばれないはずの `llama`」の代わり**の2役。**本物のブラウザはテストから開かない。**
+# `fake_llama` と同じく、**素の `cargo build` からは作られない。**
+[[bin]]
+name = "fake_recorder"
+path = "tests/support/fake_recorder.rs"
+required-features = ["testing"]
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+chrono = { version = "0.4.45", features = ["serde"] }
+eventsource-stream = "0.2.3"
+futures-util = "0.3.34"
+# 画面（`web/dist`）を実行ファイルへ埋め込む（ADR-0041 §決定2 / 作業単位 F-4a）。
+#
+# **`rust-embed` ではなくこちらを選んだ理由**: `rust-embed` は既定で
+# 「debug はディスクから読む」形になり、`debug-embed` を有効にし忘れた瞬間に
+# **この機の既定とコードが偶然同じ**という穴ができる（ADR-0041 §決定2 が却下した形）。
+# `include_dir` は**常に埋め込む**ので、忘れようがない。
+# **フィーチャは1つも要らない**（`glob` / `metadata` / `nightly` は使わない）。
+include_dir = { version = "0.7.4", default-features = false }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "http2", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "uuid", "macros", "migrate", "json"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-stream = "0.1.19"
+tower-http = { version = "0.7.0", features = ["trace", "cors", "fs"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# **API の仕様書（OpenAPI）をコードから生む**（ADR-0047 §② / 作業単位 P-2a）。
+#
+# **フィーチャは `macros`（既定）と `chrono` だけ**（応答の時刻は `DateTime<Utc>`）。
+# `axum_extras` は使わない —— パスの引数は `#[utoipa::path(params(...))]` に名前で書く
+# （抽出器は `Result<Path<_>, PathRejection>` で受けているので、推論に寄りかかれない）。
+# ライセンスは `MIT OR Apache-2.0`（`utoipa` / `utoipa-gen` とも）。
+#
+# **版を `=` で固定する**（6.0 は 2026-09-23 公開。6.0.1 の `item_schema` が指す先を集めない穴を
+# 実際に踏んだ / `server::openapi` の doc）。上げるときは `server::openapi` のテストを読み直すこと。
+utoipa = { version = "=6.0.0", features = ["chrono"] }
+# **固定のためだけの直接依存**（コードからは使わない）。`utoipa` 6.0.0 は `utoipa-gen` を
+# キャレット（`^6.0.0`）で要求するので、`utoipa` を `=` にしても生成側の版は `Cargo.lock` にしか
+# 固定されていなかった。**踏んだ穴（`item_schema` / `IntoParams` が指す先を集めない）も、
+# テストが使う `utoipa::__dev::SchemaReferences` の中身も、生成するのは `utoipa-gen`** なので、
+# こちらも `=` で押さえる（P-2a のレビュー / 2026-09-30）。上げるときは `utoipa` と揃えること。
+utoipa-gen = "=6.0.1"
+uuid = { version = "1.24.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+# 自分自身への dev-dependency。統合テスト（tests/）のビルド時にだけ `testing` が有効になり、
+# `Store::pool` などのテスト専用 API が見えるようになる。
+personacore = { path = ".", features = ["testing"] }
+tempfile = "3.27.0"
+wiremock = "0.6.5"
+# 仮想時間（`tokio::time::pause` / `advance`）はこのフィーチャでしか開かない。
+# **本体の依存には足さない。** テストのビルドでだけ有効になり、
+# 素の `cargo build` では時計を止める API そのものが存在しない。
+tokio = { version = "1.53.1", features = ["test-util"] }
+# **仕様書（OpenAPI）と実際の応答を突き合わせる JSON Schema の検証器**（ADR-0047 §② / 作業単位 P-2a）。
+#
+# **テストのビルドでだけ使う。** 本番の依存には入らない。
+# `jsonschema` ではなくこちらにしたのは**増える依存が少ない**から（実測: +13 package、
+# `jsonschema` は既定のフィーチャを切っても +36）。ライセンスは `MIT OR Apache-2.0`
+# （増える依存も MIT / MIT-0 / Apache-2.0 / BSD-2-Clause のどれかを選べる）。
+boon = "0.6.1"

@@ -1,0 +1,50 @@
+name: 不具合の報告 / Bug report
+description: 期待どおりに動かないことを知らせる / Report something that does not work as expected
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **脆弱性はここに書かないでください**（[SECURITY.md](https://github.com/marukei/personacore/blob/main/SECURITY.md)）。日本語でも英語でもかまいません。
+        **Do not report vulnerabilities here** (see [SECURITY.md](https://github.com/marukei/personacore/blob/main/SECURITY.md)). Japanese or English is fine.
+
+        ログや設定を貼るときは、上流への鍵・個人のパス・会話の中身など、見られたくないものを伏せてください。
+        When pasting logs or settings, remove anything you do not want to share, such as upstream keys, personal paths or conversation text.
+  - type: input
+    id: version
+    attributes:
+      label: 版 / Version
+      description: リリースの版か、コミット / A release version or a commit
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: Windows 11
+    validations:
+      required: true
+  - type: textarea
+    id: upstream
+    attributes:
+      label: 上流の推論サーバとモデル / Upstream inference server and model
+      description: "例: llama.cpp の版、gguf のファイル名、上流プロファイルの書き方（鍵は伏せる） / e.g. llama.cpp version, gguf file name, how the upstream profile is written (without keys)"
+  - type: textarea
+    id: steps
+    attributes:
+      label: 再現の手順 / Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待したこと / Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 実際に起きたこと / Actual behaviour
+      description: エラーの文面やログがあれば貼ってください / Paste error messages or logs if you have them
+      render: text
+    validations:
+      required: true

@@ -1,0 +1,81 @@
+-- `character.name` を `character.handle` へ改名する（作業単位 0004b-3）。
+--
+-- ============================================================================
+-- 1. なぜ改名するのか — 「名前」が2つの概念を指していた
+-- ============================================================================
+--
+-- ADR-0011 が**識別子**（`model` フィールドで指す値 / 一意 / 不変）と
+-- **呼び名**（プロンプトに載る / 一意でなくてよい）を別の列に分けたのに、
+-- 識別子側の綴りは `name` のままだった。結果、この表を読む人は
+-- **`name` と `display_name` のどちらが「名前」なのかを毎回判断する**ことになる。
+--
+-- ADR-0017 で識別子は `[a-z0-9_-]` だけの「打つための鍵」に純化された。
+-- **もう名前ではない。** 綴りを概念に合わせる。
+--
+-- ============================================================================
+-- 2. `RENAME COLUMN` で足りる — CHECK が追随することを実測した
+-- ============================================================================
+--
+-- 0005 が入れた3本の CHECK は**すべて `name` を参照している。**
+-- SQLite 3.25 以降の `ALTER TABLE ... RENAME COLUMN` は、CHECK・索引・トリガ・
+-- ビューの中の参照も書き換える**はず**だが、`legacy_alter_table` の影響を受けるため
+-- 「はず」で済ませない。実測した（2026-08-16 / sqlite 3.53.4 / sqlite3 CLI）:
+--
+--   CREATE TABLE character (... name TEXT NOT NULL UNIQUE CHECK (...name...) ...);
+--   ALTER TABLE character RENAME COLUMN name TO handle;
+--   SELECT sql FROM sqlite_master WHERE name='character';
+--
+--     handle TEXT NOT NULL UNIQUE
+--         CHECK (
+--             length(handle) > 0
+--             AND handle NOT GLOB '*[^a-z0-9_-]*'
+--             AND length(cast(handle AS BLOB)) = length(handle)
+--         )
+--         CHECK (handle NOT LIKE '%@%')
+--         CHECK (length(trim(handle, ' ' || char(9) || ... )) > 0),
+--
+-- **3本とも追随した。** 効き目も残っている（同じセッションでの実測）:
+--
+--   INSERT ... VALUES ('Aoi', ...)   → CHECK constraint failed
+--   INSERT ... VALUES ('a@b', ...)   → CHECK constraint failed
+--   INSERT ... VALUES (' aoi ', ...) → CHECK constraint failed
+--   INSERT ... VALUES ('aoi', ...)   → UNIQUE constraint failed: character.handle
+--
+-- したがって**表の再構築は要らない。** 0005 の12ステップ（外部キーを切る →
+-- 作る → 写す → 落とす → 改名 → 索引を作り直す → `foreign_key_check`）は、
+-- 一段でも取りこぼすと `memory` が黙って消える類の手順なので、
+-- 避けられるなら避ける方がよい。**`DROP TABLE memory` を要求する形にはしない。**
+--
+-- ============================================================================
+-- 3. 列 UNIQUE は保たれる
+-- ============================================================================
+--
+-- `name` の `UNIQUE` の実体は `sqlite_autoindex_character_1`。
+-- **`RENAME COLUMN` は表を作り直さないので、この自動索引はそのまま残る**
+-- （実測でも改名後に `UNIQUE constraint failed: character.handle` が返っている）。
+-- 見張り番は tests/store_schema.rs の `character_handle_must_be_unique`。
+--
+-- ============================================================================
+-- 4. この列を参照している索引・トリガ・ビューは無い
+-- ============================================================================
+--
+-- 唯一あった `character_name_key_idx`（正規化キーの式索引 / 0002）は
+-- **0006 が落としている。** 残っている明示索引5本はどれも `character` を見ていない
+-- （tests/store_schema.rs の `EXPECTED_INDEXES`）。
+-- 子テーブルは `character(id)` を参照しているだけで、`name` には触れていない。
+--
+-- ============================================================================
+-- 5. 外向きの綴りも一緒に変わる（この移行だけでは閉じない）
+-- ============================================================================
+--
+-- * `/admin/` の JSON: `name` → `handle`（要求・応答の両方）。
+--   `unreadable[].name` → `unreadable[].handle`、
+--   `invalid_columns: ["name"]` → `["handle"]`。
+-- * エラーコード: `character_name_*` → `character_handle_*`。
+-- * **`GET /v1/models` は変えない。** あれは OpenAI 互換の `id` であり、
+--   `model` フィールドの書式（`aoi` / `aoi@new` / `aoi@42`）も据え置き（ADR-0004）。
+--
+-- 消費者はこのリポジトリ内の `scripts/seed-characters.ps1` と
+-- `scripts/characters.sample.json` だけなので、いま変えられる。
+
+ALTER TABLE character RENAME COLUMN name TO handle;

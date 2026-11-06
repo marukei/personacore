@@ -1,0 +1,48 @@
+/target
+**/*.rs.bk
+
+# 配布物（ADR-0041 §決定5）。scripts/package.ps1 がここへ実行ファイルを置く。
+/dist/
+
+# SQLite working databases (schema lives in migrations/, never commit data)
+# DATABASE_FILE_NAME is personacore.sqlite, so *.db alone is not enough.
+# --fresh renames them to personacore.sqlite.bak-<time>(-wal/-shm) (ADR-0041).
+# Those hold real user data, so they must never show up as untracked files.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.bak-*
+/data/
+
+# Local environment overrides
+.env
+.env.local
+
+# 上流プロファイル（F-9）。gguf の置き場所は機ごとに違うので、写しは追跡しない。
+# 見本（scripts/upstreams.sample.json）はコミットする。
+scripts/upstreams.json
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Claude Code local-only settings (permissions granted on this machine)
+.claude/settings.local.json
+
+# エージェントの隔離ワークツリー（Agent ツールが作る）
+/.claude/worktrees/
+
+# FE（ADR-0031）。web/dist は vite のビルド成果物。lockfile は追跡する。
+# `pnpm build` を忘れると、起動ログが ui_files=0 と言う（ADR-0041 §決定2）。
+# ⚠ build.rs が空の web/dist を作るので、clone 直後でも素の cargo build は通る。
+/web/node_modules/
+/web/dist/
+# `svelte-check --tsgo` が書く中間ファイル置き場。
+/web/.svelte-check/

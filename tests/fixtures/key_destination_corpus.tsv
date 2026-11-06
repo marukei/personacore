@@ -1,0 +1,77 @@
+# 鍵を付けた面の宛先の分類（作業単位 A-13b-3 / ADR-0056 §決定5）。
+#
+# 1行が「宛先<TAB>分類」。分類は次の4つ。
+#   unguarded      判定しない（https:// / ループバック / localhost / 読めない綴り / ほかのスキーム）
+#   local_network  http:// ＋ ローカルネットワークのアドレス（警告して送る）
+#   elsewhere      http:// ＋ それ以外のアドレス（承認が要る）
+#   name           http:// ＋ ホスト名（接続のたびの名前解決で決まる）
+#
+# 権威は Rust（src/llm/request.rs の key_destination と address_class）。
+# 読み手は2つ —— Rust の request.rs のテスト（the_key_destination_corpus_matches_the_judgment）と、
+# 画面の web/tests/upstream-key.test.ts（web/src/lib/upstreamKey.ts の keyDestination）。
+# 範囲の端（内と外の両側）・WHATWG の読み方（\ を / と読む・10 進や 16 進の IPv4・IPv6 の正規化）を並べる。
+# `#` で始まる行と空行は読まない。
+https://203.0.113.5:443	unguarded
+https://example.com	unguarded
+http://127.0.0.1:46001	unguarded
+http://127.255.255.254:1	unguarded
+http://127.1:1	unguarded
+http://0x7f.1:1	unguarded
+http://2130706433:1	unguarded
+http://127.0.0.1.:1	unguarded
+http://localhost:1	unguarded
+http://LOCALHOST:1	unguarded
+http://[::1]:1	unguarded
+http://[0:0:0:0:0:0:0:1]:1	unguarded
+ftp://203.0.113.5:1	unguarded
+not a url	unguarded
+http://	unguarded
+	unguarded
+http://[fe80::1%25eth0]:1	unguarded
+http://9.255.255.255:1	elsewhere
+http://10.0.0.0:1	local_network
+http://10.255.255.255:1	local_network
+http://11.0.0.0:1	elsewhere
+http://172.15.255.255:1	elsewhere
+http://172.16.0.0:1	local_network
+http://172.31.255.255:1	local_network
+http://172.32.0.0:1	elsewhere
+http://192.167.255.255:1	elsewhere
+http://192.168.0.0:1	local_network
+http://192.168.255.255:1	local_network
+http://192.169.0.0:1	elsewhere
+http://169.253.255.255:1	elsewhere
+http://169.254.0.0:1	local_network
+http://169.254.255.255:1	local_network
+http://169.255.0.0:1	elsewhere
+http://126.255.255.255:1	elsewhere
+http://128.0.0.0:1	elsewhere
+http://100.64.0.1:1	elsewhere
+http://203.0.113.5:46001	elsewhere
+http://0.0.0.0:1	elsewhere
+http://3232235530:1	local_network
+http://0xc0a80001:1	local_network
+ http://10.0.0.1:1	local_network
+HTTP://192.168.0.10:1	local_network
+http://u:p@203.0.113.5:1	elsewhere
+http://203.0.113.5\@127.0.0.1:46001	elsewhere
+http://127.0.0.1\@203.0.113.5:1	unguarded
+http://[fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:1	elsewhere
+http://[fc00::]:1	local_network
+http://[fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:1	local_network
+http://[fe00::]:1	elsewhere
+http://[fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:1	elsewhere
+http://[fe80::]:1	local_network
+http://[FE80::1]:1	local_network
+http://[febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:1	local_network
+http://[fec0::]:1	elsewhere
+http://[::]:1	elsewhere
+http://[::2]:1	elsewhere
+http://[2001:db8::1]:1	elsewhere
+http://[::ffff:10.0.0.1]:1	elsewhere
+http://[::ffff:127.0.0.1]:1	elsewhere
+http://example.com:1	name
+http://relay.example:46001	name
+http://localhost.:1	name
+http://u:p@upstream.test:1	name
+http://例え.テスト:1	name

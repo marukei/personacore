@@ -1,0 +1,5 @@
+[toolchain]
+# Intentionally channel-only (no explicit host triple) so the same file works on
+# both the Windows main machine and the macOS sub machine.
+channel = "stable"
+components = ["rustfmt", "clippy"]

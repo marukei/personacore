@@ -1,0 +1,34 @@
+# マイグレーション SQL の改行を LF に固定する（ADR-0044 決定1）。
+#
+# `sqlx::migrate!` は SQL の**バイト列そのもの**の SHA-384 をチェックサムにする
+# （改行の正規化は無い）。autocrlf が有効なまま属性ファイルが無いと、
+# checkout の仕方で作業ツリーの改行が変わり、**同じコミットから組んだ2つの exe が
+# 同じ DB を「migration N was previously applied but has been modified」で
+# 開けなくなる**（ADR-0044 の背景。司令塔が 2026-09-19 に実測）。
+#
+# 索引は元から LF なので、この属性で全 checkout が LF に揃う。
+#
+# **見張り番は `src/store/migration_ledger.rs` の
+# `no_migration_file_carries_a_carriage_return`**（`#[cfg(test)] mod tests`）——
+# 下の行が消えると、次に CRLF で checkout した機で赤になる。
+# **その機で組んだ exe は、LF の帳簿を持つ DB を開けない**
+# （帳簿の付け替えは逆向きには働かない。理由は同じファイルのモジュール doc）。
+#
+# ⚠ 対象は `migrations/*.sql` だけ。リポジトリ全体を LF にする決定は別
+#   （CLAUDE.md 4節の CRLF に関する知見が全部それに依存しているので、ここで動かさない）。
+migrations/*.sql text eol=lf
+
+# 約束・決まりの提案の文面（ADR-0051 §軽い形の模索の結果と、実装する形 —— δ3 / 作業単位 A-12c-1）。
+# **測った版を1バイトも変えずに `include_str!` で埋め込む**ので、autocrlf の checkout で CRLF になると
+# 依頼の文面が測った版と変わる。見張り番は `src/prompt/agreement_proposal.rs` の
+# `the_instructions_are_the_measured_bytes`（指紋と CR の有無を見る）。
+src/prompt/agreement_proposal/*.txt text eol=lf
+
+# 依存の著作権表示（O-1 / ADR-0048）。`scripts/notices.ps1` が LF で書き出すので、
+# autocrlf の checkout で CRLF になると、package のたびに「変更あり」に見える（中身は同じ）。
+scripts/THIRD-PARTY-NOTICES.txt text eol=lf
+
+# サブエージェントの定義（.claude/agents/）。autocrlf の checkout で CRLF になると、
+# Claude Code がその定義を読み込まなくなる（O-9 のマージで description を1行変えた2本が
+# CRLF で書き直され、その2本だけが使えなくなった / 2026-11-04）。
+.claude/agents/*.md text eol=lf

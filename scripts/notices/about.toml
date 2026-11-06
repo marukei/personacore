@@ -1,0 +1,145 @@
+# cargo-about の設定（作業単位 O-1 / Issue origin#48）。scripts/notices.ps1 が使う。
+#
+# 載せるのは「実行ファイルに入る crate」だけ（dev / build の依存は入らないので外す）。
+# 集合は tests/notices.rs の the_notices_name_exactly_the_crates_the_executable_links が
+# cargo tree --edges normal --target x86_64-pc-windows-msvc と突き合わせる。
+
+# 受け入れるライセンス。**並び順が優先順位**（`MIT OR Apache-2.0` の crate は MIT の文を載せる）。
+# ここに無いライセンスの crate が入ると、cargo about は止まる（載せ方を決めてから足すこと）。
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "OpenSSL",
+    "MPL-2.0",
+    "0BSD",
+    "CC0-1.0",
+    "BSL-1.0",
+    "Unlicense",
+]
+
+# 配る実行ファイルの target（zip の名前が windows-x64 を名乗る）。
+targets = ["x86_64-pc-windows-msvc"]
+
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# **personacore 自身を載せない**（作業単位 O-2 / Issue origin#49）。自分は第三者ではない。
+# Cargo.toml に license（MIT OR Apache-2.0 OR LicenseRef-ACCRL-0.3）を書いた途端、
+# cargo-about は personacore を MIT の群に載せた（O-2 で実測。LicenseRef-ACCRL-0.3 は
+# accepted に無いが、式が OR なので MIT で満たされ、止まりはしなかった）。
+# cargo-about には crate 単位で外す設定が無い（crate の表が受けるのは accepted と clarify だけ）ので、
+# Cargo.toml の publish = false と、この「公開しない crate を外す」設定の組で外す。
+# 見張り番は tests/notices.rs の the_notices_do_not_list_personacore_itself。
+private = { ignore = true }
+
+# cargo-about に組み込みの補正。chrono は LICENSE.txt が MIT と Apache の合本で、
+# 補正が無いと SPDX の標準文（著作権者がひな形のまま）に置き換わる（O-1 で実測）。
+workarounds = ["chrono", "rustls"]
+
+# ----------------------------------------------------------------------
+# 著作権者の行を埋める（O-1 のレビュー1周目 要修正1）
+#
+# crate の表示のファイルを cargo-about が拾えないと、SPDX の標準文で補われ、
+# 著作権者の行が `<year> <copyright holders>` のひな形のまま載る（帰属が1文字も無い）。
+# 見張り番は tests/notices.rs の only_the_listed_crates_carry_a_placeholder_copyright_line
+# （ひな形の群に載ってよいのは、そこの帳簿 PLACEHOLDER_ALLOWED の crate だけ）。
+#
+# ⚠ clarify は checksum が合わないと警告だけ出して元の判定に戻る（cargo-about 0.9.2 の振る舞い）。
+#   crate の版が上がって中身が変わると、ひな形に戻って上の見張り番が赤になる。
+# ----------------------------------------------------------------------
+
+# (1) 表示を写せるファイルが crate にある —— そのファイルを指す。
+#     windows-sys / windows-link の license-mit は字下げされていて、cargo-about の
+#     認識の下限（0.5）に届かない。中身は Copyright (c) Microsoft Corporation. の MIT。
+[windows-sys.clarify]
+license = "MIT OR Apache-2.0"
+
+[[windows-sys.clarify.files]]
+path = "license-mit"
+license = "MIT"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[[windows-sys.clarify.files]]
+path = "license-apache-2.0"
+license = "Apache-2.0"
+checksum = "c16f8dcf1a368b83be78d826ea23de4079fe1b4469a0ab9ee20563f37ff3d44b"
+
+[windows-link.clarify]
+license = "MIT OR Apache-2.0"
+
+[[windows-link.clarify.files]]
+path = "license-mit"
+license = "MIT"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[[windows-link.clarify.files]]
+path = "license-apache-2.0"
+license = "Apache-2.0"
+checksum = "c16f8dcf1a368b83be78d826ea23de4079fe1b4469a0ab9ee20563f37ff3d44b"
+
+# (2) 表示を写せるファイルが無い `MIT OR Apache-2.0` —— Apache-2.0 を選ぶ
+#     （Apache-2.0 の文は著作権者の行を要らない。標準文の付録の [yyyy] は適用のしかたの説明）。
+#
+#     clarify は「確かめる元のファイル」を1つ以上要るので、**Cargo.toml の license の行**を
+#     checksum で押さえる（その行がこの式であることが、Apache-2.0 を選んでよい根拠）。
+#     その行の license は LicenseRef にしてあり、どのライセンスの文としても出ない。
+#     sqlx-* の LICENSE-MIT / LICENSE-APACHE は中身が `../LICENSE-MIT` の1行（リンクの残骸）で、
+#     eventsource-stream は表示のファイルを1つも持たない。
+#
+#     ⚠ include_dir / include_dir_macros は license が MIT だけなので Apache-2.0 を選べない
+#       （tests/notices.rs の帳簿に理由つきで載せてある）。
+[eventsource-stream.clarify]
+license = "Apache-2.0"
+
+[[eventsource-stream.clarify.files]]
+path = "Cargo.toml"
+license = "LicenseRef-cargo-manifest-license-field"
+start = 'license = "MIT OR Apache-2.0"'
+end = 'Apache-2.0"'
+checksum = "f2bbaa42e781363795f43c9bd4a73d8c76d0f5ed2ed837ad32318d61c52fb637"
+
+[sqlx-core.clarify]
+license = "Apache-2.0"
+
+[[sqlx-core.clarify.files]]
+path = "Cargo.toml"
+license = "LicenseRef-cargo-manifest-license-field"
+start = 'license = "MIT OR Apache-2.0"'
+end = 'Apache-2.0"'
+checksum = "f2bbaa42e781363795f43c9bd4a73d8c76d0f5ed2ed837ad32318d61c52fb637"
+
+[sqlx-macros-core.clarify]
+license = "Apache-2.0"
+
+[[sqlx-macros-core.clarify.files]]
+path = "Cargo.toml"
+license = "LicenseRef-cargo-manifest-license-field"
+start = 'license = "MIT OR Apache-2.0"'
+end = 'Apache-2.0"'
+checksum = "f2bbaa42e781363795f43c9bd4a73d8c76d0f5ed2ed837ad32318d61c52fb637"
+
+[sqlx-macros.clarify]
+license = "Apache-2.0"
+
+[[sqlx-macros.clarify.files]]
+path = "Cargo.toml"
+license = "LicenseRef-cargo-manifest-license-field"
+start = 'license = "MIT OR Apache-2.0"'
+end = 'Apache-2.0"'
+checksum = "f2bbaa42e781363795f43c9bd4a73d8c76d0f5ed2ed837ad32318d61c52fb637"
+
+[sqlx-sqlite.clarify]
+license = "Apache-2.0"
+
+[[sqlx-sqlite.clarify.files]]
+path = "Cargo.toml"
+license = "LicenseRef-cargo-manifest-license-field"
+start = 'license = "MIT OR Apache-2.0"'
+end = 'Apache-2.0"'
+checksum = "f2bbaa42e781363795f43c9bd4a73d8c76d0f5ed2ed837ad32318d61c52fb637"

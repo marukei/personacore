@@ -1,0 +1,85 @@
+# personacore / 上流が本文に漏らした思考を剥がす規則の表
+#
+# **これは手書きである。実装から作っていない**（作業単位 B-61 / ADR-0053 / CLAUDE.md の 16b）。
+# **作り直しの仕掛けを持たない。** 期待値を変えるときは、人が1行ずつ書き直すこと。
+#
+# 読む側: tests/thinking_corpus.rs（Rust）/ web/tests/thinking-corpus.test.ts（TypeScript）
+# 規則の実装: src/domain/thinking.rs の strip_leaked_thinking（**Rust が権威**）
+#             web/src/lib/thinking.ts の stripThinking（手で写したもの）
+#
+# 欄: 剥がしたブロックの数 <TAB> 閉じなかったか（0 / 1） <TAB> 剥がした後の本文 <TAB> 入力
+#
+# **入力を最後の欄に置いてある。** 剥がした後の本文は空になりうるので、最後の欄にすると
+# 行末に TAB が残る（編集の道具が黙って潰しうる / CLAUDE.md「改行と置換の道具」）。
+#
+# **見えない文字は \u{XXXX} と書く**（改行も \u{A} と書く。1行が1件）。
+# 受ける逃げ方は \u{16進1〜6桁} と \\ の2つだけ。読む側が他の綴りを拒む。
+# **emphasis_corpus.tsv の \uXXXX（括弧なし）にしていないのは、編集の道具（Write / Edit）が
+# 括弧なしの綴りを実文字へ化けさせたから**（B-61 で実際に起きた。U+3000 / U+00A0 / U+2009 などが生で入った）。
+# **生の不可視文字が1つも入っていないことを、両側の読み手が実際に数えている。**
+#
+# 件数: 51
+#
+# ---- C-20 で観測した形（<measurements>\c20-2026-10-24 の transcript.jsonl を縮めたもの） ----
+1	0	\u{3000}彼女は笑った。「おかえり」	<think>\u{A}The user is asking.\u{A}</think>\u{A}\u{A}\u{3000}彼女は笑った。「おかえり」
+1	0	「やあ」	<think >\u{A}The user is asking.\u{A}</think >\u{A}\u{A}「やあ」
+1	0	「やあ」	<think>考え</think >\u{A}\u{A}「やあ」
+1	0	「やあ」	<think >考え</think>\u{A}\u{A}「やあ」
+1	0		<think >\u{A}She lives with her dog.\u{A}</think >
+1	0		<think>\u{A}\u{A}</think>
+1	0	「やあ」	</think>\u{A}\u{A}「やあ」
+2	0	「やあ」	<think >First.</think >\u{A}\u{A}<think >Second.</think >\u{A}</think>\u{A}\u{A}「やあ」
+# ---- タグの綴り（空白・TAB は0個以上） ----
+1	0	「やあ」	<think\u{9}>考え</think\u{9}>「やあ」
+1	0	「やあ」	<think  \u{9} >考え</think \u{9}>「やあ」
+1	0	「やあ」	<think  >考え</think  >「やあ」
+# ---- タグではない綴り（何も変えない） ----
+0	0	<THINK>考え</THINK>本文	<THINK>考え</THINK>本文
+0	0	<Think>考え</Think>本文	<Think>考え</Think>本文
+0	0	<think\u{3000}>考え</think\u{3000}>本文	<think\u{3000}>考え</think\u{3000}>本文
+0	0	<think\u{A0}>考え</think\u{A0}>本文	<think\u{A0}>考え</think\u{A0}>本文
+0	0	<think\u{A}>考え</think\u{A}>本文	<think\u{A}>考え</think\u{A}>本文
+0	0	< think>考え< /think>本文	< think>考え< /think>本文
+0	0	<thinking>考え</thinking>本文	<thinking>考え</thinking>本文
+0	0	<think/>本文	<think/>本文
+0	0	「<think」と書いた	「<think」と書いた
+0	0	「おかえり」と彼女は笑った。	「おかえり」と彼女は笑った。
+# ---- 先頭の閉じタグ（先頭から思考が始まっていた） ----
+1	0	「やあ」	The user asks.\u{A}</think >\u{A}\u{A}「やあ」
+1	0	「やあ」	</think>「やあ」
+# ---- 閉じない思考（開きタグから末尾まで捨てる） ----
+1	1		<think>\u{A}The user is asking
+1	1	「やあ」	「やあ」<think>独白が続く\u{A}\u{A}「本文らしいもの」
+2	1	「やあ」	<think>a</think>\u{A}\u{A}「やあ」<think>b
+1	1	「やあ」	「やあ」\u{D}\u{A}<think>b
+# ---- 入れ子・余り・数 ----
+1	0	「やあ」	<think>a<think>b</think>\u{A}「やあ」
+1	0	「やあ」と笑った。	<think>a</think>「やあ」</think>と笑った。
+3	0	本文	<think>a</think><think>b</think><think>c</think>本文
+# ---- 境目の空行（字下げは残す） ----
+1	0	「一つ目」\u{A}\u{A}「二つ目」	「一つ目」\u{A}\u{A}<think>x</think>\u{A}\u{A}「二つ目」
+1	0	「やあ」と笑った。	「やあ」<think>x</think>と笑った。
+1	0	「やあ」	「やあ」\u{A}\u{A}<think>x</think>\u{A}
+1	0	\u{3000}本文	\u{A} \u{3000}\u{A}<think>x</think>\u{A}\u{3000}本文
+1	0	\u{3000}本文	\u{3000}<think>x</think>本文
+1	0	本文	<think>x</think>\u{D}\u{A}\u{D}\u{A}本文
+# 規則 (2) は先頭の断片が空白だけのときに限る。本文を持つ先頭の断片の空行は、剥がした範囲に接していないので残す。
+1	0	\u{A}\u{A}「やあ」本文	\u{A}\u{A}「やあ」<think>x</think>本文
+# 規則 (3) は剥がした範囲の直前に限る。最後の断片（範囲の後ろ）の末尾の改行は、範囲に接していないので残す。
+1	0	本文\u{A}	<think>x</think>本文\u{A}
+# ---- 行区切り（domain::LINE_BREAKS の7点） ----
+1	0	本文	<think>x</think>\u{A}本文
+1	0	本文	<think>x</think>\u{D}本文
+1	0	本文	<think>x</think>\u{B}本文
+1	0	本文	<think>x</think>\u{C}本文
+1	0	本文	<think>x</think>\u{85}本文
+1	0	本文	<think>x</think>\u{2028}本文
+1	0	本文	<think>x</think>\u{2029}本文
+# ---- 空行に入る空白（domain::TRIMMABLE のうち行区切りでない4点） ----
+1	0	本文	<think>x</think> \u{A}本文
+1	0	本文	<think>x</think>\u{9}\u{A}本文
+1	0	本文	<think>x</think>\u{3000}\u{A}本文
+1	0	本文	<think>x</think>\u{A0}\u{A}本文
+# ---- JavaScript だけが空白と認める2点（その行は空行ではない） ----
+1	0	\u{2009}\u{A}本文	<think>x</think>\u{2009}\u{A}本文
+1	0	\u{FEFF}\u{A}本文	<think>x</think>\u{FEFF}\u{A}本文

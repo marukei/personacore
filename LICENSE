@@ -1,0 +1,101 @@
+personacore
+
+SPDX-License-Identifier: MIT OR Apache-2.0 OR LicenseRef-ACCRL-0.3
+
+personacore は次の3つのライセンスのうち、使う人が選んだ1つの下で使えます。
+
+- MIT License（LICENSE-MIT）
+- Apache License, Version 2.0（LICENSE-APACHE）
+- AI Collective Creativity Respect License (ACCRL) v0.3-PROTOTYPE（LICENSE-ACCRL.md）
+
+personacore is available under your choice of the MIT License (LICENSE-MIT),
+the Apache License, Version 2.0 (LICENSE-APACHE), or the AI Collective Creativity
+Respect License (ACCRL) v0.3-PROTOTYPE (LICENSE-ACCRL.md).
+
+MIT と Apache-2.0 はオープンソースのライセンスとして広く承認されたものです。
+組み込む側の事情でそれが要る場合は、どちらかを選んでください。
+ACCRL を選んでも、選ばなくても、ACCRL の第II部の誓約と呼びかけが、
+使う人に法的な義務を課すことはありません。
+
+Copyright (c) 2026 marukei
+
+
+## ACCRL の採用の表明
+
+本作品は AI Collective Creativity Respect License (ACCRL) v0.3-PROTOTYPE の下でも公開し、
+その誓約を行います。
+
+This work is also published under the AI Collective Creativity Respect License (ACCRL)
+v0.3-PROTOTYPE, and I, its human creator, make its pledge.
+
+採用者・創作者: marukei（https://github.com/marukei）
+署名: 2026年11月4日
+
+条文: LICENSE-ACCRL.md
+  https://github.com/marukei/ACCRL の LICENSE-v0.3-PROTOTYPE.md（コミット d452001）を、
+  一字も変えずに写したもの。日本語が原文です。
+  英訳は LICENSE-ACCRL.en.md（同じリポジトリの translations/en/ から写したもの）。
+  食い違うときは日本語が優先します。
+  条文の中の相対リンクは、写し元のリポジトリの中を指します。
+
+
+## 採用者の誓約（第6条）
+
+本作品の人間創作者である私は、次のことを誓います。
+
+1. 協働の透明性
+   本作品の実装と文書の大部分は、AI協働者が書きました。
+   方向性の決定、価値判断、提案の採否、最終的な選択は、私が行いました。
+   透明性レベル3（詳細なプロセス記録）で、次のものを公開します。
+   - 設計判断の記録（docs/adr/）。各 ADR の「状態」の欄に、人間が決めたことを書いています。
+   - 開発の過程の記録（docs/process/）。AI の役割分担、運用の教訓、引き継ぎ。
+   - AI 協働の開示の文書（NOTICE-AI-COLLABORATION.md）。
+   開発の履歴（2026年8月13日から）は公開していないリポジトリにあります。
+   その間のコミットには AI の支援を受けたことを示すトレーラ（Co-Authored-By:）を付しました。
+
+2. 見えない貢献者への敬意
+   本作品のコードと文書は、AI協働者の能力を通じて、その学習データとなった
+   ソフトウェアと文書の作者の方々の知恵の上に成り立っています。
+   また本作品は、依存しているオープンソースのライブラリ（scripts/THIRD-PARTY-NOTICES.txt）、
+   推論を担う llama.cpp などの推論サーバ、会話を生む言語モデル、
+   その学習データの、それぞれの作者の方々の仕事の上で動きます。深く感謝します。
+
+3. 他者の創作的人格の尊重
+   私が他者の著作物を用いるとき、本作品について呼びかけるのと同じ敬意を払います。
+
+4. 強制しないこと
+   本ライセンスを強制の道具として用いません。
+
+この誓約は人間創作者が行うものです。AI協働者（Claude）は誓約を行いません。
+誓約できるのは人間だけだからです（ACCRL v0.3 第1条4号）。
+
+
+## AI協働の開示（第10条）
+
+AI協働者: Claude（Anthropic）— Claude Code
+協働開始: 2026年8月13日
+
+- 方向性と価値判断、提案の採否、最終的な判断: 人間
+- 要件の分解、設計の起草、実装、テスト、レビュー、測定、文書: AI協働
+  （役割と階層は docs/process/model-tiering-log.md、詳細は NOTICE-AI-COLLABORATION.md）
+
+
+## AI学習について（第2.2条・第9条）
+
+本作品は、第2.2条のAI学習の留保を付しません。
+本作品は、AI学習を含むあらゆる目的で利用できます。
+
+学習に用いる方には、見えない貢献者への敬意という本ライセンスの理念を受け止めること、
+可能な範囲で学習に用いたことを明らかにすること、学習データの来歴とライセンス情報を
+保持することを呼びかけます。これは呼びかけであって、条件ではありません。
+
+
+## 著作者人格権（第5条）
+
+本ライセンスは、著作者人格権を許諾も放棄もしません。
+また、採用者が人格権を行使しないことも、行使することも約束しません（意図的な沈黙）。
+
+---
+
+*人間とAIの協働により作成され、人間創作者が採用し、誓約しました。*
+*Created through human-AI collaboration; adopted and pledged by the human creator.*

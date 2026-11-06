@@ -1,0 +1,25 @@
+name: 提案 / Proposal
+description: 新しい機能や変更を提案する / Suggest a new feature or a change
+body:
+  - type: markdown
+    attributes:
+      value: |
+        設計の理由は [docs/adr/](https://github.com/marukei/personacore/tree/main/docs/adr) にあります。提案とぶつかる ADR があれば挙げてください。日本語でも英語でもかまいません。
+        The reasons behind the design are in [docs/adr/](https://github.com/marukei/personacore/tree/main/docs/adr) (in Japanese). If your proposal conflicts with an ADR, please name it. Japanese or English is fine.
+  - type: textarea
+    id: problem
+    attributes:
+      label: 困っていること / Problem
+      description: 何をしたくて、いま何ができないか / What you want to do and what stops you today
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 提案 / Proposal
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 考えた別の案 / Alternatives considered

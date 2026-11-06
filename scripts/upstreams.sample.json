@@ -1,0 +1,30 @@
+{
+  "ministral-llama": {
+    "main": {
+      "endpoint": "http://127.0.0.1:8081",
+      "model": "ministral-3-14b-instruct-2512",
+      "gguf": "~/.lmstudio/models/mistralai/Ministral-3-14B-Instruct-2512-GGUF/Ministral-3-14B-Instruct-2512-Q4_K_M.gguf",
+      "args": ["--ctx-size", "16384", "--jinja"]
+    }
+  },
+  "qwen-official": {
+    "main": {
+      "endpoint": "http://127.0.0.1:8081",
+      "model": "qwen3.6-35b-a3b",
+      "gguf": "~/.lmstudio/models/lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q6_K.gguf",
+      "args": ["--ctx-size", "16384", "--n-cpu-moe", "28", "--jinja"]
+    }
+  },
+  "split": {
+    "main": {
+      "endpoint": "http://127.0.0.1:1234",
+      "model": "ministral-3-14b-instruct-2512"
+    },
+    "sub": {
+      "endpoint": "http://127.0.0.1:8081",
+      "model": "qwen3.6-35b-a3b",
+      "gguf": "~/.lmstudio/models/lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q6_K.gguf",
+      "args": ["--ctx-size", "16384", "--n-cpu-moe", "41", "--jinja"]
+    }
+  }
+}

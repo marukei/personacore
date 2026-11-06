@@ -1,0 +1,24 @@
+{{!--
+  cargo-about のひな形（作業単位 O-1 / Issue origin#48）。scripts/notices.ps1 が使う。
+
+  ⚠ 行頭の [license] / [crate] / [text] は tests/notices.rs が読む印である。
+    [license] で群が始まり、[text] の前の [crate] <名前> <版> が名前、後ろがライセンスの文。
+    ライセンスの文そのものに ==== の行が含まれうる（aws-lc-sys）ので、区切りの行では読まない。
+  ⚠ {{{ }}}（3重）で書くこと。2重はライセンスの文の < > & を HTML の実体参照に化けさせる。
+--}}
+{{#each licenses}}
+================================================================================
+[license] {{{name}}} ({{{id}}})
+{{#each used_by}}
+[crate] {{{crate.name}}} {{{crate.version}}}
+{{#if crate.repository}}
+        {{{crate.repository}}}
+{{/if}}
+{{#if crate.authors}}
+        {{#each crate.authors}}{{{this}}}{{#unless @last}}, {{/unless}}{{/each}}
+{{/if}}
+{{/each}}
+[text]
+{{{text}}}
+
+{{/each}}

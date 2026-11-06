@@ -1,0 +1,40 @@
+-- character に stat_drift_mode（変容の走らせ方）を足す（ADR-0045 / 作業単位 A-8）。
+--
+-- 値は 'off' / 'shadow' / 'on' のどれか、または NULL。
+-- **NULL は「未設定」＝起動時の既定（PERSONACORE_STAT_DRIFT。無ければ off）に従う。**
+--
+-- ============================================================================
+-- DEFAULT を置かない（既存の行は全部 NULL から始まる）
+-- ============================================================================
+--
+-- ADR-0045 §決定1: 既存のキャラクターは全部「未設定」から始まるので、
+-- **この移行を当てても、いまの DB の振る舞いは1つも変わらない。**
+-- 'off' などで埋めると、PERSONACORE_STAT_DRIFT=on で回している既存の測定が
+-- 黙って止まる（キャラクターの値は環境変数に勝つ / ADR-0045 §決定2）。
+--
+-- ============================================================================
+-- CHECK は綴りを3つに閉じる（別名を保存させない）
+-- ============================================================================
+--
+-- 環境変数は '1' / 'true' / 'yes' などの別名も受けるが、この列は受けない
+-- （ADR-0045 §決定3。別名を受けると、保存された値の綴りが割れる）。
+-- 綴りの正は domain::StatDriftMode::label。**ここは移行した時点の写しで、
+-- 適用済みの移行は編集できないので、label を変えても、ここは変わらない。**
+--
+-- 大文字や前後の空白も通さない（IN は完全一致）。typeof を縛らないのは、
+-- 数値や BLOB を入れても IN ('off', 'shadow', 'on') に一致しないため。
+-- 実測（2026-09-26 / sqlite3 3.53.4 / 既存行2件の表に当てた）:
+--
+--   既存行 → 2件とも NULL（typeof = null）
+--   受理: 'off' / 'shadow' / 'on' / NULL
+--   拒否: 'ON' / ' on' / '1' / 1 / 'true' / '' / X'6F6E'（'on' の BLOB）
+--
+-- **CHECK は外せる**（PRAGMA ignore_check_constraints）ので、読み出し側でも
+-- domain::StatDriftMode::parse を通し、通らない行は一覧で指し示す
+-- （domain::CharacterColumn::StatDriftMode）。stat_scale と同じ扱い。
+--
+-- DEFAULT が CHECK を満たさないと ADD COLUMN そのものが失敗する（0004 / 0008 の実測）が、
+-- ここは DEFAULT が無く、既存の行は NULL で、NULL は CHECK を満たす（IS NULL の枝）。
+
+ALTER TABLE character ADD COLUMN stat_drift_mode TEXT
+    CHECK (stat_drift_mode IS NULL OR stat_drift_mode IN ('off', 'shadow', 'on'));
