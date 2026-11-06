@@ -1,15 +1,15 @@
 //! **ライセンスの式の綴りと、写した条文** を見張る（作業単位 O-2 / Issue origin#49 / ADR-0048 §1）。
 //!
 //! personacore は `MIT OR Apache-2.0 OR LicenseRef-ACCRL-0.3` の三択で配る。
-//! この式は5か所に書いてあり、**どれか1つだけが違う綴りになると、どれが正しいのか誰にも分からなくなる**
-//! （cargo のメタデータ・npm・人が読む README（日本語と英語）・法的な文書が、別々のことを名乗る）。
+//! この式は6か所に書いてあり、**どれか1つだけが違う綴りになると、どれが正しいのか誰にも分からなくなる**
+//! （cargo のメタデータ・npm・人が読む README（日本語・英語・繁体字中国語）・法的な文書が、別々のことを名乗る）。
 //!
 //! # 何を見るか
 //!
 //! | 見るもの | どこで |
 //! |---|---|
-//! | `LICENSE` の SPDX の行・`Cargo.toml` の `license`・`web/package.json` の `license`・README の「ライセンス」の節・英語の README（`README.en.md`）の「License」の節の式が、**どれも1つきりで、同じ綴り** | [`every_place_names_the_same_license_expression`] |
-//! | 英語の README の「License」の節が、`LICENSE` の英語の段落（三択の案内）を**そのまま**載せている（O-10 / Issue origin#104） | [`the_english_readme_quotes_the_english_paragraph_of_the_license`] |
+//! | `LICENSE` の SPDX の行・`Cargo.toml` の `license`・`web/package.json` の `license`・README の「ライセンス」の節・訳の README（[`TRANSLATED_READMES`]: `README.en.md` の「License」の節と `README.zh-TW.md` の「授權」の節）の式が、**どれも1つきりで、同じ綴り** | [`every_place_names_the_same_license_expression`] |
+//! | 訳の README（英語・繁体字中国語）のライセンスの節が、`LICENSE` の英語の段落（三択の案内）を**訳さずにそのまま**載せている（英語は O-10 / Issue origin#104、繁体字中国語は O-14 / marukei/personacore#8） | [`the_translated_readmes_quote_the_english_paragraph_of_the_license`] |
 //! | `LICENSE` が名指すライセンスの文書が実在し、MIT の文書の著作権の行が `LICENSE` と同じ | [`the_license_names_documents_that_exist`] |
 //! | `LICENSE-ACCRL.md` / `LICENSE-ACCRL.en.md` / `LICENSE-APACHE` が、写し元から1字も変わっていない | [`the_copied_license_texts_are_unchanged`] |
 //! | `LICENSE-MIT` の著作権の行を除いた本文が、MIT の標準の本文から1字も変わっていない | [`the_mit_license_body_is_the_standard_text`] |
@@ -19,15 +19,16 @@
 //!
 //! # 何を見ていないか（先に書く）
 //!
-//! * **英語の README の散文が `LICENSE` と矛盾しないか**は、載せた段落の外については見ていない。
+//! * **訳の README の散文が `LICENSE` と矛盾しないか**は、載せた段落の外については見ていない
+//!   （繁体字中国語の README の、段落の前の断り書き・後の案内の文も見ていない。翻訳のレビューが受け持つ）。
 //!   見ているのは、`LICENSE` の英語の段落が空白の違いを除いて1字も変えずに節の中に在ることだけ。
-//! * **式が SPDX として正しいか**は見ていない。見ているのは5か所の綴りが揃っていることと、
+//! * **式が SPDX として正しいか**は見ていない。見ているのは6か所の綴りが揃っていることと、
 //!   それが [`EXPRESSION`] であることだけ（cargo が式を受けるかは `cargo build` / `cargo metadata` で確かめた）。
 //! * **`LICENSE` の散文が正しいか**は見ていない。見ているのは、署名した版から変わっていないことだけ
 //!   （[`SIGNED_LICENSE_SHA256`]）。
 //! * **AI 協働の開示の文書の散文が事実どおりか**（コミットの数・期間等）は見ていない。
 //!   見ているのは、承認した版から変わっていないことだけ（[`APPROVED_DISCLOSURE_SHA256`]）。
-//!   文書の中のリンクが実在することは `tests/readme.rs` が、両方の README から案内されていることも
+//!   文書の中のリンクが実在することは `tests/readme.rs` が、3つの README から案内されていることも
 //!   `tests/readme.rs` が見る。
 //! * **zip に入ること**は `tests/distribution.rs` が見る（AI 協働の開示の文書も）。
 //! * **写し元の版を上げたとき**は、下の指紋も一緒に変えないと赤になる（赤の側に倒れる）。
@@ -45,7 +46,7 @@ mod sha256;
 
 use sha256::sha256_hex;
 
-/// **ADR-0048 §1 で決めた式。** 5か所はこれと同じ綴りであること。
+/// **ADR-0048 §1 で決めた式。** 6か所はこれと同じ綴りであること。
 const EXPRESSION: &str = "MIT OR Apache-2.0 OR LicenseRef-ACCRL-0.3";
 
 /// 採用の表明と、三択の案内（利用者が承認し署名した文面）。
@@ -68,10 +69,22 @@ const README_SECTION: &str = "## ライセンス";
 const README_EN: &str = "README.en.md";
 const README_EN_SECTION: &str = "## License";
 
+/// 繁体字中国語（台湾）の README と、その中のライセンスの節の見出し
+/// （作業単位 O-14 / marukei/personacore#8）。
+const README_ZH_TW: &str = "README.zh-TW.md";
+const README_ZH_TW_SECTION: &str = "## 授權";
+
+/// 訳の README と、その中のライセンスの節の見出し。**訳を足すときはここに1行足す**
+/// （式の突き合わせと、英語の段落をそのまま載せているかの両方がこの一覧を回す）。
+const TRANSLATED_READMES: [(&str, &str); 2] = [
+    (README_EN, README_EN_SECTION),
+    (README_ZH_TW, README_ZH_TW_SECTION),
+];
+
 /// `LICENSE` の英語の段落（三択の案内）の書き出し。段落はここから次の空行の手前まで。
 ///
-/// 英語の README はこの段落を**そのまま**載せる（`LICENSE` は利用者が署名した文面なので、
-/// 言い換えて食い違わせない）。
+/// 訳の README（英語・繁体字中国語）はこの段落を**訳さずにそのまま**載せる
+/// （`LICENSE` は利用者が署名した文面なので、言い換えて食い違わせない）。
 const LICENSE_ENGLISH_PARAGRAPH_HEAD: &str = "personacore is available under your choice of";
 
 /// MIT の文書（著作権の行だけを差し替えた標準の本文）。
@@ -403,6 +416,15 @@ fn the_readme_scan_reads_only_the_license_section() {
             vec!["C OR D"]
         );
     }
+
+    // 繁体字中国語の README の見出しでも同じ（O-14）。
+    let planted_zh = "# 標題\n\n`外 A OR B`\n\n## 授權\n\n`C OR D`\n\n## 參與貢獻\n\n`E OR F`\n";
+    for source in both_newlines(planted_zh) {
+        assert_eq!(
+            readme_license_expressions(&source, README_ZH_TW_SECTION),
+            vec!["C OR D"]
+        );
+    }
 }
 
 #[test]
@@ -519,10 +541,10 @@ fn a_single_misspelled_place_is_reported() {
 // 実ファイル
 // ----------------------------------------------------------------------
 
-/// **5か所の式が、どれも1つきりで、[`EXPRESSION`] と同じ綴り。**
+/// **6か所の式が、どれも1つきりで、[`EXPRESSION`] と同じ綴り**（訳の README は [`TRANSLATED_READMES`] を回す）。
 #[test]
 fn every_place_names_the_same_license_expression() {
-    let places = [
+    let mut places = vec![
         (LICENSE, spdx_expressions(&read_repo_file(LICENSE))),
         (
             CARGO_MANIFEST,
@@ -536,11 +558,13 @@ fn every_place_names_the_same_license_expression() {
             README,
             readme_license_expressions(&read_repo_file(README), README_SECTION),
         ),
-        (
-            README_EN,
-            readme_license_expressions(&read_repo_file(README_EN), README_EN_SECTION),
-        ),
     ];
+    for (name, heading) in TRANSLATED_READMES {
+        places.push((
+            name,
+            readme_license_expressions(&read_repo_file(name), heading),
+        ));
+    }
     let wrong = disagreements(EXPRESSION, &places);
     assert!(
         wrong.is_empty(),
@@ -548,20 +572,26 @@ fn every_place_names_the_same_license_expression() {
     );
 }
 
-/// **英語の README の「License」の節が、`LICENSE` の英語の段落をそのまま載せている**
-/// （作業単位 O-10 / Issue origin#104）。
+/// **訳の README のライセンスの節が、`LICENSE` の英語の段落をそのまま載せている**
+/// （英語は作業単位 O-10 / Issue origin#104、繁体字中国語は O-14 / marukei/personacore#8）。
 ///
-/// `LICENSE` は利用者が署名した文面である。英語の README が三択を自分の言葉で言い直すと、
-/// **署名した文面と違うことを言いうる。** なので言い直さず、段落ごと載せる
-/// （空白・折り返しの違いだけを許す）。
+/// `LICENSE` は利用者が署名した文面である。訳の README が三択を自分の言葉で言い直すと
+/// （訳すことも含む）、**署名した文面と違うことを言いうる。** なので言い直さず、段落ごと載せる
+/// （空白・折り返しの違いだけを許す）。訳は [`TRANSLATED_READMES`] を回す。
 #[test]
-fn the_english_readme_quotes_the_english_paragraph_of_the_license() {
+fn the_translated_readmes_quote_the_english_paragraph_of_the_license() {
     let paragraph = license_english_paragraph(&read_repo_file(LICENSE)).unwrap_or_else(|| {
         panic!("{LICENSE} に `{LICENSE_ENGLISH_PARAGRAPH_HEAD}` で始まる段落が1つきりで在ること")
     });
+    let missing: Vec<String> = TRANSLATED_READMES
+        .iter()
+        .filter(|(name, heading)| !section_quotes(&read_repo_file(name), heading, &paragraph))
+        .map(|(name, heading)| format!("{name} の `{heading}` の節"))
+        .collect();
     assert!(
-        section_quotes(&read_repo_file(README_EN), README_EN_SECTION, &paragraph),
-        "{README_EN} の `{README_EN_SECTION}` の節が、{LICENSE} の英語の段落をそのまま載せていない: {paragraph}"
+        missing.is_empty(),
+        "{LICENSE} の英語の段落をそのまま載せていない: {} —— 段落: {paragraph}",
+        missing.join(" / ")
     );
 }
 

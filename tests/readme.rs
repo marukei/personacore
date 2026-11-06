@@ -1859,10 +1859,6 @@ fn executable_accepts(flag: &str) -> bool {
     parse_args([flag]).is_ok() || parse_args([flag, SAMPLE_FLAG_VALUE]).is_ok()
 }
 
-fn readme_en() -> String {
-    read_repo_file(README_EN)
-}
-
 /// ソースが名指しする `--<英字>…` の旗を全部返す。
 ///
 /// 旗は、**語の切れ目**（行頭・空白・記号 `` `*(),.;:"'<>[]| `` ・ASCII でない文字）の直後の `--` から、
@@ -2144,8 +2140,8 @@ fn the_translated_readmes_point_at_the_defaults_instead_of_copying_them() {
 // 根の `NOTICE-AI-COLLABORATION.md`。`LICENSE` が名指し（名前の一致と承認した版の指紋は
 // `tests/license.rs`）、配る zip にも入る（`tests/distribution.rs`）。ここが見るのは2つ:
 //
-// * **両方の README と docs の索引から案内されていること**（origin#50 のコメント /
-//   O-10 のレビューからの申し送り）。
+// * **3つの README（[`ALL_READMES`]）と docs の索引から案内されていること**
+//   （origin#50 のコメント / O-10 のレビューからの申し送り。繁体字中国語は O-14 で足した）。
 // * **文書の中のリンクが、全部実在するものを指していること**（同じ文書の中の錨も、
 //   その錨の `id` が文書の中に在ること）。
 //
@@ -2213,7 +2209,8 @@ fn the_anchor_scans_read_the_source_they_are_given() {
     assert!(declared_ids("錨の無い行\n").is_empty());
 }
 
-/// **両方の README と docs の索引が、AI 協働の開示の文書へ案内していること**（O-3 / Issue origin#50）。
+/// **3つの README と docs の索引が、AI 協働の開示の文書へ案内していること**
+/// （O-3 / Issue origin#50。繁体字中国語の README は O-14 / marukei/personacore#8 で足した）。
 ///
 /// 案内が無いと、`LICENSE` からしかたどれない（リポジトリを開いた人の入口から見えない）。
 #[test]
@@ -2224,13 +2221,15 @@ fn the_readmes_and_the_docs_index_point_at_the_ai_collaboration_disclosure() {
             .map(|(_, target)| target)
             .collect()
     };
+    // 根の README と訳の全部（[`ALL_READMES`]。訳を足せばここも見る）。
+    let not_pointing: Vec<&str> = ALL_READMES
+        .into_iter()
+        .filter(|name| !targets(&read_repo_file(name)).contains(DISCLOSURE))
+        .collect();
     assert!(
-        targets(&readme()).contains(DISCLOSURE),
-        "{README} が {DISCLOSURE} を案内していない"
-    );
-    assert!(
-        targets(&readme_en()).contains(DISCLOSURE),
-        "{README_EN} が {DISCLOSURE} を案内していない"
+        not_pointing.is_empty(),
+        "{DISCLOSURE} を案内していない README: {}",
+        not_pointing.join(" / ")
     );
     assert!(
         targets(&read_repo_file(DOCS_INDEX)).contains(DOCS_INDEX_TO_DISCLOSURE),
