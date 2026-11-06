@@ -15,6 +15,7 @@
 | [../scripts/README-start.md](../scripts/README-start.md) | **起動のしかた**。`start.ps1` の引数、**上流プロファイル（`upstreams.json`）の書き方**、DB の置き場所 | リポジトリから動かすとき・上流を替えるとき |
 | [../scripts/README-dist.md](../scripts/README-dist.md) | **配布物（zip）に入る利用者向けの説明**。配った実行ファイルだけで遊ぶ人が読む | 配布物を作るとき・配られた側の目線を確かめるとき |
 | [../README.en.md](../README.en.md) | **英語の入口**（English README）。何をするものか・何で動くか・配布物の入手と起動・上流・ライセンス。詳細は写さず、この表の文書と API ガイドへ案内する（O-10 / Issue origin#104） | 英語で読む人に、最初に渡すとき |
+| [../README.zh-TW.md](../README.zh-TW.md) | **繁体字中国語（台湾）の入口**（繁體中文 README）。英語の入口の訳で、構成とリンク先は英語の入口と同じ。ライセンスの節は `LICENSE` の英語の段落を訳さずに載せる（O-14 / Issue marukei/personacore#8） | 繁体字中国語で読む人に、最初に渡すとき |
 | [api/README.md](api/README.md) | **英語の API ガイド**（英語の案内は、これと根の英語の README の2つだけ。ライセンスの文書と、日英併記の AI 協働の開示の文書の英語の節を除く / [ADR-0047](adr/0047-the-api-is-the-product.md) ② P-2c）。画面なしの起動・`model` の綴り・既存のチャットクライアントから使うときの注意・管理の口・版と互換の方針。**綴りは `src/server/openapi/guide_tests.rs` が仕様書と定数に突き合わせる** | personacore を自分のソフトや既存のクライアントから使うとき |
 
 ## 設計を知る
