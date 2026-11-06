@@ -1,6 +1,6 @@
 # personacore
 
-English: [README.en.md](README.en.md)
+English: [README.en.md](README.en.md) · 繁體中文: [README.zh-TW.md](README.zh-TW.md)
 
 ローカルの推論サーバに、**キャラクターと記憶**を持たせるための中間サーバ。
 
