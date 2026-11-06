@@ -117,7 +117,7 @@ O-6 に入るにあたり、利用者が次のことを決めた。手順の細�
    - `user.name` の旗は利用者レベルの cargo の設定から外す。
    - 実名の綴り（ローマ字と漢字）は、利用者がどの Git の作業ツリーにも入っていないファイルに書き、`PERSONACORE_PRIVATE_SPELLINGS` で指す。司令塔とエージェントはその綴りを書かない。
 5. **Issue の参照の書き方を2つのリポジトリで揃える。**
-   - 追跡ファイルでは、origin の Issue は `origin#N`、公開側の Issue は `marukei/personacore#N` と書く（どちらも `tests/issue_references.rs` の走査に当たらない）。
+   - 追跡ファイルでは、origin の Issue は `origin#N`、公開側の Issue は `marukei/personacore#N` と書く（どちらも `tests/issue_references.rs` の走査に当たらない。**公開側の形は B-73 まで実際には当たっていた** —— 下の「O-6 を実行した記録」）。
    - コミットの本文の閉じるキーワードは、`Closes marukei/personacore#N` と完全な形で書く。こう書けば、origin へ取り込んでも origin の Issue を閉じない。PR の本文では `Closes #N` と書いてよい（PR の結び付きで閉じ、マージコミットの本文には写らないように設定する）。
    - 取り込む前に、取り込むコミットの本文に、完全な形でない閉じるキーワードが無いことを確かめる。
 6. **origin に開いている Issue は、着手するときに公開側で開き直す**（本文に `origin#N` を書く）。一度に全部は移さない。
@@ -151,3 +151,4 @@ O-6 を実行し、2026-11-06 に公開した。手順の細部は origin#53 に
 - **マージコミットの題名には「(#番号)」が付く。** origin へ取り込むと、origin の同じ番号の Issue に「参照された」記録が付く（最初の取り込みで確かめた）。「(#番号)」は閉じるキーワードではないので、Issue は閉じないはずである（このとき参照された Issue はもともと閉じていたので、閉じないことは観測していない）。害が無いので、そのままにする。
 - O-13（CI）は公開側の最初の Issue と PR として入れた（https://github.com/marukei/personacore/issues/1 、https://github.com/marukei/personacore/pull/2 ）。Windows のランナーで Rust は約 24 分、web は約 2 分かかる。**マージの後に、CI の2つのジョブをルールセット `main` の必須のチェックにした**（決定1）。
 - **管理者のバイパスは必須のチェックも飛ばす**（GitHub の仕様による。ルールセットのバイパスはルールセット単位で効き、ルールごとには外せない。観測はしていない）。そのため、`--admin` でマージする前に、CI の緑を確かめる（`CLAUDE.md` §4「公開の後の運用」）。
+- **決定5の「公開側の `marukei/personacore#N` は走査に当たらない」は、決めた時点では誤りだった。** `tests/issue_references.rs` は `owner/repo#数字` をわざと拾っていたので、番号を書くと赤になった。O-12 のレビューは `N` の綴りで確かめたので見落とし、O-13 の最初の CI で分かった。B-73（https://github.com/marukei/personacore/issues/3 ）で走査を変え、`#` の直前がちょうど `marukei/personacore`（大文字小文字も区別）のときだけ通すようにした。公開の後はこの名前が変わらず、どこで描画しても公開側を指すからである。ほかの `owner/repo#数字`（`marukei/personacore-origin` や大文字違いも含む）は今までどおり拾う。
