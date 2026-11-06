@@ -11,6 +11,13 @@
 //!
 //! - **リンクされた**: 行頭・空白の後・`（` `、` `「` `〜` の後・漢字の直後（`作業単位#31`）・`~~` `**` の中・
 //!   `/` `.` `-` `=` `:` `"` `(` の後・`owner/repo#31`。
+//!
+//! `owner/repo#N` は拾う（改名や移転の後に指す先が変わりうるし、origin を指すものは公開側で辿れない）。
+//! ただし**公開側の `marukei/personacore#N` だけは通す**（[`PUBLIC_REPO`]）—— O-6 の後は名前が変わらず、
+//! どこで描画しても（origin の中でも）公開側を指すため。決まりは ADR-0048 の追記 決定5・CLAUDE.md §4「公開の後の運用」。
+//! 比較は `owner` と `repo` の完全一致（大文字小文字も区別）で、`Marukei/Personacore`・`xmarukei/personacore`・
+//! `marukei/personacore.git`・`marukei/personacore-origin` などは安全側に倒して拾う。通すのはその直後の `#数字` だけで、
+//! 同じ行の他の参照は拾う。
 //! - **リンクされなかった**: 英数字と `_` の直後（`abc#31` / `_#31` / `origin#31`）・数字の直後に英字（`#31a`）・
 //!   `&#31;`（文字参照。**セミコロンで閉じたときだけ**で、`&#31 x` はリンクされる）・コードスパンの中・`#31の`（直後が日本語）・`#666`（その番号の Issue が無い）。
 //!
@@ -99,20 +106,44 @@ fn is_word(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// `before` が `owner/repo` で終わるか（`owner/repo#31` も GitHub はリンクする。公開側へ改名した後に
-/// どのリポジトリを指すかが変わりうるので拾う）。`https://…/a/b#12` のように `/` が2つ以上あるものは URL として外す。
-fn is_owner_repo(before: &str) -> bool {
-    let tail: String = before
+/// 追跡ファイルに `owner/repo#N` の形で書いてよい、ただ1つのリポジトリ（公開側）。`(owner, repo)`。
+///
+/// O-6 の後、公開側の名前は変わらないので、この形はどこで描画されても（origin の中でも）公開側の Issue を指す。
+/// 決まりは ADR-0048 の追記 決定5・CLAUDE.md §4「公開の後の運用」。比較は大文字小文字まで含めた完全一致
+/// （`Marukei/Personacore` は GitHub 上では同じリポジトリへリンクするが、安全側に倒して拾い、決まった綴り1つだけを通す）。
+const PUBLIC_REPO: (&str, &str) = ("marukei", "personacore");
+
+/// `before` が `owner/repo` で終わるなら、その `(owner, repo)` を返す。
+/// `https://…/a/b#12` のように `/` が2つ以上あるものは URL として外す（`None`）。
+fn owner_repo(before: &str) -> Option<(&str, &str)> {
+    let len: usize = before
         .chars()
         .rev()
         .take_while(|c| is_word(*c) || matches!(c, '.' | '-' | '/'))
-        .collect();
-    let tail: String = tail.chars().rev().collect();
+        .map(char::len_utf8)
+        .sum();
+    let tail = &before[before.len() - len..];
     let mut parts = tail.split('/');
-    matches!(
-        (parts.next(), parts.next(), parts.next()),
-        (Some(owner), Some(repo), None) if !owner.is_empty() && !repo.is_empty()
-    )
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(repo), None) if !owner.is_empty() && !repo.is_empty() => {
+            Some((owner, repo))
+        }
+        _ => None,
+    }
+}
+
+/// `before` が、拾うべき `owner/repo` で終わるか。
+///
+/// `owner/repo#N` も GitHub はリンクする。公開側の [`PUBLIC_REPO`] 以外は拾う —— 改名や移転の後に
+/// どのリポジトリを指すかが変わりうるし、origin（`marukei/personacore-origin#N`）を指す参照は公開側では辿れない。
+/// 公開側の `marukei/personacore#N` だけは、名前が変わらずどこで描画しても公開側を指すので通す。
+fn is_owner_repo(before: &str) -> bool {
+    owner_repo(before).is_some()
+}
+
+/// `before` が、ちょうど公開側の `marukei/personacore` で終わるか（その直後の `#数字` は拾わない）。
+fn is_public_repo(before: &str) -> bool {
+    owner_repo(before) == Some(PUBLIC_REPO)
 }
 
 /// 1行の中の、リンクされうる `#数字` を `(バイトの開始, バイトの終わり)` で返す。
@@ -121,7 +152,8 @@ fn references_in_line(line: &str) -> Vec<(usize, usize)> {
     let mut prev: Option<char> = None;
     let mut chars = line.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
-        let opens = !prev.is_some_and(is_word) || is_owner_repo(&line[..i]);
+        let opens = (!prev.is_some_and(is_word) || is_owner_repo(&line[..i]))
+            && !is_public_repo(&line[..i]);
         if c == '#' && opens {
             let mut end = i + 1;
             while let Some(&(j, d)) = chars.peek() {
@@ -281,7 +313,15 @@ fn planted_references_are_found_and_look_alikes_are_not_in_both_newline_styles()
         format!("作業単位{n}"),
         format!("範囲 {}〜{}", issue(31), issue(33)),
         format!("~~{n}~~ と **{n}**"),
-        format!("marukei/personacore{n}"),
+        format!("marukei/personacore-origin{n}"),
+        format!("example/personacore{n}"),
+        format!("xmarukei/personacore{n}"),
+        format!("foo.marukei/personacore{n}"),
+        format!("Marukei/Personacore{n}"),
+        format!("marukei/Personacore{n}"),
+        format!("marukei/personacore.git{n}"),
+        format!("example/other{n}"),
+        format!("（marukei/personacorex{n}）"),
         format!("行末の {n}"),
         format!("閉じない文字参照 &{n} x"),
     ];
@@ -308,6 +348,10 @@ fn planted_references_are_found_and_look_alikes_are_not_in_both_newline_styles()
         );
     }
     let green = [
+        format!("marukei/personacore{n}"),
+        format!("（marukei/personacore{n}）"),
+        format!("行頭でなく、marukei/personacore{n} の形"),
+        format!("`marukei/personacore{n}`"),
         "#[derive(Debug)]".to_owned(),
         "#![allow(dead_code)]".to_owned(),
         "# 見出し".to_owned(),
@@ -330,6 +374,16 @@ fn planted_references_are_found_and_look_alikes_are_not_in_both_newline_styles()
                 "拾ってはいけない綴りを拾った: {line:?} → {found:?}"
             );
         }
+    }
+    // 公開側の綴りが通すのは、その直後の `#数字` だけ。同じ行の素の参照は拾う。
+    let mixed = format!(
+        "公開側 marukei/personacore{} と素の {}\n",
+        issue(31),
+        issue(33)
+    );
+    for text in both_newlines(&mixed) {
+        let (found, _) = scan([("x.md", text.as_str())], &[]);
+        assert_eq!(found, vec![format!("x.md:1:{}", issue(33))]);
     }
 }
 
