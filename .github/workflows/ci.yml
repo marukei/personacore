@@ -1,4 +1,4 @@
-# CI（作業単位 O-13 / marukei/personacore#1）。
+# CI（作業単位 O-13 / ADR-0048 の追記 2026-11-06）。
 # 使う Actions はコミットのハッシュで固定する（タグは付け替えられうる）。
 # コマンドの並びは CLAUDE.md の「コマンド」節と CONTRIBUTING.md の「テスト」に揃える。
 name: CI
