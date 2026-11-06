@@ -1,0 +1,78 @@
+# CI（作業単位 O-13 / marukei/personacore#1）。
+# 使う Actions はコミットのハッシュで固定する（タグは付け替えられうる）。
+# コマンドの並びは CLAUDE.md の「コマンド」節と CONTRIBUTING.md の「テスト」に揃える。
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rust:
+    name: Rust (build, fmt, clippy, test)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rust-toolchain.toml の channel と components を入れる（rustup は自動では入れない）。
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      # 素の cargo build を省かない（dev-dependencies で有効になるフィーチャを、これだけが検出する）。
+      - name: cargo build
+        run: cargo build --locked
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # 合否は終了コードで見る（テストバイナリごと落ちるものは failed に数えられない）。
+      - name: cargo test
+        run: cargo test --locked --no-fail-fast
+
+  web:
+    name: Web (check, test)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # web/package.json の packageManager の版を入れる。
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: web/package.json
+          cache: true
+          cache_dependency_path: web/pnpm-lock.yaml
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm check
+        run: pnpm check
+
+      - name: pnpm test
+        run: pnpm test
