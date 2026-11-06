@@ -1,7 +1,9 @@
 //! リポジトリ根の `README.md` が名指しするものを、実体と突き合わせる。
 //!
-//! 英語の README（`README.en.md`）にも、同じ走査の本体の一部を当てている
-//! （作業単位 O-10 / Issue origin#104。何を当てて何を当てていないかは、ファイルの末尾の節の頭）。
+//! 訳の README（英語の `README.en.md` と繁体字中国語の `README.zh-TW.md`）にも、
+//! 同じ走査の本体の一部を当てている（英語は作業単位 O-10 / Issue origin#104、
+//! 繁体字中国語は O-14 / marukei/personacore#8。訳の一覧は [`TRANSLATED_READMES`]、
+//! 何を当てて何を当てていないかは「訳の README」の節の頭）。
 //!
 //! # なぜ要るか（作業単位 F-2）
 //!
@@ -171,6 +173,8 @@ const LEAST_CARGO_COMMANDS: usize = 4;
 /// README の相対リンクの最低本数。
 ///
 /// **実数（23）に近い床。** 着手時（2026-08-29）に自分で数えた値である
+/// （**⚠ O-14 で数え直すと実数は 50**（言語の行に `README.zh-TW.md` を足す前は 49）/ 2026-11-06。
+/// 着手の後に案内が増えて、床は実数から離れている。床の値は O-14 では変えていない）
 /// （CLAUDE.md「書く数は自分が読んだ数だけにする」）。
 /// **緩い床は「守っている」と数えられるだけで何も守らない**ので、実数に寄せてある。
 const LEAST_LINKS: usize = 20;
@@ -1784,30 +1788,61 @@ fn the_manifest_scan_reads_the_source_it_is_given() {
 }
 
 // ----------------------------------------------------------------------
-// **英語の README**（作業単位 O-10 / Issue origin#104）
+// **訳の README**（英語は作業単位 O-10 / Issue origin#104、
+// 繁体字中国語（台湾）は O-14 / marukei/personacore#8）
 //
-// 根の README に当てている突き合わせのうち、英語の README が名指しするもの
+// 根の README に当てている突き合わせのうち、訳の README が名指しするもの
 // （リンク・環境変数・起動スクリプト・宛先・PowerShell の版・既定値の在処）を、
-// **同じ走査の本体で**英語の README にも当てる。加えて、根の README が見ていない
-// **実行ファイルの旗**を見る（英語の README は配布物の exe を主に案内するため）。
+// **同じ走査の本体で**訳の README の全部（[`TRANSLATED_READMES`]）に当てる。
+// 加えて、根の README が見ていない**実行ファイルの旗**を見る
+// （訳の README は配布物の exe を主に案内するため）。
+// 3つの README の**どの2つの間も両方向にリンクしていること**も、ここが見る
+// （[`every_readme_links_to_every_other_readme`]）。
+//
+// **訳を足すときは、[`TRANSLATED_READMES`] に1行足す**（test 関数は訳ごとに増やさない）。
+// どの README で落ちたかは、アサートの文面がファイル名で言う。
 //
 // # ⚠ 守っていないもの（先に書く）
 //
-// * **散文は1つも見ていない。** 英語の文が日本語の README と同じことを言っているかは、
-//   ここでは検査できない（人のレビューが受け持つ）。
-// * **引数（`-Port` 等）の案内と `cargo` の並びは見ていない** —— 英語の README は
+// * **散文は1つも見ていない。** 英語の文・繁体字中国語の文が日本語の README と
+//   同じことを言っているかは、ここでは検査できない（翻訳のレビューが受け持つ）。
+// * **引数（`-Port` 等）の案内と `cargo` の並びは見ていない** —— 訳の README は
 //   どちらも書かず、権威の文書（`scripts/README-start.md` / `CLAUDE.md`）へ案内するだけである。
 //   **書き足したら、ここにも突き合わせを足すこと。**
-// * **床（[`LEAST_EN_LINKS`]）は、根の README の床と同じく無防備**（module doc の表と同じ形）。
+// * **床（[`LEAST_EN_LINKS`] / [`LEAST_ZH_TW_LINKS`]）は、根の README の床と同じく無防備**
+//   （module doc の表と同じ形）。
+// * **⚠ 一覧から訳を落とす手は、テストでは片方の一覧からしか止まらない**（O-14 で実測）。
+//   [`TRANSLATED_READMES`] だけから落とすと、[`ALL_READMES`] との突き合わせが赤になる。
+//   **両方から落とすと `cargo test` は全緑**で、止めるのは使われなくなった定数への
+//   `cargo clippy -- -D warnings` の `never used` だけである（定数ごと消せば、それも鳴らないはず —— こちらは当てていない）。
 // ----------------------------------------------------------------------
 
 /// 英語の README。
 const README_EN: &str = "README.en.md";
 
+/// 繁体字中国語（台湾）の README（`README.en.md` の訳 / O-14）。
+const README_ZH_TW: &str = "README.zh-TW.md";
+
 /// 英語の README の相対リンクの最低本数。
 ///
 /// **実数（23）に近い床**（作業単位 O-10 のレビューの是正の後に数えた値。着手時は 22）。
+/// **⚠ O-14 で数え直すと実数は 28**（言語の行に `README.zh-TW.md` を足す前は 27 / 2026-11-06）。
+/// O-10 の後に案内が増えている。床の値は O-14 では変えていない。
 const LEAST_EN_LINKS: usize = 20;
+
+/// 繁体字中国語の README の相対リンクの最低本数。
+///
+/// **実数（28。言語の行の2本を含む）に近い床**（作業単位 O-14 の着手時 / 2026-11-06 に数えた値）。
+const LEAST_ZH_TW_LINKS: usize = 26;
+
+/// 訳の README と、それぞれの相対リンクの床。**訳を足すときはここに1行足す。**
+const TRANSLATED_READMES: [(&str, usize); 2] = [
+    (README_EN, LEAST_EN_LINKS),
+    (README_ZH_TW, LEAST_ZH_TW_LINKS),
+];
+
+/// 互いにリンクしているべき README の全部（根の README と、訳の全部）。
+const ALL_READMES: [&str; 3] = [README, README_EN, README_ZH_TW];
 
 /// 値を取る旗に渡す、見本のプロファイル名。
 const SAMPLE_FLAG_VALUE: &str = "sample";
@@ -1828,18 +1863,32 @@ fn readme_en() -> String {
     read_repo_file(README_EN)
 }
 
-/// ソースが名指しする `--<英字>…` の旗を全部返す（空白で区切った語の、前後の記号を落としたもの）。
+/// ソースが名指しする `--<英字>…` の旗を全部返す。
 ///
-/// `---`（区切り線）と表の `|---|` は、`--` の後に英字が続かないので拾わない。
+/// 旗は、**語の切れ目**（行頭・空白・記号 `` `*(),.;:"'<>[]| `` ・ASCII でない文字）の直後の `--` から、
+/// 次の語の切れ目の手前までである。`---`（区切り線）と表の `|---|` は、`--` の後に英字が
+/// 続かないので拾わない。`a--b` は `--` の前が切れ目でないので拾わない。
+///
+/// **⚠ 空白で区切った語の頭だけを見る形にしないこと**（O-14）。繁体字中国語の README は
+/// 語の間に空白を置かないので、その形は `其他旗標：`--no-ui`（…` の旗を拾わなかった。
+/// 代わりに、語の中の記号（`--a,b` の `,`）でも旗が終わる（英語の README には無い綴り）。
 fn flags_named(source: &str) -> BTreeSet<String> {
+    fn breaks_word(ch: char) -> bool {
+        ch.is_whitespace() || !ch.is_ascii() || "`*(),.;:\"'<>[]|".contains(ch)
+    }
     let mut found = BTreeSet::new();
-    for word in source.split_whitespace() {
-        let word = word.trim_matches(|ch: char| "`*(),.;:\"'<>[]|".contains(ch));
-        let Some(rest) = word.strip_prefix("--") else {
+    for (at, _) in source.match_indices("--") {
+        if source[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| !breaks_word(ch))
+        {
             continue;
-        };
-        if rest.starts_with(|ch: char| ch.is_ascii_alphabetic()) {
-            found.insert(word.to_owned());
+        }
+        let body = &source[at + 2..];
+        let len = body.find(breaks_word).unwrap_or(body.len());
+        if body.starts_with(|ch: char| ch.is_ascii_alphabetic()) {
+            found.insert(format!("--{}", &body[..len]));
         }
     }
     found
@@ -1860,91 +1909,127 @@ fn the_flag_scan_reads_the_source_it_is_given() {
     assert_eq!(flags_named(planted), expected);
     assert_eq!(flags_named(&planted.replace('\n', "\r\n")), expected);
     assert!(flags_named("--- と --1 は旗ではない\n").is_empty());
+
+    // **語の間に空白を置かない書き方（繁体字中国語の README / O-14）でも拾うこと。**
+    // 空白で区切った語の頭だけを見ていた走査は、`其他旗標：`--no-ui`（僅提供…` の
+    // 旗を1つも拾わなかった（実ファイルで「旗を 1 個しか名指ししていない」と赤になった）。
+    let cjk = "其他旗標：`--no-ui`（僅提供 API）、`--no-browser`、`--upstream <name>`（啟動時）、\
+               `--fresh`（移到一旁）、`--version`。啟動時使用--fresh=1或a--b。\n";
+    let cjk_expected = BTreeSet::from([
+        "--fresh".to_owned(),
+        "--fresh=1".to_owned(),
+        "--no-browser".to_owned(),
+        "--no-ui".to_owned(),
+        "--upstream".to_owned(),
+        "--version".to_owned(),
+    ]);
+    assert_eq!(flags_named(cjk), cjk_expected);
+    assert_eq!(flags_named(&cjk.replace('\n', "\r\n")), cjk_expected);
 }
 
-/// **根の README と英語の README が、互いをリンクしていること。**
+/// **3つの README の、どの2つの間も両方向にリンクしていること**（6方向）。
 ///
 /// 片方からしかたどれないと、もう片方は**入口から見えない文書**になる。
+/// 欠けた方向は全部まとめて文面に出す（1本目で止めない）。
 #[test]
-fn the_two_readmes_link_to_each_other() {
-    let targets = |source: &str| -> BTreeSet<String> {
-        relative_links(source)
+fn every_readme_links_to_every_other_readme() {
+    // 一覧の写しが食い違っていないこと（訳を足して片方を忘れる形を止める）。
+    let mut listed: Vec<&str> = vec![README];
+    listed.extend(TRANSLATED_READMES.iter().map(|(name, _)| *name));
+    assert_eq!(
+        listed,
+        ALL_READMES.to_vec(),
+        "ALL_READMES が、根の README と TRANSLATED_READMES の並びと揃っていない"
+    );
+
+    let mut missing = Vec::new();
+    for from in ALL_READMES {
+        let targets: BTreeSet<String> = relative_links(&read_repo_file(from))
             .into_iter()
             .map(|(_, target)| target)
-            .collect()
-    };
+            .collect();
+        for to in ALL_READMES {
+            if from != to && !targets.contains(to) {
+                missing.push(format!("{from} → {to}"));
+            }
+        }
+    }
     assert!(
-        targets(&readme()).contains(README_EN),
-        "{README} が {README_EN} をリンクしていない"
-    );
-    assert!(
-        targets(&readme_en()).contains(README),
-        "{README_EN} が {README} をリンクしていない"
+        missing.is_empty(),
+        "README の間のリンクが欠けている（リンクしていない向き）: {}",
+        missing.join(" / ")
     );
 }
 
-/// **英語の README のリンクは、全部実在するものを指していること。**
+/// **訳の README のリンクは、全部実在するものを指していること。**
 ///
 /// **⚠ 見出しの錨は落として読む**ので、節が消えても鳴らない（根の README と同じ限界）。
 #[test]
-fn every_link_in_the_english_readme_points_at_something_that_exists() {
-    let links = relative_links(&readme_en());
+fn every_link_in_the_translated_readmes_points_at_something_that_exists() {
+    for (name, least) in TRANSLATED_READMES {
+        let links = relative_links(&read_repo_file(name));
 
-    assert!(
-        links.len() >= LEAST_EN_LINKS,
-        "{README_EN} の相対リンクが {} 件しかない（記録では最低 {LEAST_EN_LINKS} 件）",
-        links.len()
-    );
-
-    for (label, target) in &links {
-        let path = repo_path(target);
         assert!(
-            path.exists(),
-            "{README_EN} の「{label}」が指す {target} がリポジトリに無い（{}）",
-            path.display()
+            links.len() >= least,
+            "{name} の相対リンクが {} 件しかない（記録では最低 {least} 件）",
+            links.len()
         );
+
+        for (label, target) in &links {
+            let path = repo_path(target);
+            assert!(
+                path.exists(),
+                "{name} の「{label}」が指す {target} がリポジトリに無い（{}）",
+                path.display()
+            );
+        }
     }
 }
 
-/// **英語の README が名指しする環境変数は、全部サーバが実際に読むものであること。**
+/// **訳の README が名指しする環境変数は、全部サーバが実際に読むものであること。**
 #[test]
-fn the_english_readme_only_names_environment_variables_the_server_reads() {
+fn the_translated_readmes_only_name_environment_variables_the_server_reads() {
     let config = read_repo_file(CONFIG_SOURCE);
     let defined = defined_env_names(&config);
-    let readme_en = readme_en();
-    let named = personacore_env_names(&readme_en);
 
-    assert!(
-        !named.is_empty(),
-        "{README_EN} が環境変数を1つも名指ししていない（走査が空振りしている疑い）"
-    );
-    for name in &named {
+    for (name, _) in TRANSLATED_READMES {
+        let source = read_repo_file(name);
+        let named = personacore_env_names(&source);
+
         assert!(
-            defined.contains(name),
-            "{README_EN} が `{name}` を案内しているが、{CONFIG_SOURCE} にその綴りの定義が無い\
-             （サーバは黙って無視する）"
+            !named.is_empty(),
+            "{name} が環境変数を1つも名指ししていない（走査が空振りしている疑い）"
         );
+        for env in &named {
+            assert!(
+                defined.contains(env),
+                "{name} が `{env}` を案内しているが、{CONFIG_SOURCE} にその綴りの定義が無い\
+                 （サーバは黙って無視する）"
+            );
+        }
     }
 }
 
-/// **英語の README が名指しする旗は、全部実行ファイルが受け付けるものであること。**
+/// **訳の README が名指しする旗は、全部実行ファイルが受け付けるものであること。**
 ///
 /// 知らない旗は起動を止める（`src/server/fresh.rs`）ので、綴りを間違えた案内は
 /// 「書いてあるとおりに打ったら起動しない」になる。
 #[test]
-fn the_english_readme_only_names_flags_the_executable_accepts() {
-    let named = flags_named(&readme_en());
+fn the_translated_readmes_only_name_flags_the_executable_accepts() {
+    for (name, _) in TRANSLATED_READMES {
+        let named = flags_named(&read_repo_file(name));
 
-    assert!(
-        named.len() >= 2,
-        "{README_EN} が旗を {} 個しか名指ししていない（走査が空振りしている疑い）",
-        named.len()
-    );
-    for flag in &named {
         assert!(
-            executable_accepts(flag),
-            "{README_EN} が `{flag}` を案内しているが、実行ファイル（parse_args）はその旗を受け付けない"
+            named.len() >= 2,
+            "{name} が旗を {} 個しか名指ししていない（走査が空振りしている疑い）",
+            named.len()
         );
+        for flag in &named {
+            assert!(
+                executable_accepts(flag),
+                "{name} が `{flag}` を案内しているが、実行ファイル（parse_args）はその旗を受け付けない"
+            );
+        }
     }
 }
 
@@ -1957,91 +2042,98 @@ fn the_flag_acceptance_asks_the_real_parser() {
     assert!(!executable_accepts("--fresh=1"), "受け付けない綴り");
 }
 
-/// **英語の README が名指しする起動スクリプトは、実在すること。**
+/// **訳の README が名指しする起動スクリプトは、実在すること。**
 #[test]
-fn the_english_readme_only_names_scripts_that_exist() {
-    let named = script_paths(&readme_en());
+fn the_translated_readmes_only_name_scripts_that_exist() {
+    for (name, _) in TRANSLATED_READMES {
+        let named = script_paths(&read_repo_file(name));
 
-    assert!(
-        named.contains(START_SCRIPT),
-        "{README_EN} が {START_SCRIPT} を名指ししていない（走査が空振りしている疑い）"
-    );
-    for path in &named {
         assert!(
-            repo_path(path).exists(),
-            "{README_EN} が {path} を案内しているが、リポジトリに無い"
+            named.contains(START_SCRIPT),
+            "{name} が {START_SCRIPT} を名指ししていない（走査が空振りしている疑い）"
         );
+        for path in &named {
+            assert!(
+                repo_path(path).exists(),
+                "{name} が {path} を案内しているが、リポジトリに無い"
+            );
+        }
     }
 }
 
-/// **英語の README が名指しする宛先は、ループバックだけであること。**
+/// **訳の README が名指しする宛先は、ループバックだけであること。**
 #[test]
-fn the_english_readme_names_no_address_other_than_the_loopback() {
-    let named = ipv4_literals(&readme_en());
+fn the_translated_readmes_name_no_address_other_than_the_loopback() {
     let loopback = BindAddr::loopback(DEFAULT_PORT)
         .socket_addr()
         .ip()
         .to_string();
 
-    assert_eq!(
-        named,
-        BTreeSet::from([loopback.clone()]),
-        "{README_EN} が {loopback} 以外の宛先を名指ししている"
-    );
+    for (name, _) in TRANSLATED_READMES {
+        assert_eq!(
+            ipv4_literals(&read_repo_file(name)),
+            BTreeSet::from([loopback.clone()]),
+            "{name} が {loopback} 以外の宛先を名指ししている"
+        );
+    }
 }
 
-/// **英語の README が名乗る PowerShell の版は、スクリプトが要求する版だけであること。**
+/// **訳の README が名乗る PowerShell の版は、スクリプトが要求する版だけであること。**
 #[test]
-fn the_english_readme_names_only_the_powershell_version_the_script_requires() {
+fn the_translated_readmes_name_only_the_powershell_version_the_script_requires() {
     let major = required_powershell_major(&start_script())
         .unwrap_or_else(|| panic!("{START_SCRIPT} が要求する版を読めること"));
 
-    assert_eq!(
-        powershell_versions_named(&readme_en()),
-        BTreeSet::from([major]),
-        "{README_EN} が名乗る PowerShell の版が、{START_SCRIPT} の要求（{major}）と揃っていない"
-    );
+    for (name, _) in TRANSLATED_READMES {
+        assert_eq!(
+            powershell_versions_named(&read_repo_file(name)),
+            BTreeSet::from([major]),
+            "{name} が名乗る PowerShell の版が、{START_SCRIPT} の要求（{major}）と揃っていない"
+        );
+    }
 }
 
-/// **英語の README も既定値を写さず、在処を指すこと**（根の README と同じ帳簿 [`POINTED_CONSTANTS`]）。
+/// **訳の README も既定値を写さず、在処を指すこと**（根の README と同じ帳簿 [`POINTED_CONSTANTS`]）。
 #[test]
-fn the_english_readme_points_at_the_defaults_instead_of_copying_them() {
-    let readme_en = readme_en();
-    let pointers = rust_const_pointers(&readme_en);
+fn the_translated_readmes_point_at_the_defaults_instead_of_copying_them() {
+    for (readme_name, _) in TRANSLATED_READMES {
+        let source = read_repo_file(readme_name);
+        let pointers = rust_const_pointers(&source);
 
-    for name in POINTED_CONSTANTS {
-        let pointing: Vec<&(String, String)> = pointers
-            .iter()
-            .filter(|(_, pointed)| pointed == name)
-            .collect();
-        assert!(
-            !pointing.is_empty(),
-            "{README_EN} が `{name}` の在処を指していない"
-        );
-
-        let actual = match name {
-            "DEFAULT_PORT" => DEFAULT_PORT.to_string(),
-            "DEFAULT_ENDPOINT" => DEFAULT_ENDPOINT.to_owned(),
-            other => panic!("帳簿にある `{other}` の突き合わせ相手が書かれていない"),
-        };
-        // **指し先が、本当にその値を持っていること。全部見る。**
-        for (path, _) in &pointing {
-            let source = read_repo_file(path);
-            let value = declared_const_value(&source, name).unwrap_or_else(|| {
-                panic!("{README_EN} が指す {path} に `pub const {name}` が無い")
-            });
-            assert_eq!(
-                value, actual,
-                "{README_EN} が指す {path} の `{name}` が、実体（{actual}）と違う"
-            );
-        }
-
-        // **写していないこと。** スキームを落とした綴りも写しに数える（[`copied_forms`]）。
-        for copy in copied_forms(&actual) {
+        for name in POINTED_CONSTANTS {
+            let pointing: Vec<&(String, String)> = pointers
+                .iter()
+                .filter(|(_, pointed)| pointed == name)
+                .collect();
             assert!(
-                !readme_en.contains(&copy),
-                "{README_EN} が `{name}` の値を `{copy}` の形で写している（在処を指す形にすること）"
+                !pointing.is_empty(),
+                "{readme_name} が `{name}` の在処を指していない"
             );
+
+            let actual = match name {
+                "DEFAULT_PORT" => DEFAULT_PORT.to_string(),
+                "DEFAULT_ENDPOINT" => DEFAULT_ENDPOINT.to_owned(),
+                other => panic!("帳簿にある `{other}` の突き合わせ相手が書かれていない"),
+            };
+            // **指し先が、本当にその値を持っていること。全部見る。**
+            for (path, _) in &pointing {
+                let pointed_source = read_repo_file(path);
+                let value = declared_const_value(&pointed_source, name).unwrap_or_else(|| {
+                    panic!("{readme_name} が指す {path} に `pub const {name}` が無い")
+                });
+                assert_eq!(
+                    value, actual,
+                    "{readme_name} が指す {path} の `{name}` が、実体（{actual}）と違う"
+                );
+            }
+
+            // **写していないこと。** スキームを落とした綴りも写しに数える（[`copied_forms`]）。
+            for copy in copied_forms(&actual) {
+                assert!(
+                    !source.contains(&copy),
+                    "{readme_name} が `{name}` の値を `{copy}` の形で写している（在処を指す形にすること）"
+                );
+            }
         }
     }
 }
