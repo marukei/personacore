@@ -38,6 +38,7 @@
 //! 走査の本体はすべてソースを引数で受け取り、植えたソースを LF と CRLF の両方で通す
 //! （clone 直後の作業ツリーは CRLF になる）。
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// **SHA-256 は `tests/api_shape_fingerprint.rs` と共有する1つの実装**（既知の値の検査もそちら / 作業単位 O-7）。
@@ -592,6 +593,85 @@ fn the_translated_readmes_quote_the_english_paragraph_of_the_license() {
         missing.is_empty(),
         "{LICENSE} の英語の段落をそのまま載せていない: {} —— 段落: {paragraph}",
         missing.join(" / ")
+    );
+}
+
+/// ディレクトリの直下にある README の名前（`README` で始まり `.md` で終わるファイル。
+/// 大文字小文字は区別しない）を全部返す。ディレクトリは数えない。
+///
+/// # なぜファイルシステムで列挙するか（`git ls-files` ではなく / O-14）
+///
+/// * **まだ `git add` していない新しい訳も数えたい。** 訳を足す人が最初に回すのは
+///   追跡する前の作業ツリーで、`git ls-files` はそれを見ない。
+/// * **`.git` の無い複製ツリー（変異検査）でも、そのまま回る。**
+///
+/// 代わりに、追跡しない README が根に転がっているだけでも赤になる（赤の側に倒れる）。
+///
+/// **⚠ `tests/readme.rs` に同じ形の本体がある**（あちらは `ALL_READMES` と突き合わせる）。
+fn readmes_in(dir: &std::path::Path) -> BTreeSet<String> {
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("{} を読めること: {err}", dir.display()));
+    let mut found = BTreeSet::new();
+    for entry in entries {
+        let entry =
+            entry.unwrap_or_else(|err| panic!("{} の項目を読めること: {err}", dir.display()));
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with("readme") && lower.ends_with(".md") && entry.path().is_file() {
+            found.insert(name);
+        }
+    }
+    found
+}
+
+/// `readmes_in` は、渡されたディレクトリを読むこと（植えたディレクトリ）。
+#[test]
+fn the_readme_listing_reads_the_directory_it_is_given() {
+    let dir = std::env::temp_dir().join(format!("pc-o14-license-listing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("README.dir.md")).unwrap();
+    for name in [
+        "README.md",
+        "README.xx.md",
+        "readme.fr.md",
+        "README.txt",
+        "NOTES.md",
+    ] {
+        std::fs::write(dir.join(name), "").unwrap();
+    }
+    let found = readmes_in(&dir);
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    assert_eq!(
+        found,
+        BTreeSet::from([
+            "README.md".to_owned(),
+            "README.xx.md".to_owned(),
+            "readme.fr.md".to_owned(),
+        ])
+    );
+}
+
+/// **根にある README が、全部 [`README`] か [`TRANSLATED_READMES`] に載っていること**（その逆も）。
+///
+/// 一覧から訳を落とすと（O-14 のレビューの V3）、その訳のライセンスの節は誰にも見られなくなる。
+/// 新しい訳を `tests/readme.rs` の一覧にだけ足す形も、ここで止める。
+#[test]
+fn every_readme_at_the_root_is_checked_for_its_license_section() {
+    let on_disk = readmes_in(&repo_path("."));
+    let mut listed = BTreeSet::from([README.to_owned()]);
+    listed.extend(
+        TRANSLATED_READMES
+            .iter()
+            .map(|(name, _)| (*name).to_owned()),
+    );
+
+    let unlisted: Vec<&String> = on_disk.difference(&listed).collect();
+    let missing: Vec<&String> = listed.difference(&on_disk).collect();
+    assert!(
+        unlisted.is_empty() && missing.is_empty(),
+        "根の README と、ライセンスの節を見る一覧（README と TRANSLATED_READMES）が揃っていない —— \
+         根に在るが一覧に無い: {unlisted:?} / 一覧に在るが根に無い: {missing:?}"
     );
 }
 

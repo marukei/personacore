@@ -172,12 +172,12 @@ const LEAST_CARGO_COMMANDS: usize = 4;
 
 /// README の相対リンクの最低本数。
 ///
-/// **実数（23）に近い床。** 着手時（2026-08-29）に自分で数えた値である
-/// （**⚠ O-14 で数え直すと実数は 50**（言語の行に `README.zh-TW.md` を足す前は 49）/ 2026-11-06。
-/// 着手の後に案内が増えて、床は実数から離れている。床の値は O-14 では変えていない）
-/// （CLAUDE.md「書く数は自分が読んだ数だけにする」）。
+/// **実数（50）に近い床。** O-14 で自分で数え直した値である（2026-11-06。
+/// 根拠は CLAUDE.md「書く数は自分が読んだ数だけにする」）。
+/// 着手時（2026-08-29）の実数は 23 で床は 20 だったが、その後に案内が増えて床が実数から
+/// 離れていたので、O-14 で 48 に寄せ直した（言語の行に `README.zh-TW.md` を足す前の実数は 49）。
 /// **緩い床は「守っている」と数えられるだけで何も守らない**ので、実数に寄せてある。
-const LEAST_LINKS: usize = 20;
+const LEAST_LINKS: usize = 48;
 
 // ----------------------------------------------------------------------
 // 走査の本体。**すべてソースを引数で受け取る。**
@@ -1811,10 +1811,12 @@ fn the_manifest_scan_reads_the_source_it_is_given() {
 //   **書き足したら、ここにも突き合わせを足すこと。**
 // * **床（[`LEAST_EN_LINKS`] / [`LEAST_ZH_TW_LINKS`]）は、根の README の床と同じく無防備**
 //   （module doc の表と同じ形）。
-// * **⚠ 一覧から訳を落とす手は、テストでは片方の一覧からしか止まらない**（O-14 で実測）。
-//   [`TRANSLATED_READMES`] だけから落とすと、[`ALL_READMES`] との突き合わせが赤になる。
-//   **両方から落とすと `cargo test` は全緑**で、止めるのは使われなくなった定数への
-//   `cargo clippy -- -D warnings` の `never used` だけである（定数ごと消せば、それも鳴らないはず —— こちらは当てていない）。
+// * **一覧から訳を落とす手は、根の実物との突き合わせが止める**（O-14 で実測）。
+//   [`TRANSLATED_READMES`] だけから落とすと [`ALL_READMES`] との突き合わせが、
+//   両方から落とすと [`every_readme_at_the_root_is_listed`] が赤になる
+//   （それを置く前は、両方から落とすと `cargo test` は全緑だった）。
+//   **⚠ 止まらないのは、README のファイルごと消して一覧からも落とす手**（根の実物も減るので、
+//   突き合わせは揃ったままになる）。
 // ----------------------------------------------------------------------
 
 /// 英語の README。
@@ -1825,10 +1827,10 @@ const README_ZH_TW: &str = "README.zh-TW.md";
 
 /// 英語の README の相対リンクの最低本数。
 ///
-/// **実数（23）に近い床**（作業単位 O-10 のレビューの是正の後に数えた値。着手時は 22）。
-/// **⚠ O-14 で数え直すと実数は 28**（言語の行に `README.zh-TW.md` を足す前は 27 / 2026-11-06）。
-/// O-10 の後に案内が増えている。床の値は O-14 では変えていない。
-const LEAST_EN_LINKS: usize = 20;
+/// **実数（28）に近い床。** O-14 で数え直した値である（2026-11-06。言語の行に
+/// `README.zh-TW.md` を足す前は 27）。O-10 のレビューの是正の後の実数は 23 で床は 20 だったが、
+/// その後に案内が増えて床が実数から離れていたので、O-14 で 26 に寄せ直した。
+const LEAST_EN_LINKS: usize = 26;
 
 /// 繁体字中国語の README の相対リンクの最低本数。
 ///
@@ -1843,6 +1845,82 @@ const TRANSLATED_READMES: [(&str, usize); 2] = [
 
 /// 互いにリンクしているべき README の全部（根の README と、訳の全部）。
 const ALL_READMES: [&str; 3] = [README, README_EN, README_ZH_TW];
+
+/// ディレクトリの直下にある README の名前（`README` で始まり `.md` で終わるファイル。
+/// 大文字小文字は区別しない）を全部返す。ディレクトリは数えない。
+///
+/// # なぜファイルシステムで列挙するか（`git ls-files` ではなく / O-14）
+///
+/// * **まだ `git add` していない新しい訳も数えたい。** 訳を足す人が最初に回すのは
+///   追跡する前の作業ツリーで、`git ls-files` はそれを見ない（一覧に載せ忘れたまま
+///   緑で通り、コミットした後で初めて分かる）。
+/// * **`.git` の無い複製ツリー（変異検査）でも、そのまま回る。**
+///
+/// 代わりに、追跡しない README が根に転がっているだけでも赤になる（赤の側に倒れる）。
+///
+/// **⚠ `tests/license.rs` に同じ形の本体がある**（あちらは根の README と訳の一覧を突き合わせる）。
+fn readmes_in(dir: &std::path::Path) -> BTreeSet<String> {
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("{} を読めること: {err}", dir.display()));
+    let mut found = BTreeSet::new();
+    for entry in entries {
+        let entry =
+            entry.unwrap_or_else(|err| panic!("{} の項目を読めること: {err}", dir.display()));
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with("readme") && lower.ends_with(".md") && entry.path().is_file() {
+            found.insert(name);
+        }
+    }
+    found
+}
+
+/// `readmes_in` は、渡されたディレクトリを読むこと（植えたディレクトリ）。
+#[test]
+fn the_readme_listing_reads_the_directory_it_is_given() {
+    let dir = std::env::temp_dir().join(format!("pc-o14-readme-listing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("README.dir.md")).unwrap();
+    for name in [
+        "README.md",
+        "README.xx.md",
+        "readme.fr.md",
+        "README.txt",
+        "NOTES.md",
+    ] {
+        std::fs::write(dir.join(name), "").unwrap();
+    }
+    let found = readmes_in(&dir);
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    assert_eq!(
+        found,
+        BTreeSet::from([
+            "README.md".to_owned(),
+            "README.xx.md".to_owned(),
+            "readme.fr.md".to_owned(),
+        ])
+    );
+}
+
+/// **根にある README が、全部 [`ALL_READMES`] に載っていること**（その逆も）。
+///
+/// 一覧の自己参照（[`every_readme_links_to_every_other_readme`] の冒頭）だけでは、
+/// **両方の一覧から同時に落とす手**も、**新しい訳を一覧に載せ忘れる手**も止まらなかった
+/// （O-14 のレビューの T2）。根の実物と突き合わせて止める。
+#[test]
+fn every_readme_at_the_root_is_listed() {
+    let on_disk = readmes_in(&repo_path("."));
+    let listed: BTreeSet<String> = ALL_READMES.iter().map(|name| (*name).to_owned()).collect();
+
+    let unlisted: Vec<&String> = on_disk.difference(&listed).collect();
+    let missing: Vec<&String> = listed.difference(&on_disk).collect();
+    assert!(
+        unlisted.is_empty() && missing.is_empty(),
+        "根の README と ALL_READMES が揃っていない —— 根に在るが一覧に無い: {unlisted:?} / \
+         一覧に在るが根に無い: {missing:?}"
+    );
+}
 
 /// 値を取る旗に渡す、見本のプロファイル名。
 const SAMPLE_FLAG_VALUE: &str = "sample";
@@ -1905,6 +1983,13 @@ fn the_flag_scan_reads_the_source_it_is_given() {
     assert_eq!(flags_named(planted), expected);
     assert_eq!(flags_named(&planted.replace('\n', "\r\n")), expected);
     assert!(flags_named("--- と --1 は旗ではない\n").is_empty());
+
+    // **語の中の記号でも旗が終わること**（doc の「`--a,b` の `,`」）。
+    assert_eq!(
+        flags_named("--a,b --c;d\n"),
+        BTreeSet::from(["--a".to_owned(), "--c".to_owned()]),
+        "語の中の `,` / `;` で旗が終わっていない"
+    );
 
     // **語の間に空白を置かない書き方（繁体字中国語の README / O-14）でも拾うこと。**
     // 空白で区切った語の頭だけを見ていた走査は、`其他旗標：`--no-ui`（僅提供…` の
