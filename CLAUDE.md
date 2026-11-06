@@ -188,12 +188,10 @@ cargo fmt --all
 
 ### 公開の後の運用（O-6 の後 / [ADR-0048](docs/adr/0048-open-source-policy.md) の追記 2026-11-06）
 
-**O-6（origin#53）が済むまでは、この節を使わない**（これまでどおり `main` へ載せて push し、`Closes #N` で閉じ、参照は `origin#N` と書く。`marukei/personacore#N` はまだ書かない —— 改名の後は公開側の別の Issue を指す）。
-
-O-6 の後は、公開側 `marukei/personacore` と、非公開の `marukei/personacore-origin`（origin）の2つになる。**開発は公開側で行う。**
+**O-6（origin#53）は 2026-11-06 に済んだ。** 公開側 `marukei/personacore` と、非公開の `marukei/personacore-origin`（origin）の2つのリポジトリがある。**開発は公開側で行う。**
 
 - **作業単位の Issue と PR は公開側に置く。** origin に開いている Issue は、着手するときに公開側で開き直す（本文に `origin#N`）。
-- **公開側の `main` は PR 必須。** 作業単位ごとにブランチを push して PR を開き、レビューを通したら司令塔がマージしてよい（`gh pr merge --merge --admin`。管理者のバイパスは PR のときだけ効く）。`main` への直接の push は通らない。
+- **公開側の `main` は PR 必須。** 作業単位ごとにブランチを push して PR を開き、レビューを通したら司令塔がマージしてよい（`gh pr merge --merge --admin`。管理者のバイパスは PR のときだけ効く）。`main` への直接の push は通らない。**⚠ `--admin` は必須のチェック（CI の2つのジョブ）も飛ばす。マージの前に `gh pr checks` で両方が緑であることを確かめる。**
 - **参照の書き方:** 追跡ファイルでは公開側の Issue を `marukei/personacore#N`、origin の Issue を `origin#N` と書く（`#` ＋数字は `tests/issue_references.rs` が止める）。**コミットの本文の閉じるキーワードは `Closes marukei/personacore#N` と完全な形で書く** —— 短い形のコミットが origin の `main` に入ると、origin の同じ番号の Issue が閉じる。PR の本文は `Closes #N` でよい（公開側の設定で、マージコミットの題名を PR の題名に、本文を空にしてあるので、PR の本文はコミットに写らない）。**公開側を origin へ取り込む前に、取り込むコミットの本文に短い形の閉じるキーワードが無いことを確かめる。**
 - **⚠ origin のクローン（全履歴を持つチェックアウト）から公開側へ push しない。** origin の `main` は公開側の `main` の子孫なので、push すると非公開の履歴（作者欄は実名）が丸ごと公開される。origin のクローンの公開側の remote は、push の URL を、通らない値にしてある。公開側の作業は、公開側を clone したチェックアウトで行う。
 - 公開側のチェックアウトの作者は `marukei` / `marukei@users.noreply.github.com`（リポジトリの設定）。実名の綴りはどの追跡ファイルにも書かない（`tests/hashed_spellings.rs`。実名の検査は `PERSONACORE_PRIVATE_SPELLINGS` が指す、作業ツリーの外のファイルで行う）。
