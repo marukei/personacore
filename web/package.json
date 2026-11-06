@@ -1,6 +1,6 @@
 {
   "name": "personacore-web",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "license": "MIT OR Apache-2.0 OR LicenseRef-ACCRL-0.3",
   "type": "module",

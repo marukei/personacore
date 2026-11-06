@@ -1,6 +1,6 @@
 [package]
 name = "personacore"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 # 三択（ADR-0048 §1 / 作業単位 O-2）。綴りは LICENSE・web/package.json・README と同じであること
 # （見張り番は tests/license.rs の every_place_names_the_same_license_expression）。
