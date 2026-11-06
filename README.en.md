@@ -1,6 +1,6 @@
 # personacore
 
-日本語: [README.md](README.md)
+日本語: [README.md](README.md) · 繁體中文: [README.zh-TW.md](README.zh-TW.md)
 
 personacore is a small server that gives a local LLM **characters and memories**.
 
