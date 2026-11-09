@@ -47,6 +47,9 @@ function viewOf(overrides: Partial<ServerView> = {}): ServerView {
   return {
     listening_port: LISTENING,
     listening_port_source: "saved",
+    listening_port_requested: LISTENING,
+    listening_port_shifted: false,
+    listening_port_skipped: [],
     saved_port: SAVED,
     saved_port_unreadable: false,
     next_port: NEXT,

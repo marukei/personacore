@@ -342,14 +342,20 @@ impl LaunchPlan {
     /// **同じ名前で起こしたときに、その面の `failed` として出る**（F-10a より前は、`main` が
     /// `ServerError::Launch` を受けて環境変数の既定で起き直していた。その枝は消えた）。
     ///
+    /// # 待ち受けとの取り合いは、番号を明示したときだけ見る（ADR-0057 §決定3 / 作業単位 F-11b）
+    ///
+    /// **`bind` が `None` なら番号の取り合いを見ない**（`main` は `AppConfig::explicit_bind` を渡す）。
+    /// 明示していない起動は、待ち受けを探すときに `upstreams.json` の全部の gguf の面の番号を飛ばすので、
+    /// 面と取り合わない——そこで覚えた名前を捨てると、使えるプロファイルを理由なく捨てることになる。
+    ///
     /// # Errors
     ///
-    /// gguf が無い、または personacore 自身の待ち受けとポートを取り合うとき。
-    pub fn check_before_starting(&self, bind: BindAddr) -> Result<(), LaunchError> {
+    /// gguf が無い、または（`bind` が `Some` のとき）personacore 自身の待ち受けとポートを取り合うとき。
+    pub fn check_before_starting(&self, bind: Option<BindAddr>) -> Result<(), LaunchError> {
         if let Some(missing) = self.missing_gguf() {
             return Err(LaunchError::MissingGguf(missing));
         }
-        if let Some(collision) = self.port_conflict(bind) {
+        if let Some(collision) = bind.and_then(|bind| self.port_conflict(bind)) {
             return Err(LaunchError::PortCollision(collision));
         }
         Ok(())
@@ -392,14 +398,14 @@ impl LaunchPlan {
     /// ——そこに待ち受けを作ったのは personacore ではない。
     #[must_use]
     pub(in crate::server) fn port_conflict(&self, bind: BindAddr) -> Option<PortCollision> {
-        // **`0` は「OS に空きを選ばせる」**（`BindAddr::loopback` の doc）。
-        // **ここで比べているのは「要求したポート」で、`0` のときは取り合いを判定しない。**
-        // **⚠ OS が割り当てた実ポートが、面の名指しするポートと一致する可能性はある**
-        // （エフェメラル範囲 49152–65535 を名指しするプロファイルだけ。利用者の実機の 8080 は覆う）。
-        // **`tests/upstream_cli.rs` は `PERSONACORE_PORT=0` で走るので、実行ファイル経由の経路では
-        // この門は一度も効いていない**（レビューが指摘 / 2026-09-19）。
-        // 覆うなら `bind` の後の `local_addr` を渡す形になる（引数の型が変わる）。
-        // **いまの実害はゼロなので、そのときに決める。**
+        // **`0` は「OS に空きを選ばせる」**（`BindAddr::loopback` の doc）。`0` が来たら取り合いを判定しない。
+        //
+        // **起動時（`App::bind_with`）は、実際に開いた番号（`local_addr`）を渡す**（ADR-0057 §決定3 /
+        // 作業単位 F-11b）——ずらした起動では設定の番号と違い、`PERSONACORE_PORT=0` では OS が選んだ番号になる。
+        // **だから起動時に `0` は来ない。** `0` が来うるのは、事前検査（`check_before_starting`）に明示の `0` を
+        // 渡したときだけで、そのときは実際の番号がまだ決まっていないので判定しない。
+        // （F-11b より前は設定の番号を渡していて、`PERSONACORE_PORT=0` の起動ではこの門が一度も効かなかった
+        // ——レビューが指摘 / 2026-09-19。引数の型は `BindAddr` のまま、渡す値を `local_addr` に替えて塞いだ。）
         let port = bind.port();
         if port == 0 {
             return None;
@@ -1577,6 +1583,52 @@ mod tests {
                 "Debug に宛先の秘密が出ている（{secret}）: {debugged}"
             );
         }
+    }
+
+    /// **事前検査は、待ち受けのアドレスを渡したときだけ取り合いを見る**（ADR-0057 §決定3 / 作業単位 F-11b）。
+    ///
+    /// 同じ計画・同じ番号で、`Some` なら取り合い、`None` なら通る（gguf は在る）。**gguf の実在はどちらでも見る**
+    /// （無い gguf の計画は `None` でも止まる）。
+    #[test]
+    fn the_check_before_starting_sees_the_port_only_when_one_is_given() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
+        let gguf = dir.path().join("there.gguf");
+        std::fs::write(&gguf, b"not a real gguf").expect("置けること");
+        let plan = plan_of(
+            &serde_json::json!({ "one": { "main": {
+                "endpoint": "http://localhost:45101", "model": "m", "gguf": gguf,
+            } } })
+            .to_string(),
+        );
+
+        assert!(
+            matches!(
+                plan.check_before_starting(Some(BindAddr::loopback(45_101))),
+                Err(LaunchError::PortCollision(_))
+            ),
+            "明示した番号と同じなら取り合いで止まること"
+        );
+        assert!(
+            plan.check_before_starting(None).is_ok(),
+            "番号を渡さないのに取り合いで止めた"
+        );
+        assert!(
+            plan.check_before_starting(Some(BindAddr::loopback(45_102)))
+                .is_ok(),
+            "違う番号なのに止めた"
+        );
+
+        let missing = plan_of(
+            r#"{ "one": { "main": { "endpoint": "http://localhost:45101", "model": "m",
+                                    "gguf": "/planted/never-there.gguf" } } }"#,
+        );
+        assert!(
+            matches!(
+                missing.check_before_starting(None),
+                Err(LaunchError::MissingGguf(_))
+            ),
+            "番号を渡さなくても gguf の実在は見ること"
+        );
     }
 
     #[test]

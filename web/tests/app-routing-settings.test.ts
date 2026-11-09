@@ -29,6 +29,9 @@ const SETTINGS_LABEL = "設定";
 const SERVER: ServerView = {
   listening_port: 8123,
   listening_port_source: "default",
+  listening_port_requested: 8123,
+  listening_port_shifted: false,
+  listening_port_skipped: [],
   saved_port: null,
   saved_port_unreadable: false,
   next_port: 8789,

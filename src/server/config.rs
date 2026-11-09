@@ -48,11 +48,13 @@
 //! （既定値で埋めると 2 段目の照会が二度と行われない）。
 //! 照会と既定値への退避は `super::context` が担う。
 
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::extract::SubContext;
+use super::port_search::PortSearch;
 use super::upstreams::ProfileSettings;
 use crate::domain::{
     AxisDiscoveryMemories, AxisTrialRule, AxisTrialRuleError, DEFAULT_DRIFT_DECAY,
@@ -462,6 +464,34 @@ pub fn port_in_use_message(port: u16) -> String {
     )
 }
 
+/// **番号を明示していない起動が、ずらす範囲を全部試しても待ち受けを開けなかったときに、利用者へ言う文**
+/// （[ADR-0057](../../docs/adr/0057-the-listening-port-shifts-when-taken-and-is-set-from-the-screen.md)
+/// §決定3「B-76 の文を、試した範囲を言う形に広げる」/ 作業単位 F-11b）。
+///
+/// **[`port_in_use_message`]（番号を明示したとき）とは別の文**——明示のときの文は今までどおり。
+///
+/// # 直し方は2つ言う。先に [`ENV_PORT`]、次に画面の「設定」
+///
+/// * **この起動では画面を開けない**（待ち受けていない）。だから先に言うのは、いま打てる手の [`ENV_PORT`]。
+/// * **毎回 [`ENV_PORT`] を打たなくて済むように**、起動できた後に画面の「設定」で番号を保存すれば、
+///   次からはそこから試すことを添える（ADR-0057 の背景 —— 配布物の利用者に環境変数を打たせ続けない）。
+///
+/// 範囲が1つの番号しか無い（元の番号が 65535）ときは「〜」を書かない。
+/// **写しが `tests/listening_port_cli.rs` の `a_whole_range_taken_names_the_range_and_how_to_get_out` に在る。**
+pub fn ports_in_use_message(first: u16, last: u16) -> String {
+    let (range, every) = if first == last {
+        (first.to_string(), "")
+    } else {
+        (format!("{first}〜{last}"), "どれも")
+    };
+    format!(
+        "ポート {range} は、{every}他のプログラムが使っているか、使えない番号でした\
+         （上流プロファイルの llama の面が使う番号は試していません）。\
+         環境変数 {ENV_PORT} で空いているポートを指定して起動し直してください\
+         （起動できたら、画面の「設定」でその番号を保存すると、次からは指定しなくてもその番号から試します）"
+    )
+}
+
 /// **画面で保存できる待ち受けのポートの下端**（[ADR-0057](../../docs/adr/0057-the-listening-port-shifts-when-taken-and-is-set-from-the-screen.md) §決定5）。
 ///
 /// **上端は `u16::MAX`（65535）。** `0`（OS に選ばせる）と特権ポートは保存できない ——
@@ -502,7 +532,8 @@ impl SavedPort {
 /// **待ち受けのポートが何から決まったか**（ADR-0057 §決定1・5）。
 ///
 /// 効く順は [`ENV_PORT`] → 保存した番号 → [`DEFAULT_PORT`]（[`resolve_port`]）。
-/// **F-11 が「明示か」（ずらすか）を見分けるのも、`GET /admin/server` が言うのもこれ。**
+/// **「明示か」（塞がっていたらずらすか / ADR-0057 §決定1・作業単位 F-11b の `port_search`）を見分けるのも、
+/// `GET /admin/server` が言うのもこれ。** ずらすのは [`Self::Saved`] と [`Self::Default`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortSource {
     /// [`ENV_PORT`]（明示）。
@@ -862,6 +893,12 @@ pub struct AppConfig {
     /// **[`Self::with_bind`] では変わらない**（テストがエフェメラルポートへ差し替える入口で、
     /// 出どころの話はしない）。
     port_source: PortSource,
+    /// **待ち受けを探すときに飛ばす番号**（`upstreams.json` の全部のプロファイルの gguf の面が使う番号 /
+    /// ADR-0057 §決定3 / [`Self::with_face_ports`]）。
+    ///
+    /// **既定は空**（`main` が読んで渡す。テストの入口は渡さない限り何も飛ばさない）。
+    /// **明示（`environment`）と `0` の起動では見ない**（`port_search::PortSearch::plan`）。
+    face_ports: BTreeSet<u16>,
     database_path: PathBuf,
     /// **UI をディスクから配るなら、その配り先**（ADR-0041 §決定2 / [`ENV_WEB_DIR`]）。
     ///
@@ -1286,6 +1323,7 @@ impl AppConfig {
         Ok(Self {
             bind: BindAddr::loopback(port),
             port_source,
+            face_ports: BTreeSet::new(),
             database_path,
             web_dir,
             llm,
@@ -1304,11 +1342,38 @@ impl AppConfig {
 
     /// 待ち受けアドレスを差し替える（テストのエフェメラルポート指定など）。
     ///
-    /// **出どころ（[`Self::port_source`]）は変えない。**
+    /// **出どころ（[`Self::port_source`]）は変えない**——出どころが `default` のままなら、その番号が塞がって
+    /// いれば次の空きへずれる（ADR-0057 §決定1）。**塞がっていたら止まってほしいテストは、`PERSONACORE_PORT`
+    /// を参照関数から渡す**（出どころ `environment`）。
     #[must_use]
     pub fn with_bind(mut self, bind: BindAddr) -> Self {
         self.bind = bind;
         self
+    }
+
+    /// **待ち受けを探すときに飛ばす番号を載せる**（ADR-0057 §決定3 / 作業単位 F-11b）。
+    ///
+    /// `main` は `upstreams.json` の全部のプロファイルの gguf の面が使う番号（`UpstreamProfiles::launch_ports`）
+    /// を、番号を明示していない起動でだけ渡す。**明示（`environment`）と `0` では、渡しても見ない。**
+    /// 渡し直すと置き換える（足し合わせない）。
+    #[must_use]
+    pub fn with_face_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.face_ports = ports.into_iter().collect();
+        self
+    }
+
+    /// **この起動が待ち受けを探す計画**（候補の列 / `port_search` モジュール）。**純粋関数。**
+    pub(in crate::server) fn port_search(&self) -> PortSearch {
+        PortSearch::plan(self.bind.port(), self.port_source, &self.face_ports)
+    }
+
+    /// **番号を明示したときだけ、その待ち受けのアドレス**（ADR-0057 §決定3）。
+    ///
+    /// `main` の覚えた名前の事前検査（`LaunchPlan::check_before_starting`）はこれを渡す——**明示していなければ
+    /// 番号の取り合いでプロファイルを捨てない**（待ち受けを探すときに面の番号を飛ばすので、取り合わない）。
+    #[must_use]
+    pub fn explicit_bind(&self) -> Option<BindAddr> {
+        (self.port_source == PortSource::Environment).then_some(self.bind)
     }
 
     /// DB ファイルのパスを差し替える。
@@ -2071,6 +2136,85 @@ mod tests {
             config_with_saved(&[(ENV_PORT, "abc")], Some(saved())),
             Err(ConfigError::Port)
         ));
+    }
+
+    /// **探す計画は設定の番号・出どころ・飛ばす番号から作る。** 明示した番号は列が1つ、保存した番号は
+    /// 11 個で面の番号を飛ばす。`with_bind` は出どころを変えないので、`default` のまま列が 11 個になる。
+    /// 事前検査に渡すアドレス（`explicit_bind`）は明示のときだけ（作業単位 F-11b）。
+    #[test]
+    fn the_port_search_follows_the_source_and_the_face_ports() {
+        use super::super::port_search::PortSearch;
+
+        let env = ENV_PORT_VALUE.to_string();
+        let explicit = config_of(&[(ENV_PORT, &env)])
+            .expect("組めること")
+            .with_face_ports([ENV_PORT_VALUE]);
+        assert_eq!(
+            explicit.port_search(),
+            PortSearch::plan(ENV_PORT_VALUE, PortSource::Environment, &BTreeSet::new())
+        );
+        assert_eq!(
+            explicit.explicit_bind(),
+            Some(BindAddr::loopback(ENV_PORT_VALUE))
+        );
+
+        let faces = BTreeSet::from([SAVED_PORT_VALUE + 1]);
+        let from_saved = config_with_saved(&[], Some(saved()))
+            .expect("組めること")
+            .with_face_ports(faces.clone());
+        assert_eq!(
+            from_saved.port_search(),
+            PortSearch::plan(SAVED_PORT_VALUE, PortSource::Saved, &faces)
+        );
+        assert_ne!(
+            from_saved.port_search(),
+            PortSearch::plan(SAVED_PORT_VALUE, PortSource::Saved, &BTreeSet::new()),
+            "前提: 飛ばす番号が列を変えること"
+        );
+        assert_eq!(from_saved.explicit_bind(), None);
+
+        // **`with_bind` は出どころを変えない**（`default` のまま、塞がっていればずれる）。
+        let rebound = config_of(&[])
+            .expect("組めること")
+            .with_bind(BindAddr::loopback(9400));
+        assert_eq!(
+            rebound.port_search(),
+            PortSearch::plan(9400, PortSource::Default, &BTreeSet::new())
+        );
+        assert_eq!(rebound.explicit_bind(), None);
+
+        // **渡し直すと置き換える**（足し合わせない）。
+        let replaced = config_of(&[])
+            .expect("組めること")
+            .with_face_ports([8081])
+            .with_face_ports([8083]);
+        assert_eq!(
+            replaced.port_search(),
+            PortSearch::plan(DEFAULT_PORT, PortSource::Default, &BTreeSet::from([8083]))
+        );
+    }
+
+    /// **範囲が全部だめだった文は、範囲・`PERSONACORE_PORT`・画面の「設定」を言う。** 1つの番号の文
+    /// （[`port_in_use_message`]）とは違う文で、範囲が1つの番号なら「〜」を書かない。
+    #[test]
+    fn the_range_message_names_the_range_and_both_ways_out() {
+        let message = ports_in_use_message(18_090, 18_100);
+        assert!(
+            message.starts_with(
+                "ポート 18090〜18100 は、どれも他のプログラムが使っているか、使えない番号でした"
+            ),
+            "{message}"
+        );
+        assert!(message.contains(ENV_PORT), "{message}");
+        assert!(message.contains("画面の「設定」"), "{message}");
+        assert_ne!(message, port_in_use_message(18_090));
+
+        let single = ports_in_use_message(65535, 65535);
+        assert!(
+            single.starts_with("ポート 65535 は、他のプログラムが"),
+            "{single}"
+        );
+        assert!(!single.contains('〜'), "{single}");
     }
 
     /// **抽出モデルの既定は本文モデルの既定と同じ綴り**（ADR-0021 §10 / 2026-08-21 の実測）。

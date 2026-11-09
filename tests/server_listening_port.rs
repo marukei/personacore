@@ -16,6 +16,10 @@
 //! | `a_port_outside_1024_to_65535_is_refused_and_nothing_is_written` | 範囲の外を保存する／理由が届かない／`port` を省いた依頼が保存を消す |
 //! | `a_read_only_location_neither_reads_nor_writes_the_saved_port` | 読むだけの置き場所で保存を読む・書く・壊れたファイルを読めないと言う |
 //! | `in_use_is_said_only_for_a_port_another_program_holds` | 自分の番号を「使われている」と言う／他が掴んだ番号を「空いている」と言う／使われていると保存しない |
+//! | `a_taken_saved_port_shifts_past_the_face_ports_and_the_report_says_so` | 保存した番号が塞がっていると止まる／面の番号へずれる／`GET` が元の番号・ずらした・飛ばした番号を言わない（作業単位 F-11b） |
+//! | `a_requested_port_that_a_face_uses_is_skipped_even_when_free` | 明示していないのに、面が使う元の番号で待ち受ける |
+//! | `an_explicit_port_in_use_stops_without_shifting` | `PERSONACORE_PORT` の番号をずらす／B-76 の判定（`is_port_in_use`）が外れる |
+//! | `a_whole_range_taken_stops_and_names_the_range` | 範囲が全部塞がっているのに起きる／範囲（元の番号〜+10）を言わない／範囲の外まで探す |
 //!
 //! # 前提
 //!
@@ -46,11 +50,11 @@ const MAX_BINDS: usize = 5;
 /// **1回の依頼の上限**（`tests/upstream_profile_editor.rs` の `REQUEST_TIMEOUT` と同じ理由）。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ポートを取れること");
-    let port = listener.local_addr().expect("宛先を読めること").port();
-    drop(listener);
-    port
+/// **空いている番号を1つ**（OS が自分では配らない帯から / [`hold_quiet_range`]。掴まずに返す）。
+fn quiet_free_port() -> u16 {
+    let (held, first) = hold_quiet_range();
+    drop(held);
+    first
 }
 
 /// **このテストの前提**（モジュールの doc）。
@@ -135,9 +139,16 @@ impl Drop for Serving {
 /// **本番の入口でサーバを起こし、答えるまで待つ。** 置き場所の渡し方は呼び出し側が決める。
 ///
 /// **ポートを取られたら別のポートで起こし直す**（`tests/upstream_profile_editor.rs` の `serve` と同じ理由）。
+///
+/// # 番号は OS が配らない帯から取る（作業単位 F-11b）
+///
+/// **`saved` / `default` の腕は、取られていても止まらずに次の空きへずれる**（ADR-0057 §決定1）ので、上の
+/// 起こし直しに入らず、ここで待つ番号には別の誰かが答える。**OS に選ばせた番号は、並んで走る他の腕が次に
+/// 受け取る番号の隣**（Windows は順に配る / [`hold_quiet_range`] の doc）なので、取られうる。OS が配らない帯の
+/// 番号は、このファイルの腕どうしでしか取り合わない。
 async fn serve(dir: &Path, source: Source, startup: impl Fn(Startup) -> Startup) -> Serving {
     for _ in 0..MAX_BINDS {
-        let port = free_port();
+        let port = quiet_free_port();
         let port_text = port.to_string();
         let lookup = move |key: &str| match key {
             ENV_LLM_ENDPOINT => Some(CLOSED_ENDPOINT.to_owned()),
@@ -145,7 +156,7 @@ async fn serve(dir: &Path, source: Source, startup: impl Fn(Startup) -> Startup)
             _ => None,
         };
         let saved = match source {
-            Source::Saved => Some(SavedPort::new(port).expect("前提: OS が選んだ番号は 1024 以上")),
+            Source::Saved => Some(SavedPort::new(port).expect("前提: 帯の番号は 1024 以上")),
             Source::Environment | Source::Default => None,
         };
         let mut config = AppConfig::from_lookup_with_data_dir_and_saved_port(
@@ -287,6 +298,10 @@ async fn the_report_names_the_actual_port_and_where_it_came_from() {
             json!({
                 "listening_port": server.port,
                 "listening_port_source": label,
+                // **ずらしていない**（作業単位 F-11b。元の番号＝実際の番号、飛ばした番号は無い）。
+                "listening_port_requested": server.port,
+                "listening_port_shifted": false,
+                "listening_port_skipped": [],
                 // **保存のファイルは無い**（起動の設定に渡した保存は、ファイルではない）。
                 "saved_port": null,
                 "saved_port_unreadable": false,
@@ -396,6 +411,9 @@ async fn a_saved_port_reads_back_and_null_forgets_it() {
         json!({
             "listening_port": server.port,
             "listening_port_source": "environment",
+            "listening_port_requested": server.port,
+            "listening_port_shifted": false,
+            "listening_port_skipped": [],
             "saved_port": null,
             "saved_port_unreadable": false,
             "next_port": DEFAULT_PORT,
@@ -577,4 +595,223 @@ async fn in_use_is_said_only_for_a_port_another_program_holds() {
     assert_eq!(released["saved_port_in_use"], json!(false), "{released}");
 
     server.stop().await;
+}
+
+// ----------------------------------------------------------------------
+// ずらし（作業単位 F-11b / ADR-0057 §決定1・3・4）
+// ----------------------------------------------------------------------
+//
+// **ここの腕は `App::bind` で起こす**（`App::run_with_upstreams` は実際の番号を返さない。ずれた先の番号は
+// `App::local_addr` でしか知れない）。**塞ぐ番号は全部このテストが掴んだもの**で、OS が自分では配らない帯
+// （[`hold_quiet_range`]）から選ぶ。**利用者の 8080 には触らない。**
+
+/// **範囲（元の番号 +10）の幅の写し**（`port_search::PORT_SHIFT_SPAN`）。**定数から作らない。**
+const SPAN: u16 = 10;
+
+/// **OS が自分では配らない番号の帯（20000〜28999）で、続いた 11 個（元の番号〜+10）の空きを全部掴む。**
+///
+/// # なぜ OS に選ばせた番号の近くを使わないのか（作業単位 F-11b で実測）
+///
+/// **Windows は `127.0.0.1:0` の番号を、プロセスをまたいで1つずつ順に配る**（2回続けて8個ずつ取ると
+/// `61545〜61552`、`61553〜61560`）。同じテストの実行ファイルで並んで走る他の腕は、OS に選ばせた番号を
+/// 放して子やサーバに開かせるので、**その近くの 11 個を掴むと、他の腕の番号を奪う**（実測: 範囲を全部
+/// 塞ぐ腕と並んだ「保存した番号がずれる」腕の子が、範囲を使い切って止まった）。動的な範囲
+/// （Windows 49152〜65535・Linux 32768〜60999）の外なら、OS に選ばせる腕とは重ならない。
+///
+/// 帯の中の始まりは、プロセス番号と呼んだ回数から散らす（同じ実行ファイルの腕どうし・並んだ実行どうしを分ける）。
+/// 掴めなかった（使われている・Windows の除外範囲）ら、別の始まりで取り直す。
+fn hold_quiet_range() -> (Vec<std::net::TcpListener>, u16) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let seed = std::process::id().wrapping_mul(2_654_435_761);
+    for _ in 0..200 {
+        let call = CALLS.fetch_add(1, Ordering::Relaxed);
+        let offset = seed.wrapping_add(call.wrapping_mul(7_919)) % 9_000;
+        let first = 20_000 + u16::try_from(offset).expect("9000 未満であること");
+        let mut held = Vec::new();
+        for port in first..=first + SPAN {
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => held.push(listener),
+                Err(_) => break,
+            }
+        }
+        if held.len() == usize::from(SPAN) + 1 {
+            return (held, first);
+        }
+    }
+    panic!("前提: 続いた 11 個の空きを 200 回で掴めなかった");
+}
+
+/// **元の番号だけを掴んだまま返す**（+1〜+10 は空いていることを確かめてから放す / [`hold_quiet_range`]）。
+fn hold_a_free_port() -> (std::net::TcpListener, u16) {
+    let (mut held, first) = hold_quiet_range();
+    let kept = held.swap_remove(0);
+    drop(held);
+    (kept, first)
+}
+
+/// **元の番号から +10 までの 11 個を、全部このテストが掴む**（範囲が全部塞がった機を作る）。
+fn hold_a_whole_range() -> (Vec<std::net::TcpListener>, u16) {
+    hold_quiet_range()
+}
+
+/// **出どころと番号を決めて設定を組む**（DB は一時ディレクトリ。上流は閉じたポート）。
+fn config_on(dir: &Path, source: Source, port: u16) -> AppConfig {
+    let port_text = port.to_string();
+    let lookup = move |key: &str| match key {
+        ENV_LLM_ENDPOINT => Some(CLOSED_ENDPOINT.to_owned()),
+        ENV_PORT if matches!(source, Source::Environment) => Some(port_text.clone()),
+        _ => None,
+    };
+    let saved = match source {
+        Source::Saved => Some(SavedPort::new(port).expect("前提: 1024 以上")),
+        Source::Environment | Source::Default => None,
+    };
+    let config =
+        AppConfig::from_lookup_with_data_dir_and_saved_port(lookup, Some(dir.to_path_buf()), saved)
+            .expect("設定を組めること")
+            .with_database_path(dir.join("db").join("personacore.sqlite"));
+    match source {
+        Source::Default => config.with_bind(BindAddr::loopback(port)),
+        Source::Environment | Source::Saved => config,
+    }
+}
+
+/// **`App::bind` で起こし、実際の番号で答えるまで待つ。**
+async fn serve_bound(config: &AppConfig) -> Result<Serving, ServerError> {
+    let app = App::bind(config).await?;
+    let port = app.local_addr().port();
+    let (shutdown, wait) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        app.serve(async move {
+            let _ = wait.await;
+        })
+        .await
+    });
+    let serving = Serving {
+        port,
+        shutdown: Some(shutdown),
+        task: Some(task),
+    };
+    assert!(serving.answers().await, "起こしたサーバが答えない");
+    Ok(serving)
+}
+
+/// **保存した番号が塞がっていると、面の番号を飛ばして次の空きで待ち受け、`GET /admin/server` が
+/// 元の番号・ずらしたこと・飛ばした番号を言う**（ADR-0057 §決定3・4）。
+///
+/// 保存した番号 `P` を塞ぎ、`P+1` を面の番号として渡す。**`P+1` は空いていても開きに行かない**ので、
+/// 待ち受けは `P+2` 以降（`P+2` を他の誰かが掴んでいればさらに先）。**飛ばした番号は `P+1` だけ。**
+/// **見本の `upstreams.json` の形**（既定の 8080 が塞がると、llama の面の 8081 を飛ばして 8082 になる）を、
+/// 利用者の 8080 に触らずに作ったもの。
+#[tokio::test]
+async fn a_taken_saved_port_shifts_past_the_face_ports_and_the_report_says_so() {
+    assert_no_port_in_this_process();
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let (blocker, saved) = hold_a_free_port();
+    let face = saved + 1;
+    let config = config_on(dir.path(), Source::Saved, saved).with_face_ports([face, 1]);
+
+    let server = serve_bound(&config)
+        .await
+        .expect("保存した番号が塞がっていても、ずらして起きること");
+    assert!(
+        server.port > face && server.port <= saved + SPAN,
+        "面の番号を飛ばした範囲の中で待ち受けていない（保存 {saved}・面 {face}・実際 {}）",
+        server.port
+    );
+    assert_eq!(
+        report(server.port).await,
+        json!({
+            "listening_port": server.port,
+            "listening_port_source": "saved",
+            "listening_port_requested": saved,
+            "listening_port_shifted": true,
+            "listening_port_skipped": [face],
+            "saved_port": null,
+            "saved_port_unreadable": false,
+            "next_port": DEFAULT_PORT,
+            "next_port_source": "default",
+            "editable": false,
+        })
+    );
+    server.stop().await;
+    drop(blocker);
+}
+
+/// **明示していなければ、面が使う元の番号は空いていても開かない**（ADR-0057 §決定3「元の番号も」）。
+///
+/// 出どころは `default`（`with_bind` で番号だけを差し替える）。元の番号 `P` は空いている（掴んですぐ放す）。
+#[tokio::test]
+async fn a_requested_port_that_a_face_uses_is_skipped_even_when_free() {
+    assert_no_port_in_this_process();
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let (probe, requested) = hold_a_free_port();
+    drop(probe);
+    let config = config_on(dir.path(), Source::Default, requested).with_face_ports([requested]);
+
+    let server = serve_bound(&config).await.expect("起きること");
+    assert_ne!(server.port, requested, "面が使う元の番号で待ち受けた");
+    let body = report(server.port).await;
+    assert_eq!(body["listening_port_requested"], json!(requested), "{body}");
+    assert_eq!(body["listening_port_source"], "default", "{body}");
+    assert_eq!(body["listening_port_shifted"], json!(true), "{body}");
+    assert_eq!(body["listening_port_skipped"], json!([requested]), "{body}");
+    server.stop().await;
+}
+
+/// **`PERSONACORE_PORT` の番号は、塞がっていてもずらさずに止まる**（ADR-0057 §決定1）。
+///
+/// **止まり方は今までどおり**（`ServerError::is_port_in_use` が真 —— `main` はこれで B-76 の文を足す）。
+/// **面の番号を渡しても見ない**（明示の番号は面と同じなら B-52 が止める）。
+#[tokio::test]
+async fn an_explicit_port_in_use_stops_without_shifting() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let (blocker, port) = hold_a_free_port();
+    let config = config_on(dir.path(), Source::Environment, port).with_face_ports([port + 1]);
+
+    let err = serve_bound(&config)
+        .await
+        .err()
+        .expect("明示した番号が塞がっていれば止まること");
+    assert!(err.is_port_in_use(), "B-76 の判定から外れた: {err:?}");
+    assert_eq!(
+        err.tried_ports(),
+        None,
+        "明示の番号で範囲を言っている: {err:?}"
+    );
+    assert_eq!(err.to_string(), "待ち受けアドレスを開けませんでした");
+    drop(blocker);
+}
+
+/// **範囲が全部塞がっていると、範囲（元の番号〜+10）を言って止まる**（ADR-0057 §決定3）。
+///
+/// **11 個とも、このテストが掴んだもの**（`+11` は塞がない —— 範囲の外まで探す実装なら、そこで起きて赤）。
+#[tokio::test]
+async fn a_whole_range_taken_stops_and_names_the_range() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let (held, first) = hold_a_whole_range();
+    for source in [Source::Saved, Source::Default] {
+        let config = config_on(dir.path(), source, first);
+        let err = serve_bound(&config)
+            .await
+            .err()
+            .expect("範囲が全部塞がっていれば止まること");
+        assert_eq!(
+            err.tried_ports(),
+            Some((first, first + SPAN)),
+            "試した範囲を言っていない: {err:?}"
+        );
+        assert!(
+            !err.is_port_in_use(),
+            "範囲の失敗を、明示の番号の失敗（B-76 の1つの番号の文）として扱っている: {err:?}"
+        );
+        assert_eq!(err.to_string(), "待ち受けアドレスを開けませんでした");
+        // **探すのは `Store::connect` より前**（`App::bind` の doc の約束）——止まった起動は DB の置き場所すら作らない。
+        assert!(
+            !dir.path().join("db").exists(),
+            "範囲を使い切って止まったのに、DB の置き場所を作っている"
+        );
+    }
+    drop(held);
 }

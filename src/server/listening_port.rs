@@ -30,10 +30,12 @@
 //!
 //! | 口 | 何をする |
 //! |---|---|
-//! | `GET /admin/server` | いまの待ち受け・出どころ・保存した番号・次の起動で使う番号と出どころ・保存できるか（[`ServerView`]） |
+//! | `GET /admin/server` | いまの待ち受け・出どころ・元の番号・ずらしたか・飛ばした番号・保存した番号・次の起動で使う番号と出どころ・保存できるか（[`ServerView`]） |
 //! | `PUT /admin/server/port` | `{"port": 8090}` で保存、`{"port": null}` で保存を消す（[`SavePortView`]） |
 //!
 //! **動いている間に待ち受けを移さない**（保存は次の起動から効く / ADR-0057 §決定5）。
+//! **保存した番号が次の起動で使われていれば、その起動は次の空きへずらす**（ADR-0057 §決定3 / 作業単位 F-11b /
+//! `port_search` モジュール）。元の番号・ずらしたか・飛ばした番号は `GET /admin/server` が言う（API 1.6）。
 //!
 //! # ⚠ 守れないもの
 //!
@@ -53,6 +55,7 @@ use utoipa::openapi::schema::Object;
 
 use super::config::{BindAddr, ENV_PORT, PortSource, SavedPort, resolve_port};
 use super::error::{ApiError, ErrorBody};
+use super::port_search::OpenedPort;
 use super::profile_editor::{ProfilesLocation, RealSteps, ReplaceError, replace_file_with};
 use super::remembered;
 use super::{AppState, openapi};
@@ -231,8 +234,9 @@ pub(crate) fn port_in_use(port: u16) -> bool {
 pub(crate) struct Listening {
     /// **実際に待ち受けている番号**（`local_addr`。設定値ではない）。
     port: u16,
-    /// **その番号が何から決まったか**（`AppConfig::port_source`）。
-    source: PortSource,
+    /// **待ち受けをどう開けたか**——元の番号・その出どころ・ずらしたか・飛ばした番号
+    /// （`port_search::open_first` の結果 / 作業単位 F-11b）。
+    opened: OpenedPort,
     /// **保存した番号の置き場所**（[`memory_for`]。既定の置き場所でなければ `None`＝保存できない）。
     memory: Option<PathBuf>,
     /// **書いて読み直すまでを1つずつ**（同じ実行ファイルの中の2つの保存を混ぜない）。
@@ -240,10 +244,10 @@ pub(crate) struct Listening {
 }
 
 impl Listening {
-    pub(crate) const fn new(port: u16, source: PortSource, memory: Option<PathBuf>) -> Self {
+    pub(crate) const fn new(port: u16, opened: OpenedPort, memory: Option<PathBuf>) -> Self {
         Self {
             port,
-            source,
+            opened,
             memory,
             writing: Mutex::new(()),
         }
@@ -289,7 +293,10 @@ impl Listening {
         let (next_port, next_port_source) = next_start(saved);
         ServerView {
             listening_port: self.port,
-            listening_port_source: self.source.label(),
+            listening_port_source: self.opened.source().label(),
+            listening_port_requested: self.opened.requested(),
+            listening_port_shifted: self.opened.shifted(),
+            listening_port_skipped: self.opened.skipped().to_vec(),
             saved_port: saved.map(SavedPort::get),
             saved_port_unreadable,
             next_port,
@@ -341,7 +348,7 @@ impl Listening {
         );
 
         // **いまこの personacore が使っている番号なら「使われている」と言わない**（ADR-0057 §決定5）。
-        // **使われていても保存は止めない**（次の起動で F-11 がずらす）。
+        // **使われていても保存は止めない**（次の起動は、塞がっていれば次の空きへずらす / `port_search`）。
         let saved_port_in_use =
             wanted.map(|port| port.get() != self.port && port_in_use(port.get()));
         Ok(SavePortView {
@@ -369,22 +376,37 @@ fn port_source_schema() -> Object {
     openapi::closed_string(PortSource::ALL.map(PortSource::label))
 }
 
-/// **`GET /admin/server` の本文**（ADR-0057 §決定6 の F-12 の行）。
+/// **`GET /admin/server` の本文**（ADR-0057 §決定6 の F-12・F-11 の行）。
 ///
 /// | 欄 | 意味 |
 /// |---|---|
 /// | `listening_port` | **いま実際に待ち受けている番号**（`local_addr`。`PERSONACORE_PORT=0` なら OS が選んだ番号） |
-/// | `listening_port_source` | その番号の出どころ（`environment` / `saved` / `default`） |
+/// | `listening_port_source` | **試し始めた番号**の出どころ（`environment` / `saved` / `default`）。ずらしても変わらない |
+/// | `listening_port_requested` | **元の番号**（試し始めた番号。`PERSONACORE_PORT=0` なら `0`）。ずらしていなければ `listening_port` と同じ |
+/// | `listening_port_shifted` | **元の番号を使えず、別の番号で待ち受けたか**（`0` で OS に選ばせたのは `false`） |
+/// | `listening_port_skipped` | **探すときに飛ばした番号**（llama の面が使う番号のうち、開けた番号より前のもの。ずらしていなければ空） |
 /// | `saved_port` | 保存した番号（無い・読めない・保存できない置き場所なら `null`） |
 /// | `saved_port_unreadable` | **保存のファイルが在るのに読めない**（範囲の外・数でない・2行以上・I/O の失敗）なら `true`。無い・空・保存できない置き場所なら `false`。**画面が「保存なし」と「壊れたファイルが在る」を見分けるため** |
 /// | `next_port` | 次の起動で使う番号（`PERSONACORE_PORT` が読めない綴りなら `null` —— 次の起動は止まる） |
 /// | `next_port_source` | その出どころ |
 /// | `editable` | 保存できるか（既定の置き場所か。`GET /admin/upstream/profiles` の同名の欄と同じ意味） |
+///
+/// # 欄名を `listening_port_*` にした理由（作業単位 F-11b）
+///
+/// F-12 の欄は**何についての話か**を頭に置いている——`listening_port_*` は**いまの待ち受け**、`saved_port_*`
+/// は保存、`next_port_*` は次の起動。**元の番号・ずらしたか・飛ばした番号は、どれもいまの待ち受けをどう開けたか**
+/// の話なので、`listening_port_source` と同じ頭に揃えた。`original_port` / `shifted` のような裸の名前にすると、
+/// 保存や次の起動の話と読み分けられない（「保存した番号から何かをずらしたのか」と読める）。
+/// **`listening_port_shifted` を持つのは、元の番号と実際の番号の比較では `0` の起動を見分けられないから**
+/// （元の番号 `0`・実際の番号は OS が選んだ番号で、ずらしてはいない）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub(crate) struct ServerView {
     listening_port: u16,
     #[schema(schema_with = port_source_schema)]
     listening_port_source: &'static str,
+    listening_port_requested: u16,
+    listening_port_shifted: bool,
+    listening_port_skipped: Vec<u16>,
     #[schema(required = true)]
     saved_port: Option<u16>,
     saved_port_unreadable: bool,

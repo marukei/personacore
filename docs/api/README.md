@@ -141,7 +141,13 @@ A port can also be saved through the API (`PUT /admin/server/port`, see
 [The listening port](#the-listening-port)); it is used from the next start. The order is
 `PERSONACORE_PORT`, then the saved port, then `8080`.
 
-The startup log prints the address it listens on.
+If the saved port or `8080` is taken, personacore listens on the next free port, up to
+ten above it, and logs a warning. A port set with `PERSONACORE_PORT` is never moved: if it
+is taken, personacore stops. So **if your program needs a fixed port, set
+`PERSONACORE_PORT`**, or read the actual port from `GET /admin/server`.
+
+The startup log prints the address it listens on (`addr=` on the line that says it has
+started listening).
 
 **Where data lives.** By default everything is under a `personacore` directory in the
 operating system's per-user data directory:
@@ -195,7 +201,7 @@ itself. It is served with `--no-ui` too, because it is part of the API, not of t
 carries the API version:
 
 ```
-x-personacore-api-version: 1.5
+x-personacore-api-version: 1.6
 ```
 
 That includes errors, 404 and 405 responses, the event stream and `/openapi.json`.
@@ -705,12 +711,34 @@ The port is decided at start, in this order: `PERSONACORE_PORT`, then the saved 
 then `8080`. **Saving does not move the running server**; the saved port is used from
 the next start.
 
+**When the saved port or `8080` is taken, personacore moves to the next free port.** It
+tries that port and the ten above it, in order (stopping at 65535), and listens on the
+first one it can open. It does not try the ports used by the upstream processes it can
+start (the `gguf` sides of every profile in `upstreams.json`, whether or not that profile is
+selected), including the first port itself; those still count towards the ten. A port is
+moved past when opening it fails because it is in use, or because Windows refuses it
+(a port inside an excluded range); any other failure stops the start. If none of them
+can be opened, personacore stops and names the range it tried. The port it moved to is
+not saved: the next start tries the saved port or `8080` again. **A port set with
+`PERSONACORE_PORT` is never moved**; if it is taken, personacore stops. With
+`PERSONACORE_PORT=0` the operating system chooses, and that is not counted as moving.
+
+When it moves, the startup log has one warning naming the first port, the port it moved
+to, where the first port came from and the ports it did not try (`requested_port`,
+`port`, `port_source` and `skipped_ports`), and `GET /admin/server` reports it (below).
+The `bind=` field of the startup line that reports the settings is the first port tried;
+the actual port is in the warning and in `addr=` on the line that says it has started
+listening.
+
 `GET /admin/server` returns:
 
 | Field | Meaning |
 |---|---|
 | `listening_port` | The port personacore is actually listening on (with `PERSONACORE_PORT=0`, the port the operating system chose) |
-| `listening_port_source` | Where that port came from: `environment` (`PERSONACORE_PORT`), `saved` or `default` |
+| `listening_port_source` | Where the first port tried came from: `environment` (`PERSONACORE_PORT`), `saved` or `default` |
+| `listening_port_requested` | The first port tried, from that source (`0` with `PERSONACORE_PORT=0`). Equal to `listening_port` unless personacore moved |
+| `listening_port_shifted` | `true` when personacore could not use `listening_port_requested` and is listening on another port. `false` with `PERSONACORE_PORT=0` |
+| `listening_port_skipped` | The ports it did not try because an upstream process of a profile uses them, up to the port it opened (empty when it did not move) |
 | `saved_port` | The saved port, or `null` when none is saved, the file cannot be read, or ports cannot be saved in this run |
 | `saved_port_unreadable` | `true` when the saved port file exists but cannot be read (not a single number from 1024 to 65535, or it cannot be opened); `false` when there is no file, the file is empty, or ports cannot be saved in this run. Use it to tell "nothing saved" from "a broken file is there" |
 | `next_port` | The port the next start will use, worked out now from this process's `PERSONACORE_PORT` and the saved port (`null` if `PERSONACORE_PORT` cannot be read as a port, in which case the next start stops) |
@@ -775,7 +803,7 @@ header.
 
 ## Versioning and compatibility
 
-The current API version is `1.5`.
+The current API version is `1.6`.
 
 The API version is kept separately from the application version and is stated in the
 OpenAPI document (`info.version`) and in the `X-Personacore-Api-Version` header. The
@@ -811,6 +839,14 @@ segment (such as `v1`) into the paths under `/admin`.
   working; requests that reached personacore some other way (for example through another
   host name) may start to be refused within `1.x`. The `Host` / `Origin` checks were added
   this way.
+
+Changes in `1.6` (from `1.5`): in `GET /admin/server` and the save response of
+`PUT /admin/server/port`, the fields `listening_port_requested`, `listening_port_shifted`
+and `listening_port_skipped` (see [The listening port](#the-listening-port)). When the
+saved port or `8080` is taken, personacore now moves to the next free port instead of
+stopping; `listening_port_source` now names where the first port tried came from. A port
+set with `PERSONACORE_PORT` behaves as before. No route or failure was added or removed.
+Version `1.5` was not in any release.
 
 Changes in `1.5` (from `1.4`): the two listening port routes, `GET /admin/server` and
 `PUT /admin/server/port` (see [The listening port](#the-listening-port)), with the fields

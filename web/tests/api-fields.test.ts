@@ -527,6 +527,10 @@ describe("待ち受けのポートの欄名は写し元と一致する（`listen
     expect(labelsOf(rustFieldsOf(LISTENING_PORT_RS, "SavePortView"))).toEqual([
       "editable",
       "listening_port",
+      // **作業単位 F-11b（API 1.6）で足した3つ**（元の番号・ずらしたか・飛ばした番号）。
+      "listening_port_requested",
+      "listening_port_shifted",
+      "listening_port_skipped",
       "listening_port_source",
       "next_port",
       "next_port_source",

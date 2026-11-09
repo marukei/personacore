@@ -31,6 +31,9 @@ import SettingsPanel from "../src/lib/SettingsPanel.svelte";
 const READ: ServerView = {
   listening_port: 8123,
   listening_port_source: "saved",
+  listening_port_requested: 8123,
+  listening_port_shifted: false,
+  listening_port_skipped: [],
   saved_port: 8456,
   saved_port_unreadable: false,
   next_port: 8789,
@@ -42,6 +45,9 @@ const READ: ServerView = {
 const SAVED: SavePortView = {
   listening_port: 8123,
   listening_port_source: "saved",
+  listening_port_requested: 8123,
+  listening_port_shifted: false,
+  listening_port_skipped: [],
   saved_port: 9001,
   saved_port_unreadable: false,
   next_port: 9001,

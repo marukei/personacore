@@ -3,7 +3,8 @@
 //! 起動の順序は
 //! **引数（`--version` ならここで終わる）→ ログ初期化 → データのディレクトリのロック
 //! （取れなければ動いている側を案内して終わる）→ 上流プロファイル（無ければ見本を書く）
-//! → 設定読み込み → 待ち受け → ブラウザを開く（`--no-ui` なら開かない）→ 停止待ち**。
+//! → 設定読み込み（番号を明示していなければ、飛ばす番号のために `upstreams.json` も読む）
+//! → 待ち受け（明示していない番号が塞がっていれば次の空きへ）→ ブラウザを開く（`--no-ui` なら開かない）→ 停止待ち**。
 //! 実体は `personacore::server` にあり、ここは結線だけを持つ。
 //!
 //! 起動失敗は `anyhow` で返す（CLAUDE.md 5節: `main` 付近のみ許容）。
@@ -15,12 +16,13 @@ use std::process::ExitCode;
 use anyhow::Context;
 use personacore::llm::endpoint_for_log;
 use personacore::server::{
-    Acquired, App, AppConfig, Browser, ENV_UPSTREAMS, LaunchPlan, LaunchTiming, ProfileSettings,
-    SampleOutcome, SavedPort, ServerError, Startup, Ui, UpstreamProfiles, VERSION_LINE,
-    acquire_beside, database_path_from_env, guide_second_start, init_tracing, load_profiles,
-    overlay_profile, parse_args, port_in_use_message, read_remembered, read_saved_port,
-    remembered_path_beside, saved_port_path_beside, shutdown_signal, upstreams_path_under,
-    wait_before_closing_if_alone, write_sample_if_missing,
+    Acquired, App, AppConfig, Browser, ENV_UPSTREAMS, LaunchPlan, LaunchTiming, PortSource,
+    ProfileSettings, SampleOutcome, SavedPort, ServerError, Startup, Ui, UpstreamProfiles,
+    VERSION_LINE, acquire_beside, database_path_from_env, guide_second_start, init_tracing,
+    launch_ports_at, load_profiles, overlay_profile, parse_args, port_in_use_message,
+    ports_in_use_message, read_remembered, read_saved_port, remembered_path_beside,
+    saved_port_path_beside, shutdown_signal, upstreams_path_under, wait_before_closing_if_alone,
+    write_sample_if_missing,
 };
 
 /// **`run` がどう終わったか**（失敗は `Err`）。
@@ -60,10 +62,19 @@ fn main() -> ExitCode {
 /// **待ち受けを開けなかった理由が「他のプログラムが使っている」なら、番号と直し方を言う**
 /// （作業単位 B-76 / marukei/personacore#13）。
 ///
-/// **それ以外の失敗の文は変えない**（今までどおり「サーバの実行に失敗しました」）。
-/// 見張り番は `tests/upstream_cli.rs` の `an_occupied_port_names_the_port_and_the_setting_and_never_waits`。
+/// | 失敗 | 言う文 |
+/// |---|---|
+/// | **番号を明示していない起動が、ずらす範囲を全部試しても開けなかった**（`ServerError::tried_ports`） | **試した範囲**と直し方（`ports_in_use_message` / ADR-0057 §決定3 / 作業単位 F-11b） |
+/// | 明示した番号（`PERSONACORE_PORT`）が使われていた | 今までどおり、その番号と `PERSONACORE_PORT`（`port_in_use_message`） |
+/// | それ以外 | 今までどおり「サーバの実行に失敗しました」 |
+///
+/// **`port` は設定の番号**（明示のときは試した番号そのもの）。見張り番は `tests/upstream_cli.rs` の
+/// `an_occupied_port_names_the_port_and_the_setting_and_never_waits` と、`tests/listening_port_cli.rs` の
+/// `a_whole_range_taken_names_the_range_and_how_to_get_out`。
 fn explain_server_failure(err: ServerError, port: u16) -> anyhow::Error {
-    if err.is_port_in_use() {
+    if let Some((first, last)) = err.tried_ports() {
+        anyhow::Error::new(err).context(ports_in_use_message(first, last))
+    } else if err.is_port_in_use() {
         anyhow::Error::new(err).context(port_in_use_message(port))
     } else {
         anyhow::Error::new(err).context("サーバの実行に失敗しました")
@@ -151,8 +162,9 @@ async fn run() -> anyhow::Result<Finished> {
     // | 2 | **覚えた名前**（`selected-upstream.txt`。**既定の置き場所のときだけ読む**） | **警告を1本出して 3 で起きる。覚えた名前は消さない** |
     // | 3 | 環境変数の既定 | 設定が読めなければ止まる（今までどおり） |
     //
-    // **旗も覚えた名前も無ければ、`upstreams.json` を読まない**——上流の決め方は
-    // F-4f より前と1バイトも変わらない。
+    // **旗も覚えた名前も無ければ、上流を決めるために `upstreams.json` を読まない**——上流の決め方は
+    // F-4f より前と1バイトも変わらない（**待ち受けを探すときに飛ばす番号のためには読む**。下の
+    // `face_ports_of` / ADR-0057 §決定3 / 作業単位 F-11b）。
     //
     // **プロファイルから来た値は、環境変数4つと同じ入口へ流す**（ADR-0042 §決定1）。
     // **入口を増やさない**——増やすと「どちらが効いているか」が2つになる。
@@ -181,7 +193,15 @@ async fn run() -> anyhow::Result<Finished> {
             },
         },
     };
-    let config = chosen.config;
+    // **番号を明示していなければ、待ち受けを探すときに飛ばす番号を読む**（ADR-0057 §決定3 / 作業単位 F-11b）。
+    //
+    // `upstreams.json` の全部のプロファイルの gguf の面の番号（選んでいるかを問わない）。**明示した起動
+    // （`PERSONACORE_PORT`）では読まない**——ずらさないので要らない（面と同じなら今までどおり B-52 が止める）。
+    let config = if chosen.config.port_source() == PortSource::Environment {
+        chosen.config
+    } else {
+        chosen.config.with_face_ports(face_ports_of(&profiles_path))
+    };
 
     log_settings(
         &config,
@@ -330,6 +350,8 @@ fn log_settings(config: &AppConfig, profile: Option<&str>, from: ProfileFrom) {
     let upstream = endpoint_for_log(config.llm().endpoint());
     let sub_upstream = endpoint_for_log(config.sub_llm_endpoint());
     tracing::info!(
+        // **試し始めた番号**（ADR-0057 §決定4）。塞がっていてずらした起動では、実際の番号と違う——
+        // 実際の番号は `App::bind` が出す警告（ずらしたとき）と、待ち受けの行の `addr=` が言う。
         bind = %config.bind(),
         // **その番号が何から決まったか**（ADR-0057 §決定5）——`environment` / `saved` / `default`。
         // 見張り番は `tests/listening_port_cli.rs`。
@@ -509,6 +531,42 @@ fn saved_port_of(profiles_path: &ProfilesPath) -> Option<SavedPort> {
     }
 }
 
+/// **待ち受けを探すときに飛ばす番号を読む**（ADR-0057 §決定3 / 作業単位 F-11b）。**番号を明示していない起動だけが呼ぶ。**
+///
+/// 読むのは**その起動が使う置き場所**（`PERSONACORE_UPSTREAMS` が指す先か、既定の置き場所）。中身は番号だけにして
+/// 捨てる——**上流を決めるのには使わない。**
+///
+/// | 条件 | 結果 |
+/// |---|---|
+/// | 置き場所を決められない | 空（何も言わない） |
+/// | ファイルが無い | 空（何も言わない） |
+/// | 読めない・JSON や形として読めない | **警告を1本出して空**（止めない。上流を選んでいれば、そちらは今までどおり止まる・警告する） |
+fn face_ports_of(profiles_path: &ProfilesPath) -> std::collections::BTreeSet<u16> {
+    let path = match profiles_path {
+        ProfilesPath::Overridden(path) | ProfilesPath::Default(path) => path,
+        ProfilesPath::Undecidable => return std::collections::BTreeSet::new(),
+    };
+    match launch_ports_at(path) {
+        Ok(ports) => ports,
+        Err(err) => {
+            // **鎖は Debug で書く**（形の誤りの文面は利用者の綴りを含みうる。改行で行を割らせない）。
+            tracing::warn!(
+                upstream_profiles_path = %path.display(),
+                error = %err,
+                cause = ?std::error::Error::source(&err).map(ToString::to_string),
+                "{FACE_PORTS_UNREADABLE}"
+            );
+            std::collections::BTreeSet::new()
+        }
+    }
+}
+
+/// **飛ばす番号のために読む `upstreams.json` が読めないときの警告の本文**（ADR-0057 §決定3）。
+///
+/// **写しが `tests/listening_port_cli.rs` の `FACE_PORTS_UNREADABLE_LINE` に在る**
+/// （文面を変えたら、そちらは「言っていない」で赤になる）。
+const FACE_PORTS_UNREADABLE: &str = "上流プロファイルを読めないので、待ち受けのポートを探すときに llama の面の番号を飛ばせません（待ち受けのポートが使われていてずらすとき、llama の面と同じ番号で待ち受けることがあります。upstreams.json を直すと、次の起動から飛ばします）";
+
 /// **保存した待ち受けのポートを読めないときの警告の本文**（ADR-0057 §決定5）。
 ///
 /// **写しが `tests/listening_port_cli.rs` の `SAVED_PORT_UNREADABLE_LINE` と
@@ -561,7 +619,7 @@ const REMEMBERED_UNUSABLE: &str = "覚えていた上流プロファイルを使
 /// | 既定の置き場所でない（`PERSONACORE_UPSTREAMS` / 決められない） | **何も言わない。ファイルを読みもしない** |
 /// | 覚えた名前が無い（ファイルが無い・空） | 何も言わない |
 /// | 覚えた名前を読めない（ディレクトリ・権限・2行以上） | 警告 |
-/// | **覚えた名前が使えない**（名前が無い／検証に通らない／gguf が無い／待ち受けと取り合う／設定を組めない） | **警告。同じ行が名前を言う** |
+/// | **覚えた名前が使えない**（名前が無い／検証に通らない／gguf が無い／**明示した**待ち受けの番号と取り合う／設定を組めない） | **警告。同じ行が名前を言う** |
 ///
 /// **どの場合も、覚えた名前は消さない**（利用者が `upstreams.json` を直せば、次から効く）。
 fn remembered_choice(
@@ -616,9 +674,11 @@ fn remembered_choice(
 /// **明示の `--upstream` と同じ関数を通す**（[`select_profile`] と、`bind` が止まるのと同じ判定の
 /// `LaunchPlan::check_before_starting`）——**判定の写しを作らない。**
 ///
-/// **待ち受けとの取り合いは、保存した番号も見る**（`config.bind()` が保存した番号になる / ADR-0057 §決定5）。
-/// 振る舞いは今までどおり（取り合えば覚えた名前を使わない）。番号を明示していないときに取り合わなくするのは
-/// F-11（ADR-0057 §決定3）。
+/// **待ち受けとの取り合いは、番号を明示したとき（`PERSONACORE_PORT`）だけ見る**（ADR-0057 §決定3 /
+/// 作業単位 F-11b / `AppConfig::explicit_bind`）。明示していなければ、待ち受けを探すときに面の番号を飛ばすので
+/// 取り合わない——保存した番号や既定の番号が面と同じでも、覚えた名前を捨てない。
+/// 見張り番は `tests/listening_port_cli.rs` の
+/// `a_remembered_profile_on_the_saved_port_is_kept_and_the_saved_port_is_skipped`（明示の対照つき）。
 fn remembered_profile(
     name: &str,
     profiles_path: &ProfilesPath,
@@ -629,7 +689,7 @@ fn remembered_profile(
         config_for(&selected.settings, saved_port).context("設定を読み込めませんでした")?;
     selected
         .plan
-        .check_before_starting(config.bind())
+        .check_before_starting(config.explicit_bind())
         .context("上流を起こせません")?;
     Ok((selected, config))
 }
