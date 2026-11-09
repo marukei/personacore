@@ -27,6 +27,7 @@
 //! | **4段だけ** | [`the_distributed_readme_has_exactly_four_steps`] |
 //! | **起こせなかったとき（ログ名が出ない失敗）の文面が、画面に出るとおり** | [`the_distributed_readme_shows_the_spawn_failure_as_the_screen_does`] |
 //! | **README の保存先の名前が、実行ファイルの定数と同じ** | [`the_distributed_readme_names_the_files_the_executable_actually_writes`] |
+//! | **使用中のポートの文とポートの変え方が、実行ファイルの文・定数と同じ** | [`the_distributed_readme_shows_the_port_in_use_message_and_how_to_change_the_port`] |
 //! | **zip を組む途中で失敗したら、`.partial` を残さない** | [`a_failure_while_zipping_leaves_no_partial_file`] |
 //!
 //! `package.ps1` の中の**順番**（zip は複製の後）は `tests/start_script.rs` が見る
@@ -59,9 +60,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use personacore::server::{
-    APP_DATA_DIR_NAME, DATABASE_FILE_NAME, DEFAULT_COMMAND, FRESH_FLAG, NO_BROWSER_FLAG,
-    NO_UI_FLAG, UPSTREAM_FLAG, UPSTREAM_LOG_DIR_NAME, UPSTREAMS_FILE_NAME, VERSION_FLAG,
-    VERSION_LINE,
+    APP_DATA_DIR_NAME, DATABASE_FILE_NAME, DEFAULT_COMMAND, DEFAULT_PORT, ENV_PORT, FRESH_FLAG,
+    NO_BROWSER_FLAG, NO_UI_FLAG, UPSTREAM_FLAG, UPSTREAM_LOG_DIR_NAME, UPSTREAMS_FILE_NAME,
+    VERSION_FLAG, VERSION_LINE, port_in_use_message,
 };
 
 // ----------------------------------------------------------------------
@@ -188,6 +189,21 @@ const DEVELOPER_WORDS: [&str; 14] = [
     "PERSONACORE_",
 ];
 
+/// **README が名指してよい環境変数**（[`DEVELOPER_WORDS`] の `PERSONACORE_` の例外 / 作業単位 B-76）。
+///
+/// **ポートの変え方だけは、利用者が要る**——他のプログラムが既定のポートを使っていると、
+/// personacore は起動できない（実行ファイルがこの名前を言って止まる / `server::port_in_use_message`）。
+///
+/// **綴りは実行ファイルの定数から引く**——ここに在る名前は、サーバが読む環境変数そのものである
+/// （`tests/readme.rs` の `the_translated_readmes_only_name_environment_variables_the_server_reads` と同じ考え）。
+/// **ここに無い `PERSONACORE_…` は、今までどおり開発者の言葉として拾う。**
+///
+/// **⚠ 帳簿である。足せば通る**（[`DEVELOPER_WORDS`] と同じ）。
+const USER_FACING_ENV_NAMES: [&str; 1] = [ENV_PORT];
+
+/// 環境変数の綴りの接頭辞（[`DEVELOPER_WORDS`] の1つ）。
+const ENV_NAME_PREFIX: &str = "PERSONACORE_";
+
 /// **README が必ず「」で名指す、画面の文言**（手順4の操作）。
 ///
 /// 綴りの権威は画面のソース（[`SCREEN_FILES`]）。ここは「README が落としていない」ことだけを見る。
@@ -210,7 +226,12 @@ fn developer_words(source: &str) -> Vec<(usize, String)> {
     let mut found = Vec::new();
     for (index, line) in source.lines().enumerate() {
         for word in DEVELOPER_WORDS {
-            if line.contains(word) {
+            let named = if word == ENV_NAME_PREFIX {
+                has_developer_env_name(line)
+            } else {
+                line.contains(word)
+            };
+            if named {
                 found.push((index + 1, word.to_owned()));
             }
         }
@@ -219,6 +240,19 @@ fn developer_words(source: &str) -> Vec<(usize, String)> {
         }
     }
     found
+}
+
+/// **行に `PERSONACORE_…` があり、そのどれかが [`USER_FACING_ENV_NAMES`] に無いか。**
+///
+/// 名前は接頭辞から「英大文字・数字・`_`」の続く限り（`PERSONACORE_PORTS` は `PERSONACORE_PORT` ではない）。
+fn has_developer_env_name(line: &str) -> bool {
+    line.match_indices(ENV_NAME_PREFIX).any(|(at, _)| {
+        let rest = &line[at..];
+        let len = rest
+            .find(|ch: char| !(ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_'))
+            .unwrap_or(rest.len());
+        !USER_FACING_ENV_NAMES.contains(&&rest[..len])
+    })
 }
 
 /// **作業単位の番号の形**（`F-4d` / `B-45` / `C-18`）を拾う。
@@ -597,6 +631,34 @@ fn the_developer_word_scan_reads_the_source_it_is_given() {
             Vec::new(),
             "作業単位の番号に似た綴り（`UTF-8` / モデル名）を拾わないこと"
         );
+    }
+
+    // **環境変数の例外は、帳簿の名前「まるごと」だけ**（作業単位 B-76）。
+    // 期待の綴りは定数から作らない（帳簿を広げる変異で、期待まで一緒に動かないように）。
+    for allowed in [
+        "`$env:PERSONACORE_PORT = '8090'`\n",
+        "PERSONACORE_PORT と書いた\n",
+    ] {
+        for source in both_newlines(allowed) {
+            assert_eq!(
+                developer_words(&source),
+                Vec::new(),
+                "利用者向けの環境変数を拾わないこと: {source:?}"
+            );
+        }
+    }
+    for planted in [
+        "PERSONACORE_DB_PATH と書いた\n",
+        "PERSONACORE_PORTS と書いた\n",
+        "PERSONACORE_PORT と PERSONACORE_UPSTREAMS と書いた\n",
+    ] {
+        for source in both_newlines(planted) {
+            assert_eq!(
+                developer_words(&source),
+                vec![(1, "PERSONACORE_".to_owned())],
+                "帳簿に無い環境変数を拾うこと: {source:?}"
+            );
+        }
     }
 
     // **実ファイルも同じ本体を通ること**（空振りしていないこと）。
@@ -1066,6 +1128,33 @@ fn the_distributed_readme_shows_the_spawn_failure_as_the_screen_does() {
     assert!(
         readme.contains(&format!("`{log_suffix}")),
         "{DIST_README} が、ログのファイル名が付く形 `{log_suffix}…）` を書いていない"
+    );
+}
+
+/// **使用中のポートで止まったときの文と、ポートの変え方を書いていること**（作業単位 B-76 / marukei/personacore#13）。
+///
+/// 見るもの:
+/// * README が、既定のポートで実行ファイルが出す文（`server::port_in_use_message`）を**そのまま**書いている。
+/// * README が、PowerShell で [`ENV_PORT`] を立てて起こす1行を書いている。
+/// * README の例の宛先が、personacore の既定のポート（`127.0.0.1:<DEFAULT_PORT>`）を使っていない
+///   ——同じ番号を例に書くと、その例どおりに立てた推論サーバが personacore の起動を止める。
+#[test]
+fn the_distributed_readme_shows_the_port_in_use_message_and_how_to_change_the_port() {
+    let readme = dist_readme();
+    let message = port_in_use_message(DEFAULT_PORT);
+    assert!(
+        readme.contains(&message),
+        "{DIST_README} が、使用中のポートで実行ファイルが出す文 `{message}` をそのまま書いていない"
+    );
+    let command = format!("$env:{ENV_PORT} = '");
+    assert!(
+        readme.contains(&command),
+        "{DIST_README} が、PowerShell でポートを変える `{command}…` を書いていない"
+    );
+    let default_endpoint = format!("127.0.0.1:{DEFAULT_PORT}");
+    assert!(
+        !readme.contains(&default_endpoint),
+        "{DIST_README} が、personacore の既定のポートと同じ宛先 `{default_endpoint}` を例に書いている"
     );
 }
 
