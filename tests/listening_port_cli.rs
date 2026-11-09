@@ -954,6 +954,9 @@ fn an_unreadable_saved_port_warns_and_the_file_is_kept() {
 /// 保存した番号 `P` をこのテストが掴み、**選ばれていないプロファイル**の gguf の面を `P+1` に置く
 /// （起動の計画に入っているかを問わず飛ばす / ADR-0057 §決定3）。待ち受けは `P+2` 以降で、飛ばした番号は `P+1`。
 /// **偽の `llama` は1度も呼ばれない**（プロファイルを選んでいない起動は何も起こさない）。
+///
+/// **gguf の面を持つプロファイルを、名前の順で2つ目に置く**（1つ目 `aa-external` は外の上流だけ）——
+/// 最初のプロファイルだけを見る実装を、ここでも赤にする（変異 M15 で、単体テストだけが止めていたのを足した）。
 #[test]
 fn a_taken_saved_port_shifts_past_a_face_port_and_the_log_and_the_api_say_so() {
     let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
@@ -964,11 +967,16 @@ fn a_taken_saved_port_shifts_past_a_face_port_and_the_log_and_the_api_say_so() {
     let marker = root.join(TOUCH_MARKER);
     std::fs::write(
         app_dir_of(root).join("upstreams.json"),
-        serde_json::json!({ "unchosen": { "main": {
-            "endpoint": format!("http://127.0.0.1:{face_port}"), "model": "unchosen-model",
-            "gguf": root.join("planted-unchosen.gguf"),
-            "args": ["--pc-touch", marker],
-        } } })
+        serde_json::json!({
+            "aa-external": { "main": {
+                "endpoint": DECOY_ENDPOINT, "model": "external-model",
+            } },
+            "zz-unchosen": { "main": {
+                "endpoint": format!("http://127.0.0.1:{face_port}"), "model": "unchosen-model",
+                "gguf": root.join("planted-unchosen.gguf"),
+                "args": ["--pc-touch", marker],
+            } },
+        })
         .to_string(),
     )
     .expect("プロファイルを置けること");
