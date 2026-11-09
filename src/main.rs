@@ -1,7 +1,8 @@
 //! personacore — ローカルLLMキャラクター会話基盤のオーケストレーション層。
 //!
 //! 起動の順序は
-//! **引数（`--version` ならここで終わる）→ ログ初期化 → 上流プロファイル（無ければ見本を書く）
+//! **引数（`--version` ならここで終わる）→ ログ初期化 → データのディレクトリのロック
+//! （取れなければ動いている側を案内して終わる）→ 上流プロファイル（無ければ見本を書く）
 //! → 設定読み込み → 待ち受け → ブラウザを開く（`--no-ui` なら開かない）→ 停止待ち**。
 //! 実体は `personacore::server` にあり、ここは結線だけを持つ。
 //!
@@ -14,22 +15,39 @@ use std::process::ExitCode;
 use anyhow::Context;
 use personacore::llm::endpoint_for_log;
 use personacore::server::{
-    App, AppConfig, Browser, ENV_UPSTREAMS, LaunchPlan, LaunchTiming, ProfileSettings,
+    Acquired, App, AppConfig, Browser, ENV_UPSTREAMS, LaunchPlan, LaunchTiming, ProfileSettings,
     SampleOutcome, SavedPort, ServerError, Startup, Ui, UpstreamProfiles, VERSION_LINE,
-    init_tracing, load_profiles, overlay_profile, parse_args, port_in_use_message, read_remembered,
-    read_saved_port, remembered_path_beside, saved_port_path_beside, shutdown_signal,
-    upstreams_path_under, wait_before_closing_if_alone, write_sample_if_missing,
+    acquire_beside, database_path_from_env, guide_second_start, init_tracing, load_profiles,
+    overlay_profile, parse_args, port_in_use_message, read_remembered, read_saved_port,
+    remembered_path_beside, saved_port_path_beside, shutdown_signal, upstreams_path_under,
+    wait_before_closing_if_alone, write_sample_if_missing,
 };
+
+/// **`run` がどう終わったか**（失敗は `Err`）。
+enum Finished {
+    /// 待ち受けて、停止の合図で止まった（今までどおり）。
+    Stopped,
+    /// **同じデータを使う personacore がすでに動いていたので、案内だけして終わった**（ADR-0057 §決定2）。
+    /// `wait` は「窓を閉じる前に Enter を待つ候補か」（ブラウザを開かなかった・開けなかった）。
+    AlreadyRunning { wait: bool },
+}
 
 /// **失敗を言ってから、ダブルクリックで開いた窓なら Enter を待って終わる**（作業単位 B-76）。
 ///
 /// 書き出しは標準ライブラリの `main` が `Result` を返したときと同じ形（`Error: {:?}` ＋ 終了コード 1）。
 /// **`eprintln!` を使わない**——標準エラーが閉じていると panic する（`--version` の doc と同じ）。
-/// **待つのは失敗の枝だけ。** 正常に終わったとき（Ctrl+C）は待たない。
+/// **待つのは失敗の枝と、ブラウザを開かずに案内だけした2つ目**（ADR-0057 §決定2——案内の文が窓と一緒に
+/// 消えないように）。正常に終わったとき（Ctrl+C）は待たない。
 /// **実行時（tokio）を落とした後で待つ**——起こした子（`kill_on_drop`）を、待っている間に残さない。
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Finished::Stopped) => ExitCode::SUCCESS,
+        Ok(Finished::AlreadyRunning { wait }) => {
+            if wait {
+                wait_before_closing_if_alone();
+            }
+            ExitCode::SUCCESS
+        }
         Err(err) => {
             use std::io::Write as _;
             let _ = writeln!(std::io::stderr().lock(), "Error: {err:?}");
@@ -53,7 +71,7 @@ fn explain_server_failure(err: ServerError, port: u16) -> anyhow::Error {
 }
 
 #[tokio::main]
-async fn run() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<Finished> {
     // **引数はログより先に読む。** 綴り違いで止まる話に、起動ログは要らない。
     //
     // **`args_os` を使う**——`std::env::args()` は Unicode でない引数で **panic する**
@@ -78,10 +96,36 @@ async fn run() -> anyhow::Result<()> {
     if args.version() {
         use std::io::Write as _;
         writeln!(std::io::stdout().lock(), "{VERSION_LINE}").context("版を書き出せませんでした")?;
-        return Ok(());
+        return Ok(Finished::Stopped);
     }
 
     init_tracing().context("ログ出力を初期化できませんでした")?;
+
+    // **同じデータを使う personacore を2つ動かさない**（ADR-0057 §決定2 / 作業単位 F-11a）。
+    //
+    // **ファイルに触る最初の処理**——見本を書く・`--fresh` の退避・上流への照会・待ち受けより前。
+    // `--version` の後なので、`--version` はロックを見ない（ログの初期化はファイルに触らない）。
+    //
+    // **DB の置き場所は設定と同じ関数で決める**（`database_path_from_env` → `config::database_path_from`）。
+    // **`--upstream` のプロファイルはこの値を変えない**（`overlay_profile` が触るのは宛先とモデルの4つだけ。
+    // 見張り番は `tests/upstream_profiles.rs` の `PERSONACORE_DB_PATH` を引く assert）ので、プロファイルより前に取れる。
+    // 決められなければ、設定を組むときと同じ理由で止まる（`ConfigError::DataDir` / `DatabasePath`）。
+    //
+    // **取れなければ、何もせずに案内して 0 で終わる。** `--fresh` / `--upstream` は使わず、使わなかったと言う。
+    // **持っているロックは `Startup` に渡し、待ち受けを開いた後に URL を書き、`serve` が返るまで持つ。**
+    let database_path = database_path_from_env().context("設定を読み込めませんでした")?;
+    let instance_lock = match acquire_beside(&database_path).with_context(|| {
+        format!(
+            "同じデータを使う personacore が動いているかを確かめられませんでした（{}）",
+            database_path.display()
+        )
+    })? {
+        Acquired::Held(lock) => lock,
+        Acquired::Taken(other) => {
+            let wait = guide_second_start(other, &args);
+            return Ok(Finished::AlreadyRunning { wait });
+        }
+    };
 
     // **上流プロファイルの置き場所**（ADR-0042 §決定1）。
     let profiles_path = profiles_path();
@@ -222,7 +266,8 @@ async fn run() -> anyhow::Result<()> {
         Some(selected) => (selected.plan, Some(selected.name)),
         None => (LaunchPlan::none(), None),
     };
-    let mut startup = parts.startup(plan, remember);
+    // **ロックを渡す**（ADR-0057 §決定2）——待ち受けを開いた後に URL を書き、`serve` が返るまで持つ。
+    let mut startup = parts.startup(plan, remember).holding(instance_lock);
     if let Some(name) = selected_name {
         startup = startup.selecting(name);
     }
@@ -231,7 +276,7 @@ async fn run() -> anyhow::Result<()> {
         .map_err(|err| explain_server_failure(err, config.bind().port()))?;
 
     tracing::info!("停止しました");
-    Ok(())
+    Ok(Finished::Stopped)
 }
 
 /// **起動のたびに同じものを渡す部分**（ブラウザ・見本・置き場所）。

@@ -49,6 +49,7 @@ mod error;
 mod extract;
 mod fresh;
 mod host_guard;
+mod instance_lock;
 mod launch;
 mod listening_port;
 mod models;
@@ -85,11 +86,21 @@ pub use config::{
     ENV_DRIFT_DECAY, ENV_DRIFT_FORM, ENV_DRIFT_NOTE, ENV_DRIFT_SLOPE, ENV_DRIFT_STEP_COST,
     ENV_LLM_ENDPOINT, ENV_LLM_IDLE_TIMEOUT, ENV_MAIN_MODEL, ENV_PORT, ENV_STAT_DRIFT,
     ENV_SUB_LLM_ENDPOINT, ENV_SUB_MODEL, ENV_UPSTREAMS, ENV_WEB_DIR, PortSource, SAVED_PORT_MIN,
-    SavedPort, database_path_under, os_data_dir, port_in_use_message, resolve_port,
+    SavedPort, database_path_from, database_path_from_env, database_path_under, os_data_dir,
+    port_in_use_message, resolve_port,
 };
 /// **起動に失敗したとき、ダブルクリックで開いた窓を理由と一緒に消さない**（作業単位 B-76 / `console` モジュール）。
 pub use console::{PRESS_ENTER_TO_CLOSE, wait_before_closing_if_alone};
 pub use error::ApiError;
+/// **同じデータを使う personacore を2つ動かさない**（ADR-0057 §決定2 / 作業単位 F-11a / `instance_lock` モジュール）。
+///
+/// **`main` が起動の最初に [`acquire_beside`] を呼び、取れたら [`Startup::holding`] で渡す。**
+/// **URL を書く口（`InstanceLock::announce`）は公開しない**——書くのは待ち受けを開いた後の
+/// [`App::run_with_upstreams`] だけ。
+pub use instance_lock::{
+    Acquired, InstanceLock, InstanceLockError, LOCK_FILE_NAME, OtherInstance, RUNNING_FILE_NAME,
+    acquire_beside, guide_second_start, lock_dir_of,
+};
 
 /// **失敗の応答の形の一覧**（API の形の指紋のため / 作業単位 O-7 / `error::error_catalog`）。
 #[cfg(any(test, feature = "testing"))]
@@ -781,6 +792,8 @@ pub struct Startup {
     remember: Option<String>,
     /// **この起動が選んだプロファイルの名前**（作業単位 F-10b / [`Self::selecting`]）。
     selected: Option<String>,
+    /// **`main` が起動の最初に取った、データのディレクトリのロック**（ADR-0057 §決定2 / [`Self::holding`]）。
+    instance: Option<instance_lock::InstanceLock>,
 }
 
 impl Startup {
@@ -796,7 +809,19 @@ impl Startup {
             ui: Ui::Serve,
             remember: None,
             selected: None,
+            instance: None,
         }
+    }
+
+    /// **この起動が持っている、データのディレクトリのロック**（ADR-0057 §決定2 / 作業単位 F-11a）。
+    ///
+    /// **待ち受けを開いた後に、実際の URL と画面を配るか（[`Self::ui`]）をロックの隣へ書き、
+    /// [`App::run_with_upstreams`] が返るまで持ち続ける**——同じデータで起こした2つ目は、それを読んで案内する。
+    /// **渡さなければ何も書かない**（テストの入口の既定）。
+    #[must_use]
+    pub fn holding(mut self, lock: instance_lock::InstanceLock) -> Self {
+        self.instance = Some(lock);
+        self
     }
 
     /// **この起動はプロファイル `name` で起きた**（作業単位 F-10b / ADR-0055 §決定3）。
@@ -1024,6 +1049,8 @@ impl App {
         F: Future<Output = ()> + Send + 'static,
     {
         let startup = startup.into();
+        // **ロックは `serve` が返るまで持つ**（下の `drop`）。`bind` が失敗して `?` で抜けても、ここで手放す。
+        let instance = startup.instance;
         let mut app =
             Self::bind_launching(config, startup.plan, startup.timing, startup.ui).await?;
 
@@ -1040,6 +1067,14 @@ impl App {
         app.profiles_file = startup.profiles_file;
         app.selected_profile = startup.selected;
 
+        // **待ち受けを開いた後に、実際の URL と画面を配るかを、ロックの隣へ書く**（ADR-0057 §決定2 / 作業単位 F-11a）。
+        // **`local_addr` から書く**（設定の番号ではない。`PERSONACORE_PORT=0` でも実際の番号を言う）。
+        // **書けなくても止めない**（`announce` は警告だけ）——`bind` と `serve` の間に `?` を置かない約束を破らない。
+        // **下のブラウザの行より前に書く**——`tests/instance_lock_cli.rs` は、その行を「書いた後」の印として待つ。
+        if let Some(lock) = &instance {
+            lock.announce(app.local_addr, startup.ui);
+        }
+
         // **画面を配らないなら、ブラウザの指定を見ない**（作業単位 P-1）——開く頁が無い。
         // **この1行が「画面は配らない」を言う唯一の行**（`Ui` の doc の表）。
         // `ui_source` は待ち受けの行と同じ欄・同じ綴り（集計はこの欄で引く）。
@@ -1050,11 +1085,17 @@ impl App {
                 // 待ち受けの行の `ui_source=none` と綴りが割れて集計で引けない（実測）。
                 tracing::info!(ui_source = %web::UI_SOURCE_NONE, "{NO_UI_LINE}");
             }
-            (Ui::Serve, Browser::Open) => browser::open(&url),
+            (Ui::Serve, Browser::Open) => {
+                // 開けなかったことは `browser::open` が WARN で言う（ここでは止めない）。
+                let _opened = browser::open(&url);
+            }
             (Ui::Serve, Browser::Stay) => tracing::info!(url = %url, "ブラウザは開きません"),
         }
 
-        app.serve(shutdown).await
+        let served = app.serve(shutdown).await;
+        // **`serve` が返る（`Store` を閉じ、起こした子を止めた）まで、ロックを持つ。**
+        drop(instance);
+        served
     }
 
     /// 待ち受けを開始し、**最後に** DB へ接続する（マイグレーション適用込み）。

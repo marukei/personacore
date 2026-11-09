@@ -1016,6 +1016,41 @@ pub fn database_path_under(data_dir: &Path) -> PathBuf {
     data_dir.join(APP_DATA_DIR_NAME).join(DATABASE_FILE_NAME)
 }
 
+/// **DB の置き場所を決める。純粋関数**（ADR-0041 §決定3）。
+///
+/// [`ENV_DATABASE_PATH`] があればそれ（前後の空白を落とす。**空は [`ConfigError::DatabasePath`]**）、
+/// 無ければ `data_dir` の下の既定（[`database_path_under`]）。**どちらも無ければ [`ConfigError::DataDir`]**
+/// ——**カレントディレクトリへは落とさない**（決められなければ止める）。
+///
+/// **[`AppConfig`] の組み立てと、起動の最初にロックを置く場所（ADR-0057 §決定2 / `main`）の両方がここを通る**
+/// ——写しを作らない。**`--upstream` のプロファイルはこの値を変えない**（`overlay_profile` が触るのは
+/// 宛先とモデルの4つだけ）ので、ロックはプロファイルを読む前に取れる。
+pub fn database_path_from<F>(lookup: &F, data_dir: Option<&Path>) -> Result<PathBuf, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match lookup(ENV_DATABASE_PATH) {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(ConfigError::DatabasePath);
+            }
+            Ok(PathBuf::from(trimmed))
+        }
+        None => Ok(database_path_under(data_dir.ok_or(ConfigError::DataDir)?)),
+    }
+}
+
+/// **プロセスの環境から** DB の置き場所を決める（[`database_path_from`] に環境と [`os_data_dir`] を渡すだけ）。
+///
+/// `main` が起動の最初（設定を組む前）に、ロックを置く場所を決めるために呼ぶ（ADR-0057 §決定2）。
+pub fn database_path_from_env() -> Result<PathBuf, ConfigError> {
+    database_path_from(
+        &|key: &str| std::env::var(key).ok(),
+        os_data_dir().as_deref(),
+    )
+}
+
 /// **宛先とモデルだけを差し替えた上流の設定**（走ったままの差し替え / 作業単位 F-4b-2）。
 ///
 /// **検証は起動時と同じ**（[`ModelId::parse`] と `LmStudioConfig::new`）——
@@ -1129,18 +1164,9 @@ impl AppConfig {
         // 数値として読めないので、ここで弾かれる（[`resolve_port`]）。
         let (port, port_source) = resolve_port(lookup(ENV_PORT).as_deref(), saved_port)?;
 
-        // **未設定なら OS の作法の場所**（ADR-0041 §決定3）。
-        // **カレントディレクトリへは落とさない**——決められなければ止める。
-        let database_path = match lookup(ENV_DATABASE_PATH) {
-            Some(raw) => {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    return Err(ConfigError::DatabasePath);
-                }
-                PathBuf::from(trimmed)
-            }
-            None => database_path_under(data_dir.as_deref().ok_or(ConfigError::DataDir)?),
-        };
+        // **DB の置き場所は [`database_path_from`] の1か所で決める**（`main` がロックを置く場所も同じ関数 /
+        // ADR-0057 §決定2）。
+        let database_path = database_path_from(&lookup, data_dir.as_deref())?;
 
         // **UI をディスクから配るか**（ADR-0041 §決定2 / `PERSONACORE_WEB_DIR`）。
         // **未設定は `None`＝埋め込みを配る**（既定のパスへは落とさない）。
