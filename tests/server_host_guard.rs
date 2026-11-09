@@ -32,8 +32,8 @@ use personacore::llm::{
     ChatRequest, ChatStream, Completion, FinishReason, LlmClient, LlmError, LlmFuture,
 };
 use personacore::server::{
-    API_VERSION, App, AppConfig, BindAddr, DEFAULT_PORT, ENV_LLM_ENDPOINT, ENV_WEB_DIR, LaunchPlan,
-    ServerError, Startup,
+    API_VERSION, App, AppConfig, BindAddr, DEFAULT_PORT, ENV_LLM_ENDPOINT, ENV_PORT, ENV_WEB_DIR,
+    LaunchPlan, ServerError, Startup,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -310,12 +310,18 @@ impl Serving {
     async fn start(dir: &Path, profiles: PathBuf) -> Self {
         for _ in 0..MAX_BINDS {
             let port = free_port();
+            // **番号は参照関数の `PERSONACORE_PORT` で明示する**（作業単位 F-11b）——取られていたら待ち受けを
+            // 開けずに返り、起こし直しに入る。明示していない番号（`with_bind`）は次の空きへずれて起きる。
+            let port_text = port.to_string();
             let config = AppConfig::from_lookup_with_data_dir(
-                |key: &str| (key == ENV_LLM_ENDPOINT).then(|| CLOSED_ENDPOINT.to_owned()),
+                move |key: &str| match key {
+                    ENV_LLM_ENDPOINT => Some(CLOSED_ENDPOINT.to_owned()),
+                    ENV_PORT => Some(port_text.clone()),
+                    _ => None,
+                },
                 Some(dir.to_path_buf()),
             )
             .expect("設定を組めること")
-            .with_bind(BindAddr::loopback(port))
             .with_database_path(dir.join("db").join("personacore.sqlite"));
             let plan =
                 Startup::new(LaunchPlan::none()).with_editable_profiles_file(profiles.clone());
