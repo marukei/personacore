@@ -83,6 +83,8 @@ pwsh ./scripts/start.ps1
 
 待ち受けのポートは、**環境変数 `PERSONACORE_PORT` → 画面の「設定」で保存した番号 → 既定**の順で決まる
 （保存した番号は次の起動から効く。`-Port` は `PERSONACORE_PORT` に入る）。
+保存した番号や既定の番号が使われていると、personacore は空いている次の番号（10 個先まで）で起き、
+画面の上の帯と起動ログでそう言う。`PERSONACORE_PORT` で明示した番号はずらさない（使われていれば止まる）。
 
 > **既定のポートは写していない。** 値は `src/server/config.rs` の `DEFAULT_PORT` にある。
 > markdown は Rust のソースを読めないので、**写す代わりに書かない**ことで揃えてある。

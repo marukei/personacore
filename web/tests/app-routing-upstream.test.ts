@@ -170,7 +170,12 @@ it("`#/upstream` は、上流の観測を読んで出す", async () => {
     expect(urls).toContain("/admin/upstream/profiles");
   });
   // **観測と、書いたプロファイルの一覧を1回ずつ**（作業単位 F-4b-3 で後者が増えた）。
-  expect([...urls].sort()).toEqual(["/admin/upstream", "/admin/upstream/profiles"]);
+  // **`/admin/server` は全部の画面の上のずらしの帯が1回読む**（作業単位 F-11c / `PortShiftNotice.svelte`）。
+  expect([...urls].sort()).toEqual([
+    "/admin/server",
+    "/admin/upstream",
+    "/admin/upstream/profiles",
+  ]);
 
   // **中身が、応答のとおりに出ている**（面ごとの列で）。
   // **行は見出しで引く**（作業単位 F-4b-3 で、観測の前に起こした状態の表が並んだ）。

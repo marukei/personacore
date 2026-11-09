@@ -4,6 +4,7 @@
   import CharacterList from "./lib/CharacterList.svelte";
   import ChatView from "./lib/ChatView.svelte";
   import MemoryList from "./lib/MemoryList.svelte";
+  import PortShiftNotice from "./lib/PortShiftNotice.svelte";
   import SettingsPanel from "./lib/SettingsPanel.svelte";
   import StatsPanel from "./lib/StatsPanel.svelte";
   import UpstreamPanel from "./lib/UpstreamPanel.svelte";
@@ -70,6 +71,12 @@
       {/each}
     </nav>
   </div>
+  <!--
+    **待ち受けのポートをずらして起きたら、ナビの下に1行の帯を出す**（作業単位 F-11c / ADR-0057 §決定4）。
+    **`main` の外**——どの画面を開いても見える。ずらしていない・読めないときは何も出さない
+    （`PortShiftNotice.svelte`）。見張り番は `tests/port-shift-notice.test.ts`（この配線も見る）。
+  -->
+  <PortShiftNotice />
 </header>
 
 <!--

@@ -101,7 +101,9 @@ it("`#/settings` は、待ち受けのポートを読んで出す", async () => 
     await vi.waitFor(() => {
       expect(rows().length).toBe(3);
     });
-    expect(urls).toEqual(["/admin/server"]);
+    // **2回**——設定の画面と、全部の画面の上のずらしの帯（作業単位 F-11c / `PortShiftNotice.svelte`）が、
+    // それぞれ開いたときに1回ずつ読む。ほかの口は読まない。
+    expect(urls).toEqual(["/admin/server", "/admin/server"]);
     expect(target.querySelector("main h1")?.textContent?.trim()).toBe(SETTINGS_LABEL);
     expect(rows()[0]).toEqual(["いま待ち受けている番号", "8123（既定の番号）"]);
   } finally {

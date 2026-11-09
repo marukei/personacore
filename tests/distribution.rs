@@ -27,7 +27,7 @@
 //! | **4段だけ** | [`the_distributed_readme_has_exactly_four_steps`] |
 //! | **起こせなかったとき（ログ名が出ない失敗）の文面が、画面に出るとおり** | [`the_distributed_readme_shows_the_spawn_failure_as_the_screen_does`] |
 //! | **README の保存先の名前が、実行ファイルの定数と同じ** | [`the_distributed_readme_names_the_files_the_executable_actually_writes`] |
-//! | **使用中のポートの文とポートの変え方が、実行ファイルの文・定数と同じ** | [`the_distributed_readme_shows_the_port_in_use_message_and_how_to_change_the_port`] |
+//! | **使用中のポートの文とポートの変え方が、実行ファイルの文・定数と同じ。ふだんはずらして帯で知らせ、明示したときだけ止まると書いている**（F-11c） | [`the_distributed_readme_shows_the_port_in_use_message_and_how_to_change_the_port`] |
 //! | **zip を組む途中で失敗したら、`.partial` を残さない** | [`a_failure_while_zipping_leaves_no_partial_file`] |
 //!
 //! `package.ps1` の中の**順番**（zip は複製の後）は `tests/start_script.rs` が見る
@@ -191,8 +191,10 @@ const DEVELOPER_WORDS: [&str; 14] = [
 
 /// **README が名指してよい環境変数**（[`DEVELOPER_WORDS`] の `PERSONACORE_` の例外 / 作業単位 B-76）。
 ///
-/// **ポートの変え方だけは、利用者が要る**——他のプログラムが既定のポートを使っていると、
-/// personacore は起動できない（実行ファイルがこの名前を言って止まる / `server::port_in_use_message`）。
+/// **ポートの変え方だけは、利用者が要る**——この名前で番号を明示した起動は、その番号が使われていると
+/// 止まる（実行ファイルがこの名前を言って止まる / `server::port_in_use_message`）。明示していない起動は
+/// ずらして起きる（ADR-0057 §決定1 / 作業単位 F-11b）が、ずらす範囲を使い切って止まったときも、
+/// 直し方としてこの名前を言う（`server::ports_in_use_message`）。
 ///
 /// **綴りは実行ファイルの定数から引く**——ここに在る名前は、サーバが読む環境変数そのものである
 /// （`tests/readme.rs` の `the_translated_readmes_only_name_environment_variables_the_server_reads` と同じ考え）。
@@ -1132,19 +1134,53 @@ fn the_distributed_readme_shows_the_spawn_failure_as_the_screen_does() {
 }
 
 /// **使用中のポートで止まったときの文と、ポートの変え方を書いていること**（作業単位 B-76 / marukei/personacore#13）。
+/// **ふだんはずらして起きて帯で知らせ、番号を明示したときだけ止まると書いていること**（作業単位 F-11c /
+/// ADR-0057 §決定7）。
 ///
 /// 見るもの:
-/// * README が、既定のポートで実行ファイルが出す文（`server::port_in_use_message`）を**そのまま**書いている。
+/// * **README が、ずらして起きたときの帯の文を、既定のポートで書いている**（`web/src/lib/portShift.ts` の
+///   文の頭の写し。F-11c で足した）。直す場所として「設定」の画面を書いている。
+/// * **止まる文は「番号を明示したとき」の話として書いている**（F-11c で主張を絞った。B-76 の間は、既定の
+///   ポートでも止まったので、その文を無条件に書いていた）。
+/// * README が、明示した番号で実行ファイルが出す文（`server::port_in_use_message`）を**そのまま**書いている。
 /// * README が、PowerShell で [`ENV_PORT`] を立てて起こす1行を書いている。
 /// * README の例の宛先が、personacore の既定のポート（`127.0.0.1:<DEFAULT_PORT>`）を使っていない
-///   ——同じ番号を例に書くと、その例どおりに立てた推論サーバが personacore の起動を止める。
+///   ——同じ番号を例に書くと、その例どおりに立てた推論サーバと personacore がぶつかる（personacore はずれて起きる）。
 #[test]
 fn the_distributed_readme_shows_the_port_in_use_message_and_how_to_change_the_port() {
     let readme = dist_readme();
+    // **帯の文の頭の写し**（`web/src/lib/portShift.ts`。**定数から作らない**）。
+    let band = format!("ポート {DEFAULT_PORT} は他のプログラムが使っていたので、");
+    assert!(
+        readme.contains(&band),
+        "{DIST_README} が、ずらして起きたときの帯の文 `{band}…` を書いていない"
+    );
+    // **写しの元にも同じ綴りが在る**（帯の文を変えたら、README の写しと一緒にここが赤になる）。
+    let band_source = include_str!("../web/src/lib/portShift.ts");
+    assert!(
+        band_source.contains("は${why}、${actual} で起動しました")
+            && band_source.contains("\"他のプログラムが使っていたので\""),
+        "web/src/lib/portShift.ts の帯の文が、README の写しと同じ形でなくなった"
+    );
+    assert!(
+        readme.contains("「設定」の画面"),
+        "{DIST_README} が、番号を変える場所（「設定」の画面）を書いていない"
+    );
+    let explicit_only =
+        format!("`{ENV_PORT}` で番号を指定して起こしたときは、その番号をずらしません");
+    assert!(
+        readme.contains(&explicit_only),
+        "{DIST_README} が、止まるのは番号を明示したときだけだと書いていない（`{explicit_only}`）"
+    );
     let message = port_in_use_message(DEFAULT_PORT);
     assert!(
         readme.contains(&message),
         "{DIST_README} が、使用中のポートで実行ファイルが出す文 `{message}` をそのまま書いていない"
+    );
+    assert!(
+        readme.find(&explicit_only) > readme.find(&message)
+            && readme.find(&band) < readme.find(&message),
+        "{DIST_README} の並びが、帯の項 → 止まる文 → 明示したときだけ、になっていない"
     );
     let command = format!("$env:{ENV_PORT} = '");
     assert!(
