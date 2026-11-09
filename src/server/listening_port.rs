@@ -249,32 +249,49 @@ impl Listening {
         }
     }
 
-    /// **保存した番号を読み直す。** 読めなければ警告を出して `None`（保存が無いのと同じに扱う）。
-    fn saved(&self) -> Option<SavedPort> {
-        let memory = self.memory.as_deref()?;
+    /// **保存した番号を読み直す。** 戻り値は `(番号, 読めないか)`。
+    ///
+    /// | 状態 | 戻り値 |
+    /// |---|---|
+    /// | 保存できない置き場所（`ReadOnly` / 置き場所が無い） | `(None, false)`——**ファイルを読みもしない** |
+    /// | ファイルが無い・空 | `(None, false)` |
+    /// | 読めた | `(Some(番号), false)` |
+    /// | **在るのに読めない**（範囲の外・数でない・2行以上・I/O の失敗） | `(None, true)` |
+    ///
+    /// # 読めないことはログでは言わない（`debug` だけ）
+    ///
+    /// **警告は起動時の1本（`main` の `SAVED_PORT_UNREADABLE`）だけ。** ここは `GET` のたびに通るので、
+    /// `warn` にすると画面が読み直すたびに同じ警告が積もる（レビューの指摘）。**利用者へは応答の
+    /// `saved_port_unreadable` が言う。** 理由（`#[source]`）は `debug` に残す——ログの絞りを上げれば、
+    /// どのファイルがなぜ読めないかを起動し直さずに追える（出さない形はその手掛かりを捨てる）。
+    fn saved(&self) -> (Option<SavedPort>, bool) {
+        let Some(memory) = self.memory.as_deref() else {
+            return (None, false);
+        };
         match read_saved_port(memory) {
-            Ok(saved) => saved,
+            Ok(saved) => (saved, false),
             Err(err) => {
                 // **パスはログにだけ出す**（応答には載らない）。
-                tracing::warn!(
+                tracing::debug!(
                     saved_in = %memory.display(),
                     error = %err,
                     cause = ?std::error::Error::source(&err),
-                    "保存した待ち受けのポートを読めません（次の起動では使われません。ファイルは消していません）"
+                    "保存した待ち受けのポートを読めません（応答の saved_port_unreadable で知らせます）"
                 );
-                None
+                (None, true)
             }
         }
     }
 
     /// **`GET /admin/server` の本文。** 保存のファイルと環境変数を、呼ぶたびに読み直す。
     pub(crate) fn view(&self) -> ServerView {
-        let saved = self.saved();
+        let (saved, saved_port_unreadable) = self.saved();
         let (next_port, next_port_source) = next_start(saved);
         ServerView {
             listening_port: self.port,
             listening_port_source: self.source.label(),
             saved_port: saved.map(SavedPort::get),
+            saved_port_unreadable,
             next_port,
             next_port_source: next_port_source.label(),
             editable: self.memory.is_some(),
@@ -359,6 +376,7 @@ fn port_source_schema() -> Object {
 /// | `listening_port` | **いま実際に待ち受けている番号**（`local_addr`。`PERSONACORE_PORT=0` なら OS が選んだ番号） |
 /// | `listening_port_source` | その番号の出どころ（`environment` / `saved` / `default`） |
 /// | `saved_port` | 保存した番号（無い・読めない・保存できない置き場所なら `null`） |
+/// | `saved_port_unreadable` | **保存のファイルが在るのに読めない**（範囲の外・数でない・2行以上・I/O の失敗）なら `true`。無い・空・保存できない置き場所なら `false`。**画面が「保存なし」と「壊れたファイルが在る」を見分けるため** |
 /// | `next_port` | 次の起動で使う番号（`PERSONACORE_PORT` が読めない綴りなら `null` —— 次の起動は止まる） |
 /// | `next_port_source` | その出どころ |
 /// | `editable` | 保存できるか（既定の置き場所か。`GET /admin/upstream/profiles` の同名の欄と同じ意味） |
@@ -369,6 +387,7 @@ pub(crate) struct ServerView {
     listening_port_source: &'static str,
     #[schema(required = true)]
     saved_port: Option<u16>,
+    saved_port_unreadable: bool,
     #[schema(required = true)]
     next_port: Option<u16>,
     #[schema(schema_with = port_source_schema)]

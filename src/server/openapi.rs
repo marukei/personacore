@@ -2154,6 +2154,13 @@ mod tests {
             !admits_null(&view["properties"]["listening_port"]),
             "{view}"
         );
+        // **`saved_port_unreadable` は常に載る真偽値**（`null` にならない / レビュー後の追加）。
+        assert!(required(view).contains(&"saved_port_unreadable"), "{view}");
+        assert_eq!(
+            view["properties"]["saved_port_unreadable"]["type"],
+            json!("boolean"),
+            "{view}"
+        );
 
         let saved = schema(&document, "SavePortView");
         let carries_in_use = parts(saved).into_iter().any(|part| {

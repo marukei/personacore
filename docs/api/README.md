@@ -712,6 +712,7 @@ the next start.
 | `listening_port` | The port personacore is actually listening on (with `PERSONACORE_PORT=0`, the port the operating system chose) |
 | `listening_port_source` | Where that port came from: `environment` (`PERSONACORE_PORT`), `saved` or `default` |
 | `saved_port` | The saved port, or `null` when none is saved, the file cannot be read, or ports cannot be saved in this run |
+| `saved_port_unreadable` | `true` when the saved port file exists but cannot be read (not a single number from 1024 to 65535, or it cannot be opened); `false` when there is no file, the file is empty, or ports cannot be saved in this run. Use it to tell "nothing saved" from "a broken file is there" |
 | `next_port` | The port the next start will use, worked out now from this process's `PERSONACORE_PORT` and the saved port (`null` if `PERSONACORE_PORT` cannot be read as a port, in which case the next start stops) |
 | `next_port_source` | Where `next_port` comes from (same values as `listening_port_source`) |
 | `editable` | Whether a port can be saved in this run |
@@ -736,8 +737,10 @@ The saved port lives in `listening-port.txt` next to `upstreams.json` (see
 remembered profile name, it is read and written **only when the profiles live in the
 default place**: with `PERSONACORE_UPSTREAMS` set, the file is not read and saving
 answers 409. A file that cannot be read (not a single number from 1024 to 65535) is
-reported once in the startup log and ignored; it is not deleted. When `PERSONACORE_PORT`
-is set, it wins over the saved port, and `next_port_source` says `environment`.
+reported once in the startup log and ignored; it is not deleted. While it stays broken,
+`GET /admin/server` says `saved_port_unreadable: true`; saving a port replaces the file,
+and clearing removes it. When `PERSONACORE_PORT` is set, it wins over the saved port, and
+`next_port_source` says `environment`.
 
 ## Errors
 
@@ -807,9 +810,12 @@ segment (such as `v1`) into the paths under `/admin`.
   this way.
 
 Changes in `1.5` (from `1.4`): the two listening port routes, `GET /admin/server` and
-`PUT /admin/server/port` (see [The listening port](#the-listening-port)), and their new
-failures: 400 `invalid_listening_port`, 409 `listening_port_read_only` and 500
-`listening_port_write_failed`. No existing route changed.
+`PUT /admin/server/port` (see [The listening port](#the-listening-port)), with the fields
+`listening_port`, `listening_port_source`, `saved_port`, `saved_port_unreadable`,
+`next_port`, `next_port_source` and `editable` (the save response adds
+`saved_port_in_use`), and their new failures: 400 `invalid_listening_port`, 409
+`listening_port_read_only` and 500 `listening_port_write_failed`. No existing route
+changed.
 
 Changes in `1.4` (from `1.3`): on the upstream routes (see
 [Upstream inference servers](#upstream-inference-servers)), the new route

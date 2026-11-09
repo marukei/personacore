@@ -369,6 +369,7 @@ fn a_saved_port_is_where_a_bare_start_listens_and_the_api_moves_it() {
                 "listening_port": first_port,
                 "listening_port_source": "saved",
                 "saved_port": first_port,
+                "saved_port_unreadable": false,
                 "next_port": first_port,
                 "next_port_source": "saved",
                 "editable": true,
@@ -388,6 +389,7 @@ fn a_saved_port_is_where_a_bare_start_listens_and_the_api_moves_it() {
                 "listening_port": first_port,
                 "listening_port_source": "saved",
                 "saved_port": second_port,
+                "saved_port_unreadable": false,
                 "next_port": second_port,
                 "next_port_source": "saved",
                 "editable": true,
@@ -537,6 +539,7 @@ fn the_environment_wins_over_the_saved_port() {
             "listening_port": env_port,
             "listening_port_source": "environment",
             "saved_port": saved_port,
+            "saved_port_unreadable": false,
             "next_port": env_port,
             "next_port_source": "environment",
             "editable": true,
@@ -580,7 +583,18 @@ fn an_overridden_profile_file_neither_reads_nor_writes_the_saved_port() {
     assert_settings_line(&started.all_lines(early), 0, "environment");
 
     let report = server_report(port);
+    // **実際に待ち受けた番号を言う**（設定は `0`。設定の番号を言う実装はここで赤 —— 変異 M11）。
+    assert_eq!(
+        report["listening_port"],
+        serde_json::json!(port),
+        "{report}"
+    );
     assert_eq!(report["saved_port"], serde_json::Value::Null, "{report}");
+    assert_eq!(
+        report["saved_port_unreadable"],
+        serde_json::json!(false),
+        "{report}"
+    );
     assert_eq!(report["editable"], serde_json::json!(false), "{report}");
     assert_eq!(report["next_port"], serde_json::json!(0), "{report}");
     assert_eq!(report["next_port_source"], "environment", "{report}");
@@ -612,7 +626,7 @@ fn an_overridden_profile_file_neither_reads_nor_writes_the_saved_port() {
             ("PERSONACORE_UPSTREAMS", overridden.as_os_str()),
         ],
     );
-    let (_, early) = started.listening_port_keeping_lines();
+    let (port, early) = started.listening_port_keeping_lines();
     let lines = started.all_lines(early);
     assert!(
         !lines
@@ -622,6 +636,13 @@ fn an_overridden_profile_file_neither_reads_nor_writes_the_saved_port() {
         lines.join("\n")
     );
     assert_settings_line(&lines, 0, "environment");
+    // **応答も「壊れている」と言わない**（読まないのだから。編集できる置き場所なら `true` になる対照は下のテスト）。
+    let report = server_report(port);
+    assert_eq!(
+        report["saved_port_unreadable"],
+        serde_json::json!(false),
+        "読むだけの起動が、保存のファイルを読んで壊れていると言っている: {report}"
+    );
 }
 
 /// **読めない保存のファイルは、警告を1本出して使わない。ファイルは消さない。止まらない。**
@@ -661,10 +682,39 @@ fn an_unreadable_saved_port_warns_and_the_file_is_kept() {
             "{arm}: 警告の同じ行が置き場所を言っていない: {}",
             warnings[0]
         );
+        // **前提: 警告の行は `WARN` を名乗る**（下の「GET が警告を積まない」の検出が空振りしないこと）。
+        assert!(
+            warnings[0].contains("WARN"),
+            "{arm}: 警告の行に WARN が無い（検出の綴りが合っていない）: {}",
+            warnings[0]
+        );
+        // **応答は「壊れたファイルが在る」と言い、実際に待ち受けた番号を言う**（設定は `0` —— 変異 M11）。
+        let report = server_report(port);
         assert_eq!(
-            server_report(port)["saved_port"],
+            report["listening_port"],
+            serde_json::json!(port),
+            "{arm}: {report}"
+        );
+        assert_eq!(
+            report["saved_port"],
             serde_json::Value::Null,
-            "{arm}"
+            "{arm}: {report}"
+        );
+        assert_eq!(
+            report["saved_port_unreadable"],
+            serde_json::json!(true),
+            "{arm}: {report}"
+        );
+        // **`GET` は警告を積まない**（読めないことは応答の欄が言い、警告は起動時の1本だけ）。
+        // 2回目も読んでから数える。
+        let _ = server_report(port);
+        let after = started.all_lines(Vec::new());
+        assert!(
+            !after
+                .iter()
+                .any(|line| line.contains("WARN") && line.contains("保存した待ち受けのポート")),
+            "{arm}: GET のたびに警告を出している\n{}",
+            after.join("\n")
         );
         assert_eq!(
             std::fs::read_to_string(&file).expect("読めること"),

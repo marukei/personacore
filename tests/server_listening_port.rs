@@ -12,9 +12,9 @@
 //! | 見張り番 | 何が壊れたら赤になるか |
 //! |---|---|
 //! | `the_report_names_the_actual_port_and_where_it_came_from` | 実際の番号でなく設定値を言う／出どころを取り違える |
-//! | `a_saved_port_reads_back_and_null_forgets_it` | 保存が `GET` に出ない・ファイルに書かれない・`null` で消えない・次の起動の番号が変わらない |
+//! | `a_saved_port_reads_back_and_null_forgets_it` | 保存が `GET` に出ない・ファイルに書かれない・`null` で消えない・次の起動の番号が変わらない・在るのに読めないファイルを `saved_port_unreadable` で言わない（空を壊れていると言う） |
 //! | `a_port_outside_1024_to_65535_is_refused_and_nothing_is_written` | 範囲の外を保存する／理由が届かない／`port` を省いた依頼が保存を消す |
-//! | `a_read_only_location_neither_reads_nor_writes_the_saved_port` | 読むだけの置き場所で保存を読む・書く |
+//! | `a_read_only_location_neither_reads_nor_writes_the_saved_port` | 読むだけの置き場所で保存を読む・書く・壊れたファイルを読めないと言う |
 //! | `in_use_is_said_only_for_a_port_another_program_holds` | 自分の番号を「使われている」と言う／他が掴んだ番号を「空いている」と言う／使われていると保存しない |
 //!
 //! # 前提
@@ -254,8 +254,15 @@ fn entries(dir: &Path) -> Vec<String> {
 /// **`listening_port` は実際に待ち受けている番号、`listening_port_source` はその出どころ。**
 ///
 /// **3つの出どころを、同じ形のサーバで1つずつ作る**（取り違える実装は、どれかの腕で赤になる）。
-/// `default` の腕は `with_bind` でエフェメラルポートへ差し替えている——**設定値（8080）を言う実装は、
-/// `listening_port` が実際の番号と食い違って赤になる。**
+///
+/// # ⚠ 「設定の番号を言う実装」は、このテストでは止まらない
+///
+/// **どの腕も、設定の番号（`config.bind()`）と実際に開いた番号が同じ**（`default` の腕も `with_bind` で
+/// 開く番号そのものへ差し替えている）。だから `Listening::new` に設定の番号を渡す実装は、ここでは等価で緑のまま。
+/// **それを止めるのは `tests/listening_port_cli.rs` の `PERSONACORE_PORT=0` の腕**
+/// （`an_overridden_profile_file_neither_reads_nor_writes_the_saved_port` /
+/// `an_unreadable_saved_port_warns_and_the_file_is_kept`）——設定は `0`、実際は OS が選んだ番号なので食い違う。
+/// 実測（変異 M11）は `<measurements>\f12a-saved-port\MUTATIONS.md`。
 #[tokio::test]
 async fn the_report_names_the_actual_port_and_where_it_came_from() {
     assert_no_port_in_this_process();
@@ -282,6 +289,7 @@ async fn the_report_names_the_actual_port_and_where_it_came_from() {
                 "listening_port_source": label,
                 // **保存のファイルは無い**（起動の設定に渡した保存は、ファイルではない）。
                 "saved_port": null,
+                "saved_port_unreadable": false,
                 "next_port": DEFAULT_PORT,
                 "next_port_source": "default",
                 "editable": true,
@@ -305,10 +313,15 @@ async fn a_saved_port_reads_back_and_null_forgets_it() {
     })
     .await;
 
-    // **保存する番号は、いまの待ち受けとも既定とも違う**（取り違えが観測できるように）。
-    let wanted = free_port();
+    // **保存する番号は、いまの待ち受けとも既定とも、後で手で書く番号とも違う**（取り違えが観測できるように）。
+    // **このテストは bind しない**ので空いている番号を取らず、定数にする（`saved_port_in_use` の確かめで
+    // サーバが一瞬 bind を試すが、このテストはその結果を見ない —— 見る腕は `in_use_is_said_only_…`）。
+    let wanted: u16 = 9101;
+    let edited: u16 = 9202;
     assert_ne!(wanted, server.port, "前提");
     assert_ne!(wanted, DEFAULT_PORT, "前提");
+    assert_ne!(edited, wanted, "前提");
+    assert_ne!(edited, server.port, "前提");
 
     let (status, saved) = save(server.port, &json!({ "port": wanted })).await;
     assert_eq!(status, 200, "{saved}");
@@ -319,6 +332,7 @@ async fn a_saved_port_reads_back_and_null_forgets_it() {
     );
     assert_eq!(saved["listening_port_source"], "environment", "{saved}");
     assert_eq!(saved["saved_port"], json!(wanted), "{saved}");
+    assert_eq!(saved["saved_port_unreadable"], json!(false), "{saved}");
     assert_eq!(saved["next_port"], json!(wanted), "{saved}");
     assert_eq!(saved["next_port_source"], "saved", "{saved}");
     assert_eq!(saved["editable"], json!(true), "{saved}");
@@ -339,9 +353,41 @@ async fn a_saved_port_reads_back_and_null_forgets_it() {
     assert_eq!(read["next_port_source"], "saved", "{read}");
 
     // **手で書き換えた中身も、次の `GET` が読み直す**（起動時の写しを持ち続けない）。
-    let edited = free_port();
     std::fs::write(&file, format!("\u{feff}{edited}\r\n")).expect("書けること");
-    assert_eq!(report(server.port).await["saved_port"], json!(edited));
+    let reread = report(server.port).await;
+    assert_eq!(reread["saved_port"], json!(edited), "{reread}");
+    assert_eq!(reread["saved_port_unreadable"], json!(false), "{reread}");
+
+    // **在るのに読めないファイルは `saved_port_unreadable: true`**（「保存なし」と見分ける）。
+    // 理由ごとに1つ（範囲の外・数でない・2行以上・ディレクトリ＝I/O の失敗）。
+    for (arm, text) in [
+        ("範囲の外", Some("1023\n")),
+        ("数でない", Some("eighty-ninety\n")),
+        ("2行", Some("8090\n8091\n")),
+        ("ディレクトリ", None),
+    ] {
+        match text {
+            Some(text) => std::fs::write(&file, text).expect("書けること"),
+            None => {
+                std::fs::remove_file(&file).expect("消せること");
+                std::fs::create_dir(&file).expect("ディレクトリを置けること");
+            }
+        }
+        let broken = report(server.port).await;
+        assert_eq!(
+            broken["saved_port_unreadable"],
+            json!(true),
+            "{arm}: {broken}"
+        );
+        assert_eq!(broken["saved_port"], Value::Null, "{arm}: {broken}");
+        assert_eq!(broken["next_port_source"], "default", "{arm}: {broken}");
+    }
+    std::fs::remove_dir(&file).expect("置いたディレクトリを消せること");
+    // **空のファイルは「保存なし」で、壊れてはいない。**
+    std::fs::write(&file, "").expect("書けること");
+    let empty = report(server.port).await;
+    assert_eq!(empty["saved_port_unreadable"], json!(false), "{empty}");
+    assert_eq!(empty["saved_port"], Value::Null, "{empty}");
 
     let (status, forgot) = save(server.port, &json!({ "port": null })).await;
     assert_eq!(status, 200, "{forgot}");
@@ -351,6 +397,7 @@ async fn a_saved_port_reads_back_and_null_forgets_it() {
             "listening_port": server.port,
             "listening_port_source": "environment",
             "saved_port": null,
+            "saved_port_unreadable": false,
             "next_port": DEFAULT_PORT,
             "next_port_source": "default",
             "editable": true,
@@ -479,6 +526,17 @@ async fn a_read_only_location_neither_reads_nor_writes_the_saved_port() {
     let (status, refused) = save(server.port, &json!({ "port": 80 })).await;
     assert_eq!(status, 400, "{refused}");
     assert_eq!(refused["error"]["code"], "invalid_listening_port");
+
+    // **壊れたファイルを置いても `saved_port_unreadable` は `false`**——読まないのだから、壊れているとも言わない。
+    // （`a_saved_port_reads_back_and_null_forgets_it` の同じ中身が、編集できる置き場所では `true` になる対照。）
+    std::fs::write(&file, "eighty-ninety\n").expect("書けること");
+    let broken = report(server.port).await;
+    assert_eq!(
+        broken["saved_port_unreadable"],
+        json!(false),
+        "読むだけの置き場所で保存を読んでいる: {broken}"
+    );
+    assert_eq!(broken["saved_port"], Value::Null, "{broken}");
 
     server.stop().await;
 }
