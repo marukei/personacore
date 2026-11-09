@@ -722,12 +722,15 @@ A saved port must be from 1024 to 65535; `0` (let the operating system choose) c
 be given through `PERSONACORE_PORT`. The response has the same fields as
 `GET /admin/server`, plus `saved_port_in_use`: whether another program on this machine
 is using the saved port on `127.0.0.1` right now (`false` for the port this personacore
-is listening on, `null` after clearing). A port in use is still saved.
+is listening on, `null` after clearing). It is worked out by trying to open the port, so
+it is also `true` for a port inside a range Windows has excluded (opening it is refused
+with a permission error), since the next start cannot listen there either. A port in use
+is still saved.
 
 | Status | When |
 |---|---|
 | 200 | Saved or cleared |
-| 400 `invalid_body` | The body cannot be read, `port` is missing, or `port` is not an integer |
+| 400 `invalid_body` | The body cannot be read, `port` is missing, or `port` is not an integer (including an integer too large for a signed 64-bit integer) |
 | 400 `invalid_listening_port` | `port` is outside 1024 to 65535 |
 | 409 `listening_port_read_only` | Ports cannot be saved in this run (`editable` is `false`) |
 | 500 `listening_port_write_failed` | The file could not be written or removed; what was saved before is kept |

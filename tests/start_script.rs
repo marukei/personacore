@@ -731,8 +731,25 @@ const EXPLICIT_PORT_BRANCH_HEAD: &str = "if ($null -ne $explicitPort)";
 const PORT_PARAMETER_BRANCH_HEAD: &str = "if ($PSBoundParameters.ContainsKey('Port'))";
 
 /// **引き継いだ `PERSONACORE_PORT` の分岐の頭**（明示の入口2）。
-const PORT_ENVIRONMENT_BRANCH_HEAD: &str =
-    "elseif (-not [string]::IsNullOrWhiteSpace($env:PERSONACORE_PORT))";
+///
+/// **在るだけで明示とみなす**（実行ファイルと同じ受理集合 / 作業単位 F-12b のレビュー）。実行ファイルの
+/// `config::resolve_port` は、在る値を `trim` して番号に読み、読めなければ止まる —— **空白だけの値も
+/// 「明示したが読めない」。** スクリプトが空白だけを「明示していない」と読むと、事前に見ずに渡し、
+/// 実行ファイルの側で止まる（止まる場所と文が食い違う）。
+const PORT_ENVIRONMENT_BRANCH_HEAD: &str = "elseif ($null -ne $env:PERSONACORE_PORT)";
+
+/// **空白だけを「明示していない」と読む、着手前の判定**（スクリプトに残っていてはいけない）。
+const PORT_ENVIRONMENT_BLANK_AS_ABSENT: &str = "IsNullOrWhiteSpace($env:PERSONACORE_PORT)";
+
+/// **明示していない腕の、案内を選ぶ分岐の頭**（作業単位 F-12b のレビュー）。
+///
+/// **`-Upstream` だけでなく、引き継いだ `PERSONACORE_UPSTREAMS` でも「保存した番号を読まない」側を選ぶ。**
+/// 実行ファイルは `PERSONACORE_UPSTREAMS` が空白だけでなければ置き場所を変えた起動として扱い、保存した番号を
+/// 読まない（`main.rs` の `profiles_path`）—— 同じ受理集合（`IsNullOrWhiteSpace`）で見る。
+const UPSTREAMS_HINT_HEAD: &str = "$screenHint = if ($PSBoundParameters.ContainsKey('Upstream') -or -not [string]::IsNullOrWhiteSpace($env:PERSONACORE_UPSTREAMS))";
+
+/// **画面の案内を書き出す行**（どちらの腕で決めた案内も、ここで出る）。
+const SCREEN_HINT_OUTPUT: &str = "Write-Host \"[画面] $screenHint\"";
 
 /// 明示した番号の控え。**この3つの代入だけ**（初めは `$null`、入口ごとに1つ）。
 const EXPLICIT_FROM_NOTHING: &str = "$explicitPort = $null";
@@ -763,6 +780,9 @@ const LOG_URL_FIELD: &str = "url=";
 /// | 明示の入口 | `-Port` と、引き継いだ `PERSONACORE_PORT` の**両方**が控えに入る（片方が落ちると、その入口は事前検査を受けない） |
 /// | 明示した | 事前検査と URL の組み立てが、分岐の**中に1つずつ**（外にもう1つ在れば、明示していない起動も既定を叩く） |
 /// | 明示していない | `else` の中に**事前検査も URL も無く**、実行ファイルのログの `url=` を案内する |
+/// | 案内の選び方 | `-Upstream` か、引き継いだ `PERSONACORE_UPSTREAMS` なら「保存した番号を読まない」側の案内 |
+/// | 腕の外 | **既定の番号を事前検査に渡す行が無い**（`Test-TcpReachable` は明示した番号か上流の宛先だけ）。`$defaultPort` をコードで使うのは読む行だけ |
+/// | 書き出し | 決めた案内を、分岐の後で `[画面]` の行として書き出す |
 ///
 /// # ⚠ 守っていないもの
 ///
@@ -779,6 +799,11 @@ fn the_start_script_checks_the_port_only_when_it_was_named() {
         "`{EXPLICIT_ASSIGNMENT}` の代入が3つでない（初め・-Port・PERSONACORE_PORT の3つだけのはず）"
     );
     assert_eq!(occurrences(&masked, EXPLICIT_FROM_NOTHING), 1);
+    assert!(
+        !script.contains(PORT_ENVIRONMENT_BLANK_AS_ABSENT),
+        "空白だけの PERSONACORE_PORT を「明示していない」と読んでいる\
+         （実行ファイルは在る値を明示として読み、読めなければ止まる）"
+    );
     for (head, wiring) in [
         (PORT_PARAMETER_BRANCH_HEAD, EXPLICIT_FROM_PARAMETER),
         (PORT_ENVIRONMENT_BRANCH_HEAD, EXPLICIT_FROM_ENVIRONMENT),
@@ -865,6 +890,70 @@ fn the_start_script_checks_the_port_only_when_it_was_named() {
             "明示していない腕の案内が、読んだ既定の番号を使っていない: {message}"
         );
     }
+
+    // **案内の選び方: `-Upstream` か、引き継いだ `PERSONACORE_UPSTREAMS` なら「保存した番号を読まない」側。**
+    assert_eq!(
+        occurrences(otherwise, UPSTREAMS_HINT_HEAD),
+        1,
+        "明示していない腕が、`{UPSTREAMS_HINT_HEAD}` で案内を選んでいない\
+         （引き継いだ PERSONACORE_UPSTREAMS の起動で、読まない保存の番号を案内する）"
+    );
+    assert_eq!(messages.len(), 2, "明示していない腕の案内が2つでない");
+    assert!(
+        messages[0].contains("保存した番号を読まない"),
+        "置き場所を変えた起動の案内（1つめ）が、保存した番号を読まないと言っていない: {}",
+        messages[0]
+    );
+    assert!(
+        messages[1].contains("「設定」で保存した番号"),
+        "既定の置き場所の案内（2つめ）が、保存した番号を言っていない: {}",
+        messages[1]
+    );
+
+    // **腕の外: 既定の番号を事前検査に渡す行が無い**（作業単位 F-12b のレビュー / 変異 M1 で実測 ——
+    // 分岐の後に `Test-TcpReachable … -TargetPort $defaultPort` を足しても、上の検査は全部緑だった）。
+    // **上流の疎通確認も `Test-TcpReachable` を使う**ので、呼び出しごとに「明示した番号か、上流の宛先か」を見る。
+    let calls: Vec<&str> = masked
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("Test-TcpReachable") && !line.starts_with("function "))
+        .collect();
+    assert_eq!(
+        calls.len(),
+        2,
+        "Test-TcpReachable の呼び出しが2つでない（明示した番号の事前検査と、上流の疎通確認だけのはず）: {calls:?}"
+    );
+    for call in &calls {
+        assert!(
+            call.contains("-TargetPort $explicitPort") || call.contains("$upstreamUri"),
+            "明示した番号でも上流の宛先でもない到達性の検査がある（明示していない起動が、既定の番号を叩いて止まる）: {call}"
+        );
+    }
+    // **`$defaultPort` をコードで使うのは読む行だけ**（案内の文の中は潰れているので数えない）。
+    assert_eq!(
+        occurrences(&masked, "$defaultPort"),
+        1,
+        "既定の番号を、読む行の外のコードで使っている（事前検査か URL に流れている疑い）"
+    );
+
+    // **書き出し: 決めた案内を、分岐の後で `[画面]` の行として出す**（変異 M2 —— この行を消しても緑だった）。
+    let outputs: Vec<usize> = script
+        .match_indices(SCREEN_HINT_OUTPUT)
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(
+        outputs.len(),
+        1,
+        "`{SCREEN_HINT_OUTPUT}` が1回きりでない（決めた案内が画面の行として出ない）"
+    );
+    assert!(
+        outputs[0] > else_end,
+        "`{SCREEN_HINT_OUTPUT}` が分岐の中にある（片方の腕でしか出ない）"
+    );
+    assert!(
+        masked[outputs[0]..].starts_with("Write-Host"),
+        "`{SCREEN_HINT_OUTPUT}` がコメントの中にある（実行されない）"
+    );
 }
 
 /// **二重引用符で始まる行**（案内の文）だけを、前後の空白を落として返す。コメントの行は入らない。

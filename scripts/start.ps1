@@ -39,7 +39,7 @@
       ADR-0057 §決定5）。このスクリプトは事前に見ず、URL も組み立てない ——
       **personacore のログの url= を見ること。**
     ⚠ -Upstream を付けると $env:PERSONACORE_UPSTREAMS が変わるので、personacore は保存した番号を読まない
-      （明示していなければ既定の番号で待ち受ける）。
+      （明示していなければ既定の番号で待ち受ける）。引き継いだ $env:PERSONACORE_UPSTREAMS があるときも同じ。
 
 .PARAMETER DbPath
     SQLite のファイル。省略時は $env:PERSONACORE_DB_PATH、それも無ければ
@@ -305,13 +305,18 @@ if (-not $PSBoundParameters.ContainsKey('Upstream')) {
 #    **このスクリプトはその番号を知らない**（保存のファイルを読まない —— 読む実装を2つ持たない）。
 #    既定の番号で事前検査して URL を組み立てると、保存した番号で起きる起動を誤って止め、開かない URL を案内する。
 #    見張り番は tests/start_script.rs の the_start_script_checks_the_port_only_when_it_was_named。
+#
+# ⚠ **引き継いだ PERSONACORE_PORT は、在るだけで明示とみなす**（空白だけの値も。personacore と同じ受理集合）。
+#    personacore は在る値を前後の空白を落として番号に読み、読めなければ止まる。ここで空白だけを
+#    「明示していない」と読むと、事前に見ずに渡して personacore の側で止まり、止まる場所と文が食い違う。
+#    （PowerShell からは空の値を立てにくいが、親のプロセスから引き継ぐことはある。）
 # ----------------------------------------------------------------------
 $explicitPort = $null
 if ($PSBoundParameters.ContainsKey('Port')) {
     $explicitPort = $Port
     $env:PERSONACORE_PORT = "$Port"
 }
-elseif (-not [string]::IsNullOrWhiteSpace($env:PERSONACORE_PORT)) {
+elseif ($null -ne $env:PERSONACORE_PORT) {
     $raw = $env:PERSONACORE_PORT.Trim()
     $parsed = 0
     if (-not [int]::TryParse($raw, [ref]$parsed) -or $parsed -lt 1 -or $parsed -gt 65535) {
@@ -333,9 +338,11 @@ if ($null -ne $explicitPort) {
 else {
     # ⚠ **事前に見ない。URL も組み立てない**（番号は personacore が決める）。
     #    その番号が使われていれば、personacore が自分でそう言う。画面の URL は、そのログの url= の欄。
-    # ⚠ -Upstream を付けた起動は PERSONACORE_UPSTREAMS が変わるので、personacore は保存した番号を読まない。
-    $screenHint = if ($PSBoundParameters.ContainsKey('Upstream')) {
-        "personacore のログの url= を見てください（-Upstream を付けた起動は保存した番号を読まないので、既定の $defaultPort で待ち受けます）"
+    # ⚠ PERSONACORE_UPSTREAMS で設定の置き場所を変えた起動では、personacore は保存した番号を読まない。
+    #    -Upstream はこのスクリプトがそれを立てる。**引き継いだ PERSONACORE_UPSTREAMS でも同じ**なので両方を見る
+    #    （空白だけの値は personacore が「立っていない」と読むので、同じ IsNullOrWhiteSpace で見る）。
+    $screenHint = if ($PSBoundParameters.ContainsKey('Upstream') -or -not [string]::IsNullOrWhiteSpace($env:PERSONACORE_UPSTREAMS)) {
+        "personacore のログの url= を見てください（PERSONACORE_UPSTREAMS で設定の置き場所を変えた起動（-Upstream を含む）は保存した番号を読まないので、既定の $defaultPort で待ち受けます）"
     }
     else {
         "personacore のログの url= を見てください（画面の「設定」で保存した番号、無ければ既定の $defaultPort で待ち受けます）"
