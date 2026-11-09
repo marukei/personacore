@@ -42,10 +42,10 @@ pnpm install
 
 ```bash
 # 1つめ: API（リポジトリのルートで）
-cargo run
+PERSONACORE_PORT=9000 cargo run
 
-# 2つめ: 画面（web/ で）
-pnpm dev
+# 2つめ: 画面（web/ で）。番号は1つめと同じ値（理由は下の ⚠）
+PERSONACORE_PORT=9000 pnpm dev
 ```
 
 **開くのは Vite の dev server の方**（既定 `http://127.0.0.1:5173`。
@@ -62,14 +62,15 @@ pnpm dev
 `/v1` と `/admin` は **Vite が axum へ proxy する**ので、
 本番と同じ「同一オリジン」の形のまま書ける（ADR-0031 §3）。
 
-**proxy 先のポートは `src/server/config.rs` の `DEFAULT_PORT` を読んで決めている**
+**proxy 先のポートは `PERSONACORE_PORT`、無ければ `src/server/config.rs` の `DEFAULT_PORT` を読んで決めている**
 （`vite.config.ts`。**写していない**）。
-`PERSONACORE_PORT` を立てて `cargo run` しているなら、
-`pnpm dev` にも同じ値を渡せば合う:
 
-```bash
-PERSONACORE_PORT=9000 pnpm dev
-```
+**⚠ 開発中は `PERSONACORE_PORT` を明示して、`cargo run` と `pnpm dev` の両方に同じ値を渡すこと**
+（作業単位 F-12b / [ADR-0057](../docs/adr/0057-the-listening-port-shifts-when-taken-and-is-set-from-the-screen.md) §決定7）。
+`cargo run` は、明示しなければ画面の「設定」で保存した番号を読む（既定の置き場所の `listening-port.txt`。
+配布版の exe で保存した番号も同じファイルにある）。**proxy は保存のファイルを読まない** ——読ませない
+（保存のファイルを読む実装を2つ持たない）。明示しないと、保存した番号で起きた API と、既定を向いた proxy がずれる
+（上の2行が両方に同じ値を渡しているのは、そのため）。
 
 **proxy は `Host` と `Origin` を書き換える**（作業単位 B-58）。personacore は `Host` / `Origin` が
 自分のもの（`127.0.0.1:<port>` / `localhost:<port>`）でない要求を 403 で断るので、
@@ -419,6 +420,8 @@ pnpm test
 | `src/lib/attributesEdit.ts` | **置き換えの組み立て・要約の数・拒否の読み分け**。I/O を持たない（上限と `code` は写し。上記） |
 | `src/lib/UpstreamPanel.svelte` | **上流について観測できたこと**（`GET /admin/upstream`。**読むだけ**。下記） |
 | `src/lib/upstream.ts` | **観測を表の行に組む**（帰属を1箇所で決める）。I/O を持たない |
+| `src/lib/SettingsPanel.svelte` | **「設定」の画面**（待ち受けのポートの、いま・保存・次の起動。`GET /admin/server` ＋ `PUT /admin/server/port` / 作業単位 F-12b） |
+| `src/lib/serverSettings.ts` | **「設定」の画面の行・断り書き・保存の後の文・失敗の読み分け**。I/O を持たない（`code` は写し。範囲の判定はサーバ） |
 | `src/App.svelte` | ナビゲーションと、いまの画面の切り替え |
 | `src/app.css` | **色・字・共通の部品**（作業単位 D-10。**この家で唯一の CSS ファイル**。下記）＋ **Tailwind の取り込みと `@theme`**（作業単位 D-11a。下記） |
 | `vite.config.ts` | proxy と `outDir`。ポートは `config.rs` から読む |
@@ -590,7 +593,7 @@ pnpm test
 
 ## ルータは**ハッシュ**。依存は足していない
 
-`#/chat` / `#/characters` / `#/upstream` / `#/memories/{識別子}` /
+`#/chat` / `#/characters` / `#/upstream` / `#/settings` / `#/memories/{識別子}` /
 `#/stats/{識別子}` / `#/attributes/{識別子}`。
 **`hashchange` を聞くだけ**なので、ルータのライブラリを入れていない（`src/lib/router.ts`）。
 

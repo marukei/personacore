@@ -79,7 +79,9 @@ SQLite database, the upstream profiles (`upstreams.json`) and the logs of the ll
 processes personacore started. (`scripts/start.ps1`, below, keeps the database and the
 logs under `data/` in the repository by default instead; see
 [scripts/README-start.md](scripts/README-start.md).) `PERSONACORE_DB_PATH` moves the
-database, and `PERSONACORE_PORT` changes the port.
+database. The port is chosen at start, in this order: `PERSONACORE_PORT`, then the port
+saved on the settings screen (設定) in the web UI, then the default. A saved port takes
+effect from the next start.
 The default port is set in `src/server/config.rs` as `DEFAULT_PORT`, and the startup
 log prints the address.
 

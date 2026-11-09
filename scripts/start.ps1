@@ -11,7 +11,8 @@
     やること:
 
       1. Rust 側から既定のポートと既定の上流エンドポイントを読む
-      2. ポートが空いているか見る（前回の personacore が残っていたら、そう言って止まる）
+      2. **番号を明示したときだけ**（-Port か、引き継いだ PERSONACORE_PORT）、ポートが空いているか見る
+         （前回の personacore が残っていたら、そう言って止まる）。明示していなければ見ない（ADR-0057 §決定7）
       3. FE をビルドする（web/node_modules が無ければ pnpm install から）
       4. 上流に繋がるか見る。**繋がらなくても止めない**（下記）
       5. DB の置き場所を決めて（$env:PERSONACORE_DB_PATH）、cargo run で起動する
@@ -30,8 +31,15 @@
     旗を渡さない起動は、いままでと1バイトも変わらない。
 
 .PARAMETER Port
-    待ち受けポート。省略時は $env:PERSONACORE_PORT、それも無ければ Rust 側の既定。
-    指定すると $env:PERSONACORE_PORT に入れて渡す。
+    待ち受けポート。指定すると $env:PERSONACORE_PORT に入れて渡す（画面で保存した番号より優先される）。
+
+    ⚠ **番号を明示したとき（-Port か、引き継いだ $env:PERSONACORE_PORT）だけ**、起動の前にその番号が
+      空いているかを見て、使われていれば止まる。画面の URL もその番号で表示する。
+    ⚠ **明示していなければ、番号を決めるのは personacore**（画面の「設定」で保存した番号、無ければ Rust 側の既定 /
+      ADR-0057 §決定5）。このスクリプトは事前に見ず、URL も組み立てない ——
+      **personacore のログの url= を見ること。**
+    ⚠ -Upstream を付けると $env:PERSONACORE_UPSTREAMS が変わるので、personacore は保存した番号を読まない
+      （明示していなければ既定の番号で待ち受ける）。
 
 .PARAMETER DbPath
     SQLite のファイル。省略時は $env:PERSONACORE_DB_PATH、それも無ければ
@@ -289,8 +297,18 @@ if (-not $PSBoundParameters.ContainsKey('Upstream')) {
     }
 }
 
+# ----------------------------------------------------------------------
+# 番号を明示したか（作業単位 F-12b / ADR-0057 §決定7）
+#
+# ⚠ **明示したのは -Port か、引き継いだ PERSONACORE_PORT のときだけ。**
+#    明示していなければ、番号を決めるのは personacore（画面の「設定」で保存した番号、無ければ既定）で、
+#    **このスクリプトはその番号を知らない**（保存のファイルを読まない —— 読む実装を2つ持たない）。
+#    既定の番号で事前検査して URL を組み立てると、保存した番号で起きる起動を誤って止め、開かない URL を案内する。
+#    見張り番は tests/start_script.rs の the_start_script_checks_the_port_only_when_it_was_named。
+# ----------------------------------------------------------------------
+$explicitPort = $null
 if ($PSBoundParameters.ContainsKey('Port')) {
-    $resolvedPort = $Port
+    $explicitPort = $Port
     $env:PERSONACORE_PORT = "$Port"
 }
 elseif (-not [string]::IsNullOrWhiteSpace($env:PERSONACORE_PORT)) {
@@ -299,20 +317,29 @@ elseif (-not [string]::IsNullOrWhiteSpace($env:PERSONACORE_PORT)) {
     if (-not [int]::TryParse($raw, [ref]$parsed) -or $parsed -lt 1 -or $parsed -gt 65535) {
         throw "PERSONACORE_PORT がポート番号として読めません: $raw"
     }
-    $resolvedPort = $parsed
+    $explicitPort = $parsed
+}
+
+# ----------------------------------------------------------------------
+# 2. ポートが空いているか（**番号を明示したときだけ**）
+# ----------------------------------------------------------------------
+if ($null -ne $explicitPort) {
+    if (Test-TcpReachable -TargetHost '127.0.0.1' -TargetPort $explicitPort -TimeoutMs 500) {
+        throw "ポート $explicitPort は既に使われています（前回の personacore が残っていませんか）。" +
+        " 別のポートで立てるなら -Port を指定してください。"
+    }
+    $screenHint = "http://127.0.0.1:$explicitPort/"
 }
 else {
-    $resolvedPort = $defaultPort
-}
-
-$url = "http://127.0.0.1:$resolvedPort/"
-
-# ----------------------------------------------------------------------
-# 2. ポートが空いているか
-# ----------------------------------------------------------------------
-if (Test-TcpReachable -TargetHost '127.0.0.1' -TargetPort $resolvedPort -TimeoutMs 500) {
-    throw "ポート $resolvedPort は既に使われています（前回の personacore が残っていませんか）。" +
-    " 別のポートで立てるなら -Port を指定してください。"
+    # ⚠ **事前に見ない。URL も組み立てない**（番号は personacore が決める）。
+    #    その番号が使われていれば、personacore が自分でそう言う。画面の URL は、そのログの url= の欄。
+    # ⚠ -Upstream を付けた起動は PERSONACORE_UPSTREAMS が変わるので、personacore は保存した番号を読まない。
+    $screenHint = if ($PSBoundParameters.ContainsKey('Upstream')) {
+        "personacore のログの url= を見てください（-Upstream を付けた起動は保存した番号を読まないので、既定の $defaultPort で待ち受けます）"
+    }
+    else {
+        "personacore のログの url= を見てください（画面の「設定」で保存した番号、無ければ既定の $defaultPort で待ち受けます）"
+    }
 }
 
 # ----------------------------------------------------------------------
@@ -403,7 +430,7 @@ if ($dbDir) {
 $env:PERSONACORE_DB_PATH = $resolvedDb
 
 Write-Host "[DB  ] $resolvedDb"
-Write-Host "[画面] $url"
+Write-Host "[画面] $screenHint"
 
 # ⚠ カレントディレクトリはリポジトリのルートにする。
 # PERSONACORE_WEB_DIR を渡していないので、既定の相対パスがここから解決される。

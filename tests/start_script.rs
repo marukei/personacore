@@ -654,9 +654,11 @@ fn the_start_script_names_a_database_of_its_own() {
 
 /// **既定のポートは写さずに読むこと**（`web/vite.config.ts` と同じ作法）。
 ///
-/// スクリプトはブラウザに見せる URL を組み立てるためにポートを知る必要がある。
-/// **写すと、Rust 側で既定を変えたときにスクリプトだけが黙って古びる**
-/// ——現れ方は「起動はしたのに、開いた画面が繋がらない」。
+/// ~~スクリプトはブラウザに見せる URL を組み立てるためにポートを知る必要がある。~~
+/// **作業単位 F-12b で、URL を組み立てるのは番号を明示したときだけになった**（ADR-0057 §決定7 /
+/// [`the_start_script_checks_the_port_only_when_it_was_named`]）。既定の番号は、明示していないときの
+/// 案内（「保存した番号、無ければ既定の …」）で言うためにだけ読む。
+/// **写すと、Rust 側で既定を変えたときにスクリプトの案内だけが黙って古びる。**
 #[test]
 fn the_start_script_reads_the_default_port_from_the_rust_source() {
     let script = start_script();
@@ -715,6 +717,144 @@ fn the_start_script_passes_the_chosen_port_to_the_server() {
         script.contains(&wiring),
         "起動スクリプトが `{wiring}` を書いていない\
          （-Port が画面の案内にだけ効いて、サーバへ届かない）"
+    );
+}
+
+// ----------------------------------------------------------------------
+// 番号を明示したときだけ、事前に見る（作業単位 F-12b / ADR-0057 §決定7）
+// ----------------------------------------------------------------------
+
+/// **番号を明示したかの分岐の頭。** 中で事前検査をし、URL を組み立てる。
+const EXPLICIT_PORT_BRANCH_HEAD: &str = "if ($null -ne $explicitPort)";
+
+/// **`-Port` の分岐の頭**（明示の入口1）。
+const PORT_PARAMETER_BRANCH_HEAD: &str = "if ($PSBoundParameters.ContainsKey('Port'))";
+
+/// **引き継いだ `PERSONACORE_PORT` の分岐の頭**（明示の入口2）。
+const PORT_ENVIRONMENT_BRANCH_HEAD: &str =
+    "elseif (-not [string]::IsNullOrWhiteSpace($env:PERSONACORE_PORT))";
+
+/// 明示した番号の控え。**この3つの代入だけ**（初めは `$null`、入口ごとに1つ）。
+const EXPLICIT_FROM_NOTHING: &str = "$explicitPort = $null";
+const EXPLICIT_FROM_PARAMETER: &str = "$explicitPort = $Port";
+const EXPLICIT_FROM_ENVIRONMENT: &str = "$explicitPort = $parsed";
+const EXPLICIT_ASSIGNMENT: &str = "$explicitPort = ";
+
+/// **待ち受けの番号に事前に繋いでみる行**（宛先はループバック）。
+const PORT_PRECHECK: &str = "Test-TcpReachable -TargetHost '127.0.0.1' -TargetPort $explicitPort";
+
+/// **画面の URL を組み立てる綴り**（スクリプト全体で、明示した番号で組む1つだけ）。
+const URL_PREFIX: &str = "\"http://127.0.0.1:";
+const URL_FROM_EXPLICIT: &str = "\"http://127.0.0.1:$explicitPort/\"";
+
+/// **明示していないときに読ませる、実行ファイルのログの欄**（`main.rs` が出す `url=`）。
+const LOG_URL_FIELD: &str = "url=";
+
+/// **番号を明示したときだけ、事前に空きを見て URL を組み立てること。明示していなければ、どちらもしない。**
+///
+/// # なぜ（ADR-0057 §決定7）
+///
+/// **保存した番号が効き始めたので、番号を決めるのはもう実行ファイルである**（`PERSONACORE_PORT` →
+/// 保存した番号 → 既定）。明示していない起動でスクリプトが既定の番号を叩くと、
+/// **保存した番号で起きる起動を「既定の番号が使われている」と言って止め、開かない URL を案内する。**
+///
+/// | 腕 | 見るもの |
+/// |---|---|
+/// | 明示の入口 | `-Port` と、引き継いだ `PERSONACORE_PORT` の**両方**が控えに入る（片方が落ちると、その入口は事前検査を受けない） |
+/// | 明示した | 事前検査と URL の組み立てが、分岐の**中に1つずつ**（外にもう1つ在れば、明示していない起動も既定を叩く） |
+/// | 明示していない | `else` の中に**事前検査も URL も無く**、実行ファイルのログの `url=` を案内する |
+///
+/// # ⚠ 守っていないもの
+///
+/// **綴りと位置しか見ていない。** 走らせて確かめてはいない（このファイルは `pwsh` を起動しない / F-1 の判断）。
+#[test]
+fn the_start_script_checks_the_port_only_when_it_was_named() {
+    let script = start_script();
+    let masked = masked_powershell(&script);
+
+    // **明示の入口: 控えへの代入は3つだけで、2つの入口の中に1つずつ。**
+    assert_eq!(
+        occurrences(&masked, EXPLICIT_ASSIGNMENT),
+        3,
+        "`{EXPLICIT_ASSIGNMENT}` の代入が3つでない（初め・-Port・PERSONACORE_PORT の3つだけのはず）"
+    );
+    assert_eq!(occurrences(&masked, EXPLICIT_FROM_NOTHING), 1);
+    for (head, wiring) in [
+        (PORT_PARAMETER_BRANCH_HEAD, EXPLICIT_FROM_PARAMETER),
+        (PORT_ENVIRONMENT_BRANCH_HEAD, EXPLICIT_FROM_ENVIRONMENT),
+    ] {
+        assert_eq!(occurrences(&script, head), 1, "`{head}` が1回きりでない");
+        let (start, end) =
+            block_span_for(&script, &masked, head).expect("明示の入口の分岐を切り出せること");
+        let hits: Vec<usize> = masked.match_indices(wiring).map(|(at, _)| at).collect();
+        assert_eq!(hits.len(), 1, "`{wiring}` が1回きりでない");
+        assert!(
+            hits[0] >= start && hits[0] < end,
+            "`{wiring}` が `{head}` の分岐の外にある（その入口で明示しても、事前検査を受けない）"
+        );
+    }
+
+    // **明示した腕: 事前検査と URL は、この分岐の中に1つずつ。**
+    assert_eq!(
+        occurrences(&script, EXPLICIT_PORT_BRANCH_HEAD),
+        1,
+        "`{EXPLICIT_PORT_BRANCH_HEAD}` が1回きりでない"
+    );
+    let (start, end) = block_span_for(&script, &masked, EXPLICIT_PORT_BRANCH_HEAD)
+        .expect("明示した腕を切り出せること");
+    for (needle, why) in [
+        (
+            PORT_PRECHECK,
+            "明示していない起動も、既定の番号を叩いて止まる",
+        ),
+        (
+            URL_PREFIX,
+            "明示していない起動も、スクリプトが組んだ URL を案内する",
+        ),
+    ] {
+        let hits: Vec<usize> = script.match_indices(needle).map(|(at, _)| at).collect();
+        assert_eq!(hits.len(), 1, "`{needle}` が1回きりでない（{why}）");
+        assert!(
+            hits[0] >= start && hits[0] < end,
+            "`{needle}` が明示した腕の外にある（{why}）"
+        );
+    }
+    assert!(
+        script.contains(URL_FROM_EXPLICIT),
+        "URL を明示した番号で組んでいない（`{URL_FROM_EXPLICIT}` が無い）"
+    );
+    // **素のソースで見る**（二重引用符の中の `$defaultPort` も、使っていることに数える）。
+    assert!(
+        !script[start..end].contains("$defaultPort"),
+        "明示した腕が既定の番号を使っている"
+    );
+
+    // **明示していない腕: `else` の中に事前検査も URL も無く、ログの `url=` を案内する。**
+    let after = &masked[end + 1..];
+    let gap = after.len() - after.trim_start().len();
+    assert!(
+        after.trim_start().starts_with("else"),
+        "明示した腕の直後が `else` でない（明示していない腕を切り出せない）"
+    );
+    let (else_start, else_end) =
+        brace_span_after(&masked, end + 1 + gap).expect("明示していない腕を切り出せること");
+    let otherwise = &script[else_start..else_end];
+    assert!(
+        !otherwise.contains("Test-TcpReachable"),
+        "明示していない腕が事前検査をしている（保存した番号で起きる起動を、既定の番号で止める）"
+    );
+    assert!(
+        !otherwise.contains("http://"),
+        "明示していない腕が URL を組み立てている（実行ファイルが選んだ番号と食い違いうる）"
+    );
+    assert!(
+        otherwise.contains(LOG_URL_FIELD),
+        "明示していない腕が、実行ファイルのログの `{LOG_URL_FIELD}` を案内していない"
+    );
+    // **既定の番号を読むのは、この腕の案内のため**（読んだ値が死んだ変数にならないこと）。
+    assert!(
+        otherwise.contains("$defaultPort"),
+        "明示していない腕の案内が、読んだ既定の番号を使っていない"
     );
 }
 
