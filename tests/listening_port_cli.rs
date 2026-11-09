@@ -1032,7 +1032,7 @@ fn a_taken_saved_port_shifts_past_a_face_port_and_the_log_and_the_api_say_so() {
         "警告の同じ行が飛ばした番号を言っていない\n{}",
         lines.join("\n")
     );
-    // **`bind=` は試し始めた番号のまま**（ADR-0057 §決定4）。**実際の番号は待ち受けの行の `addr=`**
+    // **`bind=` は元の番号（出どころの番号）のまま**（ADR-0057 §決定4）。**実際の番号は待ち受けの行の `addr=`**
     // （`listening_port_keeping_lines` がそこから読んだ番号が `port`）。
     assert_settings_line(&lines, saved_port, "saved");
     assert!(
@@ -1112,6 +1112,71 @@ fn a_whole_range_taken_names_the_range_and_how_to_get_out() {
     assert!(
         stderr.contains("待ち受けアドレスを開けませんでした"),
         "OS の文に至る鎖が消えている\n{stderr}"
+    );
+    // **鎖の `Caused by` の行（`PortsTaken` の文）も、試した数を偽りなく言う**（F-11 の再レビュー是正）。
+    assert!(
+        stderr.contains(&format!(
+            "ポート {first}〜{last} のうち 11 個を順に試しましたが、どれも開けませんでした"
+        )),
+        "鎖の文が試した数を言っていない\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("を除いて"),
+        "飛ばしていないのに、面の番号を除いたと言っている\n{stderr}"
+    );
+}
+
+/// **範囲の中に llama の面の番号が在ると、止まる文がその番号を「除いて」と言う**（F-11 の再レビュー是正）。
+///
+/// 範囲の 11 個のうち `first+5` だけを塞がずに残し、その番号を gguf の面に持つプロファイルを置く
+/// （選ばない）。`first+5` は空いているが面の番号なので試さず、ほかの 10 個は塞がっているので止まる。
+/// **`main` が飛ばした番号を文へ渡す配線**（`taken.skipped()`）を見る——渡さなければ「を除いて」が出ない
+/// （変異 M20）。`a_whole_range_taken_names_the_range_and_how_to_get_out` は `upstreams.json` を置かない
+/// （見本に 8081 があるだけ）ので、この配線を区別できない。
+#[test]
+fn a_whole_range_with_a_face_port_names_the_skipped_port() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
+    let root = dir.path();
+    let (mut held, first) = hold_a_whole_range();
+    let last = first + SPAN;
+    let face_port = first + 5;
+    // **`first+5` だけを放す**（並びは `first` から順なので、6 番目）。
+    drop(held.remove(5));
+    plant_saved_port(root, &format!("{first}\n"));
+    let marker = root.join(TOUCH_MARKER);
+    std::fs::write(
+        app_dir_of(root).join("upstreams.json"),
+        serde_json::json!({ "unchosen": { "main": {
+            "endpoint": format!("http://127.0.0.1:{face_port}"), "model": "unchosen-model",
+            "gguf": root.join("planted-unchosen.gguf"),
+            "args": ["--pc-touch", marker],
+        } } })
+        .to_string(),
+    )
+    .expect("プロファイルを置けること");
+
+    let (status, stderr) = run_to_exit(root, &[], &[]);
+    drop(held);
+    assert!(
+        !status.success(),
+        "面の番号のほかが全部塞がっているのに 0 で終わった（面の番号 {face_port} で待ち受けた？）\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "ポート {first}〜{last} は、上流プロファイルの llama の面が使う番号（{face_port}）を除いて、\
+             どれも他のプログラムが使っているか、使えない番号でした"
+        )),
+        "止まる文が、飛ばした面の番号を除いたと言っていない\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "ポート {first}〜{last} のうち 10 個を順に試しましたが、どれも開けませんでした"
+        )),
+        "鎖の文が、試した数（飛ばした番号を除く）を言っていない\n{stderr}"
+    );
+    assert!(
+        !marker.exists(),
+        "選んでいないプロファイルの上流を起こしている"
     );
 }
 

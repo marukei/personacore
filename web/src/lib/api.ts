@@ -1315,7 +1315,7 @@ export interface ServerView {
   listening_port: number;
   listening_port_source: string;
   /**
-   * **元の番号**（出どころの番号。試し始めた番号。`PERSONACORE_PORT=0` なら `0`）。作業単位 F-11b / ADR-0057 §決定4。
+   * **元の番号**（出どころの番号。試したとは限らない。`PERSONACORE_PORT=0` なら `0`）。作業単位 F-11b / ADR-0057 §決定4。
    * **型だけを写してある**（帯の表示は作業単位 F-11c）。
    */
   listening_port_requested: number;

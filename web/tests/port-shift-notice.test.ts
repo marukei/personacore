@@ -114,7 +114,7 @@ it("ずらしたら、帯が header の中・main の外に出て、文と「設
       expect(banner()).not.toBeNull();
     });
     expect(bannerText()).toBe(
-      "ポート 9100 は他のプログラムが使っていたので、9102 で起動しました。" +
+      "ポート 9100 は他のプログラムが使っているなどの理由で使えなかったので、9102 で起動しました。" +
         "ブックマークや外部のクライアントに 9100 を書いているなら、9102 に直してください。" +
         "番号は「設定」の画面で変えられます（次の起動から効きます）。",
     );
@@ -190,7 +190,7 @@ it("対照: 設定の画面でも、同じ拾い方で帯が当たる", async ()
   const view = mount(App, { target });
   try {
     await vi.waitFor(() => {
-      expect(bannerText()).toContain("ポート 9100 は他のプログラムが使っていたので");
+      expect(bannerText()).toContain("ポート 9100 は他のプログラムが使っているなどの理由で使えなかったので");
     });
   } finally {
     await unmount(view, { outro: false });

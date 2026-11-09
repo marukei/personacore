@@ -16,10 +16,12 @@
  *
  * | 元の番号 | 文の頭 |
  * |---|---|
- * | 塞がっていた | 「ポート {元} は他のプログラムが使っていたので、{実際} で起動しました」（ADR-0057 §決定4 の文） |
+ * | 開けなかった | 「ポート {元} は他のプログラムが使っているなどの理由で使えなかったので、{実際} で起動しました」 |
  * | **llama の面が使う番号として飛ばした**（`listening_port_skipped` が元の番号を含む） | 「ポート {元} は上流プロファイルの llama の面が使う番号なので、{実際} で起動しました」 |
  *
- * **飛ばした元の番号に「他のプログラムが使っていた」と言わない**——塞がってはいなかった
+ * **開けなかったときも「他のプログラムが使っていた」と言い切らない**（ADR-0057 §決定4 の追記 2026-11-10）——
+ * ずらす失敗には `PermissionDenied`（Windows の除外ポート範囲など）も含まれ、API はその区別を載せない。
+ * **飛ばした元の番号に「使えなかった」と言わない**——開こうとしていない
  * （起動ログの警告と同じ分け方 / `src/server/port_search.rs` の `shifted_message`）。
  *
  * **ずらしていなければ `null`**（帯を出さない）。`PERSONACORE_PORT=0` で OS に選ばせた起動もずらしていない
@@ -48,7 +50,7 @@ export function portShiftNotice(view: ServerView): PortShiftNotice | null {
   const actual = view.listening_port;
   const why = view.listening_port_skipped.includes(requested)
     ? "上流プロファイルの llama の面が使う番号なので"
-    : "他のプログラムが使っていたので";
+    : "他のプログラムが使っているなどの理由で使えなかったので";
   return {
     lead:
       `ポート ${requested} は${why}、${actual} で起動しました。` +

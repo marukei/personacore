@@ -353,7 +353,7 @@ fn log_settings(config: &AppConfig, profile: Option<&str>, from: ProfileFrom) {
     let upstream = endpoint_for_log(config.llm().endpoint());
     let sub_upstream = endpoint_for_log(config.sub_llm_endpoint());
     tracing::info!(
-        // **試し始めた番号**（ADR-0057 §決定4）。塞がっていてずらした起動では、実際の番号と違う——
+        // **元の番号**（出どころの番号。試したとは限らない / ADR-0057 §決定4 の追記）。ずらした起動では、実際の番号と違う——
         // 実際の番号は `App::bind` が出す警告（ずらしたとき）と、待ち受けの行の `addr=` が言う。
         bind = %config.bind(),
         // **その番号が何から決まったか**（ADR-0057 §決定5）——`environment` / `saved` / `default`。

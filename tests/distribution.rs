@@ -1139,7 +1139,8 @@ fn the_distributed_readme_shows_the_spawn_failure_as_the_screen_does() {
 ///
 /// 見るもの:
 /// * **README が、ずらして起きたときの帯の文を、既定のポートで書いている**（`web/src/lib/portShift.ts` の
-///   文の頭の写し。F-11c で足した）。直す場所として「設定」の画面を書いている。
+///   文の頭の写し。F-11c で足した）。元の番号を llama の面の番号として飛ばしたときの帯の文も、見本の 8081 で
+///   書いている（F-11 の再レビューで足した）。直す場所として「設定」の画面を書いている。
 /// * **止まる文は「番号を明示したとき」の話として書いている**（F-11c で主張を絞った。B-76 の間は、既定の
 ///   ポートでも止まったので、その文を無条件に書いていた）。
 /// * README が、明示した番号で実行ファイルが出す文（`server::port_in_use_message`）を**そのまま**書いている。
@@ -1150,16 +1151,25 @@ fn the_distributed_readme_shows_the_spawn_failure_as_the_screen_does() {
 fn the_distributed_readme_shows_the_port_in_use_message_and_how_to_change_the_port() {
     let readme = dist_readme();
     // **帯の文の頭の写し**（`web/src/lib/portShift.ts`。**定数から作らない**）。
-    let band = format!("ポート {DEFAULT_PORT} は他のプログラムが使っていたので、");
+    // 開けなかったときは「使っていた」と言い切らない（ADR-0057 §決定4 の追記 2026-11-10）。
+    let band =
+        format!("ポート {DEFAULT_PORT} は他のプログラムが使っているなどの理由で使えなかったので、");
     assert!(
         readme.contains(&band),
         "{DIST_README} が、ずらして起きたときの帯の文 `{band}…` を書いていない"
+    );
+    // **元の番号を llama の面の番号として飛ばしたときの帯の文**も書く（見本の llama の面は 8081）。
+    let band_face = "ポート 8081 は上流プロファイルの llama の面が使う番号なので、";
+    assert!(
+        readme.contains(band_face),
+        "{DIST_README} が、元の番号を面の番号として飛ばしたときの帯の文 `{band_face}…` を書いていない"
     );
     // **写しの元にも同じ綴りが在る**（帯の文を変えたら、README の写しと一緒にここが赤になる）。
     let band_source = include_str!("../web/src/lib/portShift.ts");
     assert!(
         band_source.contains("は${why}、${actual} で起動しました")
-            && band_source.contains("\"他のプログラムが使っていたので\""),
+            && band_source.contains("\"他のプログラムが使っているなどの理由で使えなかったので\"")
+            && band_source.contains("\"上流プロファイルの llama の面が使う番号なので\""),
         "web/src/lib/portShift.ts の帯の文が、README の写しと同じ形でなくなった"
     );
     assert!(

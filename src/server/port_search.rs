@@ -29,7 +29,8 @@
 //! **ずらしたら、`App::bind_with` が警告を1本出す**（[`shifted_message`] と、元の番号・実際の番号・出どころ・
 //! 飛ばした番号の欄）。`GET /admin/server` は [`OpenedPort`] を `listening_port_requested` /
 //! `listening_port_shifted` / `listening_port_skipped` として言う（`listening_port` モジュール）。
-//! **起動ログ `設定を読み込みました` の `bind=` は、試し始めた番号のまま**（`main` の `log_settings`）。
+//! **起動ログ `設定を読み込みました` の `bind=` は、元の番号（出どころの番号。試したとは限らない）のまま**
+//! （`main` の `log_settings` / ADR-0057 §決定4 の追記）。
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -114,7 +115,7 @@ impl PortSearch {
 /// **この起動が待ち受けを開けた結果**（`GET /admin/server` と警告が言う）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpenedPort {
-    /// **元の番号**（出どころの番号。試し始めた番号。`PERSONACORE_PORT=0` なら `0`）。
+    /// **元の番号**（出どころの番号。試したとは限らない。`PERSONACORE_PORT=0` なら `0`）。
     requested: u16,
     /// 元の番号の出どころ。
     source: PortSource,
@@ -158,8 +159,11 @@ impl OpenedPort {
 /// （全部を飛ばしたときは無い）。**範囲の中で飛ばした番号**も持つ——利用者向けの文は、それが在るときだけ
 /// 「面の番号は試していない」と言い、1つも試せなかったときはそう言う（読めない `upstreams.json` で飛ばす番号が
 /// 空の起動に、飛ばしたと言わない）。
+///
+/// **この型の文**（`main` が出す鎖の `Caused by` の行）も、試した数と範囲の幅で偽にならない形にする
+/// （[`ports_taken_text`]）。**`ServerError::PortsTaken` の `Display` は定数のまま**で、番号を含むのはこちらだけ。
 #[derive(Debug, thiserror::Error)]
-#[error("ポート {first}〜{last} を順に試しましたが、どれも開けませんでした")]
+#[error("{}", ports_taken_text(*.first, *.last, .skipped))]
 pub struct PortsTaken {
     first: u16,
     last: u16,
@@ -168,8 +172,38 @@ pub struct PortsTaken {
     source: Option<std::io::Error>,
 }
 
+/// **[`PortsTaken`] の文。純粋関数。**
+///
+/// | 範囲の中 | 文 |
+/// |---|---|
+/// | 1つも試していない（全部を飛ばした） | 「ポート {範囲} は、どれも llama の面が使う番号として飛ばしたので、1つも試していません」 |
+/// | 範囲が1つで、それを試した | 「ポート {番号} を試しましたが、開けませんでした」 |
+/// | それ以外 | 「ポート {範囲} のうち {試した数} 個を順に試しましたが、どれも開けませんでした」 |
+///
+/// 範囲が1つの番号なら「〜」を書かない。
+fn ports_taken_text(first: u16, last: u16, skipped: &[u16]) -> String {
+    let range = if first == last {
+        first.to_string()
+    } else {
+        format!("{first}〜{last}")
+    };
+    let total = usize::from(last.saturating_sub(first)) + 1;
+    let tried = total.saturating_sub(skipped.len());
+    if tried == 0 {
+        // **「どれも」の後は空白**（続く語が英字の `llama`）。
+        let every = if total > 1 { "どれも " } else { "" };
+        format!(
+            "ポート {range} は、{every}llama の面が使う番号として飛ばしたので、1つも試していません"
+        )
+    } else if total == 1 {
+        format!("ポート {range} を試しましたが、開けませんでした")
+    } else {
+        format!("ポート {range} のうち {tried} 個を順に試しましたが、どれも開けませんでした")
+    }
+}
+
 impl PortsTaken {
-    /// 試し始めた番号（元の番号）。
+    /// 元の番号（出どころの番号。試したとは限らない）。
     #[must_use]
     pub const fn first(&self) -> u16 {
         self.first
@@ -550,6 +584,58 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("他のプログラム"), "{message}");
+    }
+
+    /// **`PortsTaken` の文（鎖の `Caused by` の行）は、試した数と範囲の幅で偽にならない**（F-11 の再レビュー是正）。
+    #[test]
+    fn the_ports_taken_text_never_claims_more_than_was_tried() {
+        assert_eq!(
+            ports_taken_text(8080, 8090, &[]),
+            "ポート 8080〜8090 のうち 11 個を順に試しましたが、どれも開けませんでした"
+        );
+        assert_eq!(
+            ports_taken_text(8080, 8090, &[8081, 8085]),
+            "ポート 8080〜8090 のうち 9 個を順に試しましたが、どれも開けませんでした"
+        );
+        assert_eq!(
+            ports_taken_text(65535, 65535, &[]),
+            "ポート 65535 を試しましたが、開けませんでした"
+        );
+        assert_eq!(
+            ports_taken_text(65535, 65535, &[65535]),
+            "ポート 65535 は、llama の面が使う番号として飛ばしたので、1つも試していません"
+        );
+        let all: Vec<u16> = (9300..=9310).collect();
+        assert_eq!(
+            ports_taken_text(9300, 9310, &all),
+            "ポート 9300〜9310 は、どれも llama の面が使う番号として飛ばしたので、1つも試していません"
+        );
+        // **`Display` がこの文を使う**（型の文そのもの）。
+        let taken = PortsTaken {
+            first: 65535,
+            last: 65535,
+            skipped: vec![65535],
+            source: None,
+        };
+        assert_eq!(taken.to_string(), ports_taken_text(65535, 65535, &[65535]));
+    }
+
+    /// **元の番号を飛ばした後に、続けて別の面の番号も飛ばした形でも、元の番号を飛ばしたと読む**
+    /// （飛ばした番号の「先頭」が元の番号か / F-11 の再レビュー是正。面が1つだけの腕では、先頭と末尾を取り違える
+    /// 実装が見分けられなかった）。
+    #[tokio::test]
+    async fn a_skipped_requested_port_followed_by_another_skip_is_still_the_requested_one() {
+        let mut seen = Vec::new();
+        let (port, opened) = walk(
+            &PortSearch::plan(9100, PortSource::Saved, &faces(&[9100, 9101])),
+            &[],
+            &mut seen,
+        )
+        .await
+        .expect("開けること");
+        assert_eq!(port, 9102);
+        assert_eq!(opened.skipped(), [9100, 9101].as_slice());
+        assert!(opened.requested_was_skipped());
     }
 
     /// **全部を飛ばしたときも範囲を言って止まる**（OS の失敗は無い）。

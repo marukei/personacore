@@ -245,11 +245,12 @@ pub enum ServerError {
     #[error("待ち受けアドレスを開けませんでした")]
     Bind(#[source] std::io::Error),
 
-    /// **番号を明示していない起動が、ずらす範囲（元の番号〜`+`[`PORT_SHIFT_SPAN`]）を全部試しても
-    /// 待ち受けを開けなかった**（ADR-0057 §決定3 / 作業単位 F-11b）。
+    /// **番号を明示していない起動が、ずらす範囲（元の番号〜`+`[`PORT_SHIFT_SPAN`]）のどの番号でも
+    /// 待ち受けを開けなかった**（飛ばした番号は試していない / ADR-0057 §決定3 / 作業単位 F-11b）。
     ///
-    /// **`Display` は [`Self::Bind`] と同じ定数文字列**（どちらも「待ち受けを開けなかった」）。範囲は
-    /// [`Self::tried_ports`] で読む——`main` はそれで [`ports_in_use_message`] を足す。
+    /// **`Display` は [`Self::Bind`] と同じ定数文字列**（どちらも「待ち受けを開けなかった」）。範囲と飛ばした番号は
+    /// [`Self::ports_taken`] で読む——`main` はそれで [`ports_in_use_message`] を足す（[`Self::tried_ports`] は
+    /// 範囲だけを返す、テスト向けの近道）。
     #[error("待ち受けアドレスを開けませんでした")]
     PortsTaken(#[source] PortsTaken),
 
@@ -289,8 +290,9 @@ impl ServerError {
         matches!(self, Self::Bind(source) if source.kind() == std::io::ErrorKind::AddrInUse)
     }
 
-    /// **ずらす範囲を全部試して開けなかったなら、その範囲**（試し始めた番号, 範囲の最後の番号）
-    /// （ADR-0057 §決定3 / 作業単位 F-11b）。
+    /// **ずらす範囲のどの番号でも開けなかったなら、その範囲**（元の番号, 範囲の最後の番号）
+    /// （ADR-0057 §決定3 / 作業単位 F-11b）。**飛ばした番号は言わない**——利用者向けの文に要るので、`main` は
+    /// [`Self::ports_taken`] を読む。
     ///
     /// **[`Self::is_port_in_use`] とは重ならない**——あちらは明示した1つの番号の話（B-76 の文）、
     /// こちらは範囲の話（[`ports_in_use_message`]）。`main` は [`Self::ports_taken`] を先に見る。
@@ -1555,7 +1557,7 @@ impl App {
         let local_addr = listener.local_addr().map_err(ServerError::Bind)?;
 
         // **ずらしたら、警告を1本**（ADR-0057 §決定4）——元の番号・実際の番号・出どころ・飛ばした番号。
-        // **`設定を読み込みました` の `bind=` は試し始めた番号のまま**（`main`）。実際の番号はこの行と、
+        // **`設定を読み込みました` の `bind=` は元の番号（出どころの番号）のまま**（`main`）。実際の番号はこの行と、
         // 下の待ち受けの行の `addr=` が言う。見張り番は `tests/listening_port_cli.rs` の
         // `a_taken_saved_port_shifts_past_a_face_port_and_the_log_and_the_api_say_so`。
         if opened.shifted() {
