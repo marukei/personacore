@@ -4,6 +4,7 @@
   import CharacterList from "./lib/CharacterList.svelte";
   import ChatView from "./lib/ChatView.svelte";
   import MemoryList from "./lib/MemoryList.svelte";
+  import SettingsPanel from "./lib/SettingsPanel.svelte";
   import StatsPanel from "./lib/StatsPanel.svelte";
   import UpstreamPanel from "./lib/UpstreamPanel.svelte";
   import {
@@ -41,7 +42,7 @@
   **⚠ いまいる画面の印（太字・下の read の線）は `aria-[current=page]:` の変位で書く。**
   **読み上げに告げる属性と目に見える印が、同じ1つの条件から出る** ——
   いまいる画面だけに別のクラスを足す形にすると、片方だけが古びる。
-  **3つのタブの `class` は一字一句同じ**で、見張り番（`tests/app-nav.test.ts`）がそれを見ている。
+  **全部のタブの `class` は一字一句同じ**で、見張り番（`tests/app-nav.test.ts`）がそれを見ている。
 
   **⚠ タブの押せる高さは 48px**（`min-h-12` / 絵のまま。下限 44px は同じ見張り番）。
   **⚠ リンクの既定の色**（土台の `a` の read）**を `text-ink-2` で上書きしている。**
@@ -90,6 +91,12 @@
         見出しだけが新しい相手を名乗る**からで、ここではその状態を作れない。
       -->
       <UpstreamPanel />
+    {:else if screen.route === "settings"}
+      <!--
+        **personacore 自身の設定**（作業単位 F-12b。いまは待ち受けのポート）。
+        **`{#key}` は要らない** —— 上流の画面と同じく、識別子を運ばない。
+      -->
+      <SettingsPanel />
     {:else if screen.route === "memories"}
       <!--
         **識別子は経路が運ぶ**（`router.ts` の `Screen`）。

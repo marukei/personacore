@@ -15,10 +15,10 @@ use anyhow::Context;
 use personacore::llm::endpoint_for_log;
 use personacore::server::{
     App, AppConfig, Browser, ENV_UPSTREAMS, LaunchPlan, LaunchTiming, ProfileSettings,
-    SampleOutcome, ServerError, Startup, Ui, UpstreamProfiles, VERSION_LINE, init_tracing,
-    load_profiles, overlay_profile, parse_args, port_in_use_message, read_remembered,
-    remembered_path_beside, shutdown_signal, upstreams_path_under, wait_before_closing_if_alone,
-    write_sample_if_missing,
+    SampleOutcome, SavedPort, ServerError, Startup, Ui, UpstreamProfiles, VERSION_LINE,
+    init_tracing, load_profiles, overlay_profile, parse_args, port_in_use_message, read_remembered,
+    read_saved_port, remembered_path_beside, saved_port_path_beside, shutdown_signal,
+    upstreams_path_under, wait_before_closing_if_alone, write_sample_if_missing,
 };
 
 /// **失敗を言ってから、ダブルクリックで開いた窓なら Enter を待って終わる**（作業単位 B-76）。
@@ -112,10 +112,15 @@ async fn run() -> anyhow::Result<()> {
     //
     // **プロファイルから来た値は、環境変数4つと同じ入口へ流す**（ADR-0042 §決定1）。
     // **入口を増やさない**——増やすと「どちらが効いているか」が2つになる。
+    //
+    // **画面で保存した待ち受けのポートも、同じ入口へ流す**（ADR-0057 §決定5 / 作業単位 F-12a）。
+    // **読むのはここで1回だけ**——下の3つの経路（旗・覚えた名前・環境変数の既定）が同じ番号を見る。
+    let saved_port = saved_port_of(&profiles_path);
     let chosen = match args.upstream() {
         Some(name) => {
             let selected = select_profile(name, &profiles_path)?;
-            let config = config_for(&selected.settings).context("設定を読み込めませんでした")?;
+            let config =
+                config_for(&selected.settings, saved_port).context("設定を読み込めませんでした")?;
             warn_on_conflicts(&selected.settings, ProfileFrom::Flag);
             Chosen {
                 selected: Some(selected),
@@ -123,12 +128,12 @@ async fn run() -> anyhow::Result<()> {
                 config,
             }
         }
-        None => match remembered_choice(&profiles_path) {
+        None => match remembered_choice(&profiles_path, saved_port) {
             Some(chosen) => chosen,
             None => Chosen {
                 selected: None,
                 from: ProfileFrom::Environment,
-                config: AppConfig::from_env().context("設定を読み込めませんでした")?,
+                config: AppConfig::from_env(saved_port).context("設定を読み込めませんでした")?,
             },
         },
     };
@@ -281,6 +286,9 @@ fn log_settings(config: &AppConfig, profile: Option<&str>, from: ProfileFrom) {
     let sub_upstream = endpoint_for_log(config.sub_llm_endpoint());
     tracing::info!(
         bind = %config.bind(),
+        // **その番号が何から決まったか**（ADR-0057 §決定5）——`environment` / `saved` / `default`。
+        // 見張り番は `tests/listening_port_cli.rs`。
+        bind_from = %config.port_source().label(),
         database = ?config.database_path(),
         // **宛先はユーザー情報・クエリ・フラグメントを落として出す**（作業単位 B-71 / Issue origin#100 /
         // `llm::endpoint_for_log`）。見張り番は実行ファイルを起こす
@@ -413,13 +421,57 @@ struct Chosen {
 ///
 /// **面に書いた鍵（ADR-0056 §決定1）も別の入口で載せる**（`with_profile_keys`）——環境変数には
 /// 鍵の口を作らない。**`warn_on_conflicts` の組にも鍵を混ぜない**（値を平文で並べる行なので）。
-fn config_for(settings: &ProfileSettings) -> Result<AppConfig, personacore::server::ConfigError> {
-    Ok(
-        AppConfig::from_lookup(overlay_profile(settings, |key| std::env::var(key).ok()))?
-            .with_profile_context(settings)?
-            .with_profile_keys(settings),
-    )
+///
+/// **画面で保存した待ち受けのポート（ADR-0057 §決定5）も、環境変数の既定の経路と同じ入口で渡す**
+/// （`AppConfig::from_lookup_with_saved_port`。プロファイルは待ち受けのポートを持たない）。
+fn config_for(
+    settings: &ProfileSettings,
+    saved_port: Option<SavedPort>,
+) -> Result<AppConfig, personacore::server::ConfigError> {
+    Ok(AppConfig::from_lookup_with_saved_port(
+        overlay_profile(settings, |key| std::env::var(key).ok()),
+        saved_port,
+    )?
+    .with_profile_context(settings)?
+    .with_profile_keys(settings))
 }
+
+/// **画面で保存した待ち受けのポートを読む**（ADR-0057 §決定5 / 作業単位 F-12a）。
+///
+/// | 条件 | 結果 |
+/// |---|---|
+/// | 既定の置き場所でない（`PERSONACORE_UPSTREAMS` / 決められない） | **`None`。ファイルを読みもしない**（覚えた名前と同じ） |
+/// | ファイルが無い・空 | `None` |
+/// | 読めない（範囲の外・数でない・2行以上・ディレクトリ） | **警告を1本出して `None`。ファイルは消さない** |
+///
+/// **`PERSONACORE_PORT` があっても読む**（効く順は `config::resolve_port` が決める。壊れたファイルは知らせる）。
+fn saved_port_of(profiles_path: &ProfilesPath) -> Option<SavedPort> {
+    let ProfilesPath::Default(path) = profiles_path else {
+        return None;
+    };
+    let file = saved_port_path_beside(path);
+    match read_saved_port(&file) {
+        Ok(saved) => saved,
+        Err(err) => {
+            tracing::warn!(
+                saved_in = %file.display(),
+                error = %err,
+                cause = ?std::error::Error::source(&err),
+                "{SAVED_PORT_UNREADABLE}"
+            );
+            None
+        }
+    }
+}
+
+/// **保存した待ち受けのポートを読めないときの警告の本文**（ADR-0057 §決定5）。
+///
+/// **写しが `tests/listening_port_cli.rs` の `SAVED_PORT_UNREADABLE_LINE` と
+/// `SAVED_PORT_UNREADABLE_SCREEN` に在る**（文面を変えたら、そちらは「言っていない」で赤になる）。
+///
+/// **直し方の先頭は画面の「設定」**（作業単位 F-12b）——保存し直せば置き換わり、消せばファイルも消える。
+/// 手で直す道も残して言う（画面を出さない `--no-ui` の起動がある）。
+const SAVED_PORT_UNREADABLE: &str = "保存した待ち受けのポートを読めないので、使わずに起動します（ファイルは消していません。画面の「設定」で番号を保存し直すか保存を消すと直ります。手で直すなら、中身を 1024〜65535 の番号1行にするか、ファイルを消してください）";
 
 /// **覚えた名前で起き、gguf の面を起こさずに待つと言う行の本文**（ADR-0055 / 作業単位 F-10a のレビュー是正）。
 ///
@@ -467,7 +519,10 @@ const REMEMBERED_UNUSABLE: &str = "覚えていた上流プロファイルを使
 /// | **覚えた名前が使えない**（名前が無い／検証に通らない／gguf が無い／待ち受けと取り合う／設定を組めない） | **警告。同じ行が名前を言う** |
 ///
 /// **どの場合も、覚えた名前は消さない**（利用者が `upstreams.json` を直せば、次から効く）。
-fn remembered_choice(profiles_path: &ProfilesPath) -> Option<Chosen> {
+fn remembered_choice(
+    profiles_path: &ProfilesPath,
+    saved_port: Option<SavedPort>,
+) -> Option<Chosen> {
     let ProfilesPath::Default(path) = profiles_path else {
         return None;
     };
@@ -485,7 +540,7 @@ fn remembered_choice(profiles_path: &ProfilesPath) -> Option<Chosen> {
             return None;
         }
     };
-    match remembered_profile(&name, profiles_path) {
+    match remembered_profile(&name, profiles_path, saved_port) {
         Ok((selected, config)) => {
             warn_on_conflicts(&selected.settings, ProfileFrom::Remembered);
             Some(Chosen {
@@ -515,12 +570,18 @@ fn remembered_choice(profiles_path: &ProfilesPath) -> Option<Chosen> {
 ///
 /// **明示の `--upstream` と同じ関数を通す**（[`select_profile`] と、`bind` が止まるのと同じ判定の
 /// `LaunchPlan::check_before_starting`）——**判定の写しを作らない。**
+///
+/// **待ち受けとの取り合いは、保存した番号も見る**（`config.bind()` が保存した番号になる / ADR-0057 §決定5）。
+/// 振る舞いは今までどおり（取り合えば覚えた名前を使わない）。番号を明示していないときに取り合わなくするのは
+/// F-11（ADR-0057 §決定3）。
 fn remembered_profile(
     name: &str,
     profiles_path: &ProfilesPath,
+    saved_port: Option<SavedPort>,
 ) -> anyhow::Result<(Selected, AppConfig)> {
     let selected = select_profile(name, profiles_path)?;
-    let config = config_for(&selected.settings).context("設定を読み込めませんでした")?;
+    let config =
+        config_for(&selected.settings, saved_port).context("設定を読み込めませんでした")?;
     selected
         .plan
         .check_before_starting(config.bind())

@@ -125,6 +125,8 @@ describe("ナビゲーションには並ばない", () => {
       "chat",
       "characters",
       "upstream",
+      // **識別子を運ばない「設定」**（作業単位 F-12b）。上の `upstream` と同じ理由で並ぶ。
+      "settings",
     ]);
   });
 });

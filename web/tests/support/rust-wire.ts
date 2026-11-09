@@ -169,9 +169,13 @@ function fieldsOf(
     // （B-18 のレビューが `serde` だけの小さなクレートで実測）。
     // **`default` の綴りだけを見ると、線の上の契約を1バイトも変えない変異が赤になり、
     // その赤を「写しを直す」と読んだ人が、省略可の欄を必須と書き直す経路ができる。**
+    // **⚠ ただし `deserialize_with` を付けた `Option<…>` は、`default` が無ければ省けない**
+    // （作業単位 F-12b / `listening_port.rs` の `SavePortRequest.port`）——
+    // `serde` が欠落を `None` として受けるのは、読み方を差し替えていないときだけである。
     const optional = serialized
       ? attribute.includes("skip_serializing_if")
-      : /\bdefault\b/u.test(attribute) || /^Option\s*</u.test(found[2]);
+      : /\bdefault\b/u.test(attribute) ||
+        (/^Option\s*</u.test(found[2]) && !/\bdeserialize_with\b/u.test(attribute));
     fields.push({ name, optional });
   }
 

@@ -8,6 +8,8 @@
  * `StatsView` / `StatAllocView` / `UpdatedCharacterView`）、
  * **要求側の `CreateCharacterRequest` / `UpdateCharacterRequest`**（作業単位 D-2）、
  * および `src/server/error.rs` の `ErrorBody`。
+ * **上流の観測・プロファイル・差し替え・待ち受けのポートの型は、それぞれの `.rs` が写し元**
+ * （`upstream.rs` / `profile_editor.rs` / `switch.rs` / `listening_port.rs`。一覧は `tests/api-fields.test.ts`）。
  *
  * **⚠ 上限（`Persona::MAX_CHARS` など）はここに無い。** 写し元が違う
  * （`src/domain/character.rs`）ので `src/lib/characterEdit.ts` が持つ。
@@ -1303,6 +1305,47 @@ export interface SwitchRequest {
 }
 
 /**
+ * `GET /admin/server` の応答（`listening_port.rs` の `ServerView` / 作業単位 F-12b / ADR-0057 §決定5・6）。
+ *
+ * **出どころ（`*_source`）は `environment` / `saved` / `default`。** 綴りを閉じた型にしていない
+ * （`LaunchView.state` と同じ立場 —— 画面は知らない綴りをそのまま見せる / `serverSettings.ts`）。
+ */
+export interface ServerView {
+  /** **いま実際に待ち受けている番号**（`PERSONACORE_PORT=0` なら OS が選んだ番号）。 */
+  listening_port: number;
+  listening_port_source: string;
+  /** 保存した番号。**無い・読めない・保存できない起動なら `null`**（3つは `saved_port_unreadable` と `editable` で見分ける）。 */
+  saved_port: number | null;
+  /** **保存のファイルが在るのに読めない。** 無い・空・保存できない起動なら `false`。 */
+  saved_port_unreadable: boolean;
+  /** 次の起動で使う番号。**`PERSONACORE_PORT` を番号として読めなければ `null`**（次の起動は止まる）。 */
+  next_port: number | null;
+  next_port_source: string;
+  /** **この起動で保存できるか。** `false` は `PERSONACORE_UPSTREAMS` で置き場所を変えた起動（`ProfilesView.editable` と同じ意味）。 */
+  editable: boolean;
+}
+
+/**
+ * `PUT /admin/server/port` の応答（`listening_port.rs` の `SavePortView`）——`GET /admin/server` と同じ形に1欄を足す。
+ *
+ * **Rust 側は `#[serde(flatten)]`、こちらは `extends`**（写しの走査は両方を同じ形に読む）。
+ */
+export interface SavePortView extends ServerView {
+  /** **保存した番号を、いま他のプログラムが使っているか。** この personacore 自身の番号なら `false`、消したなら `null`。 */
+  saved_port_in_use: boolean | null;
+}
+
+/**
+ * `PUT /admin/server/port` の本文（`listening_port.rs` の `SavePortRequest`）。
+ *
+ * **`port` は省けない**（`null` が「保存を消す」）。範囲（1024〜65535）は**サーバが決める**
+ * （外なら 400 `invalid_listening_port`）。**サーバは `deny_unknown_fields`。**
+ */
+export interface SavePortRequest {
+  port: number | null;
+}
+
+/**
  * サーバが返したエラー。
  *
  * **本文は OpenAI 互換の形**（`{"error": {"message", "type", "code"?}}`）だが、
@@ -1682,6 +1725,31 @@ export function saveUpstreamProfile(
     body,
     signal,
   );
+}
+
+/**
+ * `GET /admin/server` — **待ち受けのポートの、いま・保存・次の起動**（作業単位 F-12b / ADR-0057 §決定6）。
+ *
+ * **失敗しない口**（保存が読めなければ `saved_port_unreadable` が言う）。
+ * **画面は開いたときに1回だけ読む**（周期で読み直さない / `SettingsPanel.svelte`）。
+ */
+export function getServer(signal?: AbortSignal): Promise<ServerView> {
+  return getJson<ServerView>("/admin/server", signal);
+}
+
+/**
+ * `PUT /admin/server/port` — **待ち受けのポートを保存する（数）・保存を消す（`null`）**（ADR-0057 §決定5）。
+ *
+ * **次の起動から効く**（いまの待ち受けは移らない）。**返るのは、書いた後にサーバが読み直した状態**
+ * （`GET /admin/server` と同じ形 ＋ `saved_port_in_use`）なので、画面はこれを採り、読み直しの GET を足さない。
+ * 失敗の読み分けは `serverSettings.ts` の `describeSaveFailure`。
+ */
+export function saveListeningPort(
+  port: number | null,
+  signal?: AbortSignal,
+): Promise<SavePortView> {
+  const body: SavePortRequest = { port };
+  return sendJson<SavePortView>("PUT", "/admin/server/port", body, signal);
 }
 
 /**

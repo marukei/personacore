@@ -67,13 +67,16 @@
 | **PowerShell 7 以上** | [scripts/start.ps1](../scripts/start.ps1) が動かない（`#Requires` が弾く）。**手で立てるなら要らない** | [scripts/README-start.md](../scripts/README-start.md) |
 | **cargo-about**（**配布物を作るときだけ**） | [scripts/package.ps1](../scripts/package.ps1) が**画面とリリースビルドの前に止まる**（第三者の著作権表示を作れない）。`cargo install --locked cargo-about --features cli`（確かめた版 0.9.2）。**走らせるだけなら要らない** | [scripts/notices.ps1](../scripts/notices.ps1) |
 | **ループバックに待ち受けられること** | 起動できない。**サーバは `127.0.0.1` にしか待ち受けない**（外部へ出さない） | [CLAUDE.md](../CLAUDE.md) の絶対制約 |
-| **待ち受けポートが空いていること** | [scripts/start.ps1](../scripts/start.ps1) がそう言って**何もせず止まる**。`-Port` で変えられる | [scripts/README-start.md](../scripts/README-start.md) |
+| **待ち受けポートが空いていること** | 番号を明示した（`-Port` / `PERSONACORE_PORT`）なら [scripts/start.ps1](../scripts/start.ps1) がそう言って**何もせず止まる**。明示していなければ、personacore が待ち受けを開けずに止まる（番号と直し方を言う）。番号は `-Port` か、画面の「設定」で保存して変えられる | [scripts/README-start.md](../scripts/README-start.md) |
 | **SQLite のファイルを置ける場所** | DB を開けずに落ちる。**未設定なら OS の作法の場所**、決められない環境は**起動を止める** | [ADR-0041](adr/0041-one-executable-per-os.md) §決定3 |
 
 **GPU は要らない。** 推論は上流が持つ。
 
+待ち受けのポートは、**環境変数 `PERSONACORE_PORT` → 画面の「設定」で保存した番号 → 既定**の順で決まる
+（保存した番号は次の起動から効く / [ADR-0057](adr/0057-the-listening-port-shifts-when-taken-and-is-set-from-the-screen.md) §決定5）。
 既定のポートは写していない —— 値は `src/server/config.rs` の `DEFAULT_PORT` にある。
-**待ち受けの URL は、起動ログと [scripts/start.ps1](../scripts/start.ps1) の `[画面]` 行が出す。**
+**待ち受けの URL は起動ログの `url=` が出す。** [scripts/start.ps1](../scripts/start.ps1) の `[画面]` 行が URL を出すのは
+番号を明示したときだけで、明示していなければ起動ログの `url=` を見るよう案内する。
 
 ### 速い環境を要求してよい。遅い環境で壊れてはいけない
 

@@ -50,6 +50,7 @@ mod extract;
 mod fresh;
 mod host_guard;
 mod launch;
+mod listening_port;
 mod models;
 mod openapi;
 mod profile_editor;
@@ -83,8 +84,8 @@ pub use config::{
     ENV_AXIS_TRIAL_MIN_NONZERO, ENV_AXIS_TRIAL_TURNS, ENV_CONTEXT_TOKENS, ENV_DATABASE_PATH,
     ENV_DRIFT_DECAY, ENV_DRIFT_FORM, ENV_DRIFT_NOTE, ENV_DRIFT_SLOPE, ENV_DRIFT_STEP_COST,
     ENV_LLM_ENDPOINT, ENV_LLM_IDLE_TIMEOUT, ENV_MAIN_MODEL, ENV_PORT, ENV_STAT_DRIFT,
-    ENV_SUB_LLM_ENDPOINT, ENV_SUB_MODEL, ENV_UPSTREAMS, ENV_WEB_DIR, database_path_under,
-    os_data_dir, port_in_use_message,
+    ENV_SUB_LLM_ENDPOINT, ENV_SUB_MODEL, ENV_UPSTREAMS, ENV_WEB_DIR, PortSource, SAVED_PORT_MIN,
+    SavedPort, database_path_under, os_data_dir, port_in_use_message, resolve_port,
 };
 /// **起動に失敗したとき、ダブルクリックで開いた窓を理由と一緒に消さない**（作業単位 B-76 / `console` モジュール）。
 pub use console::{PRESS_ENTER_TO_CLOSE, wait_before_closing_if_alone};
@@ -149,6 +150,14 @@ pub use upstreams::{
 /// **書く口は公開しない**——覚える先は [`Startup::with_editable_profiles_file`] の置き場所からしか作られない。
 pub use remembered::{
     REMEMBERED_FILE_NAME, RememberedUnreadable, read_remembered, remembered_path_beside,
+};
+
+/// **画面で保存した待ち受けのポート**（ADR-0057 §決定5 / 作業単位 F-12a / `listening_port` モジュール）。
+///
+/// **`main` が読むだけ。** 書くのは `PUT /admin/server/port`（このモジュールの中）で、
+/// **書く口は公開しない**——保存する先は [`Startup::with_editable_profiles_file`] の置き場所からしか作られない。
+pub use listening_port::{
+    LISTENING_PORT_FILE_NAME, SavedPortUnreadable, read_saved_port, saved_port_path_beside,
 };
 
 /// 上流の観測の共有ハンドル。**テストからだけ見える**（`App::upstream_handle` と対）。
@@ -317,6 +326,10 @@ pub(crate) struct AppState {
     /// **1つを全リクエストで共有する**（キャラクターごとに直近のターンの部品を持つ）。
     /// **プロセスの中にしか無い**（DB に持たない）。
     parts: Arc<counted_plan::PartMemory>,
+    /// **待ち受けのポートの、いま・保存・次の起動**（ADR-0057 §決定5・6 / 作業単位 F-12a / `listening_port`）。
+    ///
+    /// **保存の置き場所は [`Self::switcher`] と同じ1つの値（`profiles_file`）から作る**（`serve`）。
+    listening: Arc<listening_port::Listening>,
 }
 
 /// **直近のターンで載った取り決めの件数**（作業単位 A-12a の決め直し / [`AppState::agreement_fit`]）。
@@ -370,6 +383,11 @@ impl AppState {
     /// 永続化層。
     pub(crate) const fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// **待ち受けのポートについて、この起動が知っていること**（`GET /admin/server` / `PUT /admin/server/port`）。
+    pub(crate) fn listening(&self) -> &listening_port::Listening {
+        &self.listening
     }
 
     /// **この往復のあいだ使い続ける上流の写し**（ADR-0052 §推奨3 / 作業単位 B-60b）。
@@ -888,6 +906,9 @@ pub struct App {
     llm: Arc<dyn LlmClient>,
     listener: TcpListener,
     local_addr: SocketAddr,
+    /// **待ち受けのポートが何から決まったか**（ADR-0057 §決定5 / `AppConfig::port_source`）。
+    /// `serve` が `GET /admin/server` へ渡す。
+    port_source: PortSource,
     /// **共有の予算と、まだ走り出していない引き直しを束ねたもの**（ADR-0020）。
     ///
     /// **予算と照会先を別々のフィールドで持たない。** 別々に持つと `serve` で
@@ -1715,6 +1736,8 @@ impl App {
             llm,
             listener,
             local_addr,
+            // **出どころは設定から**（実際の番号は `local_addr` / ADR-0057 §決定5）。
+            port_source: config.port_source(),
             ui,
             refresh,
             upstream,
@@ -1961,6 +1984,13 @@ impl App {
             self.local_addr.port(),
             self.selected_profile,
         ));
+        // **保存の置き場所は、差し替え・画面の保存と同じ1つの値から**（ADR-0057 §決定5 / `listening_port::memory_for`）。
+        // **番号は実際に開いた番号**（`local_addr`。設定値ではない）。
+        let listening = Arc::new(listening_port::Listening::new(
+            self.local_addr.port(),
+            self.port_source,
+            listening_port::memory_for(&self.profiles_file),
+        ));
         let profile_editor = Arc::new(profile_editor::ProfileEditor::new(self.profiles_file));
 
         // **抽出器はここで手元にも残す。** 停止時に走っている抽出を落とすため
@@ -1986,6 +2016,7 @@ impl App {
             uncountable: Arc::new(seal::UncountableMemory::default()),
             // **部品の数の記憶も空から始める**（ADR-0052 §推奨6。冷えた最初のターンが少し遅くなるだけ）。
             parts: Arc::new(counted_plan::PartMemory::default()),
+            listening,
         };
         let store = state.store.clone();
 
@@ -2087,6 +2118,16 @@ fn router(state: AppState, port: host_guard::ListeningPort) -> Router {
         .route(
             "/admin/upstream/profiles/{name}",
             put(profile_editor::save_profile),
+        )
+        // **personacore 自身の待ち受けのポート**（ADR-0057 §決定5・6 / 作業単位 F-12a）。
+        //
+        // **上流の口（`/admin/upstream`）に混ぜない**——推論サーバの話と、personacore 自身の待ち受けの話を分ける。
+        // **書く口は `PUT .../port` の1本だけ**で、保存は次の起動から効く（待ち受けは移さない）。
+        // **この `router` に足す**（`host_guard` を通る。設定を書く口なので DNS rebinding の検査が守る経路そのもの）。
+        .route("/admin/server", get(listening_port::get_server))
+        .route(
+            "/admin/server/port",
+            put(listening_port::save_listening_port),
         )
         // 管理 API。**`memory` を消す・書き換える経路はここに生やさない**
         // （ADR-0022 / `admin` の doc）。**生えているのは下の2本だけ**——

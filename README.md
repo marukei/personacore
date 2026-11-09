@@ -81,6 +81,9 @@ pwsh ./scripts/start.ps1
 （順に「別のポートで立てる」「画面を作り直さない」）。**残りの引数・DB の置き場所・
 上流が落ちているときの振る舞いは [scripts/README-start.md](scripts/README-start.md)**（ここに写さない）。
 
+待ち受けのポートは、**環境変数 `PERSONACORE_PORT` → 画面の「設定」で保存した番号 → 既定**の順で決まる
+（保存した番号は次の起動から効く。`-Port` は `PERSONACORE_PORT` に入る）。
+
 > **既定のポートは写していない。** 値は `src/server/config.rs` の `DEFAULT_PORT` にある。
 > markdown は Rust のソースを読めないので、**写す代わりに書かない**ことで揃えてある。
 

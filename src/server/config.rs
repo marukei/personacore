@@ -462,6 +462,101 @@ pub fn port_in_use_message(port: u16) -> String {
     )
 }
 
+/// **画面で保存できる待ち受けのポートの下端**（[ADR-0057](../../docs/adr/0057-the-listening-port-shifts-when-taken-and-is-set-from-the-screen.md) §決定5）。
+///
+/// **上端は `u16::MAX`（65535）。** `0`（OS に選ばせる）と特権ポートは保存できない ——
+/// `0` は開発とテストのための値で、起動のたびに番号が変わる。
+pub const SAVED_PORT_MIN: u16 = 1024;
+
+/// **画面で保存した待ち受けのポート**（1024〜65535 / ADR-0057 §決定5）。
+///
+/// **範囲の外の値は作れない**（唯一の構築子が [`Self::new`]）。保存のファイルの読み
+/// （`listening_port::parse_saved_port`）も、保存の口（`PUT /admin/server/port`）も、ここを通る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SavedPort(u16);
+
+impl SavedPort {
+    /// **範囲（[`SAVED_PORT_MIN`]〜65535）の中なら作る。** 外なら `None`。
+    #[must_use]
+    pub const fn new(port: u16) -> Option<Self> {
+        if port >= SAVED_PORT_MIN {
+            Some(Self(port))
+        } else {
+            None
+        }
+    }
+
+    /// **整数から作る**（保存の口の本文は範囲の外の値も負の値も受けてから断る）。**純粋関数。**
+    #[must_use]
+    pub fn from_integer(value: i64) -> Option<Self> {
+        u16::try_from(value).ok().and_then(Self::new)
+    }
+
+    /// 番号。
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+/// **待ち受けのポートが何から決まったか**（ADR-0057 §決定1・5）。
+///
+/// 効く順は [`ENV_PORT`] → 保存した番号 → [`DEFAULT_PORT`]（[`resolve_port`]）。
+/// **F-11 が「明示か」（ずらすか）を見分けるのも、`GET /admin/server` が言うのもこれ。**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortSource {
+    /// [`ENV_PORT`]（明示）。
+    Environment,
+    /// 画面で保存した番号（`listening-port.txt`）。
+    Saved,
+    /// [`DEFAULT_PORT`]。
+    Default,
+}
+
+impl PortSource {
+    /// **全部の値**（仕様書の `enum` を作る / 網羅は `label` の `match` が強制する）。
+    pub const ALL: [Self; 3] = [Self::Environment, Self::Saved, Self::Default];
+
+    /// **線の上の綴り**（`GET /admin/server` の欄と、起動ログの `bind_from`）。
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Environment => "environment",
+            Self::Saved => "saved",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// **待ち受けのポートを効く順で決める。純粋関数**（ADR-0057 §決定5）。
+///
+/// | 順 | どこから | 出どころ |
+/// |---|---|---|
+/// | 1 | [`ENV_PORT`]（`environment` に渡された綴り。前後の空白は落とす） | [`PortSource::Environment`] |
+/// | 2 | 保存した番号（`saved`） | [`PortSource::Saved`] |
+/// | 3 | [`DEFAULT_PORT`] | [`PortSource::Default`] |
+///
+/// **起動時の設定（[`AppConfig`]）と、`GET /admin/server` の「次の起動で使う番号」が同じ関数を通る**
+/// （判定の写しを作らない）。
+///
+/// # Errors
+///
+/// [`ENV_PORT`] がポート番号として読めないとき（[`ConfigError::Port`]）。**保存した番号へは落とさない**
+/// ——明示した値の誤りは、今までどおり起動を止める。
+pub fn resolve_port(
+    environment: Option<&str>,
+    saved: Option<SavedPort>,
+) -> Result<(u16, PortSource), ConfigError> {
+    if let Some(raw) = environment {
+        let port = raw.trim().parse::<u16>().map_err(|_| ConfigError::Port)?;
+        return Ok((port, PortSource::Environment));
+    }
+    Ok(match saved {
+        Some(saved) => (saved.get(), PortSource::Saved),
+        None => (DEFAULT_PORT, PortSource::Default),
+    })
+}
+
 /// [`ENV_STAT_DRIFT`] を on と読む綴り。**閉じた語彙**（小文字に畳んでから照合する）。
 const STAT_DRIFT_ON: [&str; 4] = ["1", "true", "on", "yes"];
 
@@ -762,6 +857,11 @@ impl ProfileContext {
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     bind: BindAddr,
+    /// **待ち受けのポートが何から決まったか**（ADR-0057 §決定5 / [`resolve_port`]）。
+    ///
+    /// **[`Self::with_bind`] では変わらない**（テストがエフェメラルポートへ差し替える入口で、
+    /// 出どころの話はしない）。
+    port_source: PortSource,
     database_path: PathBuf,
     /// **UI をディスクから配るなら、その配り先**（ADR-0041 §決定2 / [`ENV_WEB_DIR`]）。
     ///
@@ -962,8 +1062,11 @@ pub(in crate::server) fn retarget_llm(
 
 impl AppConfig {
     /// プロセスの環境変数から組み立てる。**環境に触るのはここだけ。**
-    pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_lookup(|key| std::env::var(key).ok())
+    ///
+    /// **`saved_port` は画面で保存した待ち受けのポート**（ADR-0057 §決定5。読むのは `main` で、
+    /// 既定の置き場所のときだけ）。**引数で受ける**ので、渡し忘れる呼び出しは書けない。
+    pub fn from_env(saved_port: Option<SavedPort>) -> Result<Self, ConfigError> {
+        Self::from_lookup_with_saved_port(|key| std::env::var(key).ok(), saved_port)
     }
 
     /// 参照関数から組み立てる。未設定（`None`）の項目は既定値。
@@ -992,12 +1095,39 @@ impl AppConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let port = match lookup(ENV_PORT) {
-            // **アドレスではなくポートだけを読む。** `0.0.0.0:8080` のような値は
-            // 数値として読めないので、ここで弾かれる。
-            Some(raw) => raw.trim().parse::<u16>().map_err(|_| ConfigError::Port)?,
-            None => DEFAULT_PORT,
-        };
+        Self::from_lookup_with_data_dir_and_saved_port(lookup, data_dir, None)
+    }
+
+    /// **画面で保存した待ち受けのポートも渡して組み立てる**（ADR-0057 §決定5 / 作業単位 F-12a）。
+    ///
+    /// `main` は環境変数の既定の経路（[`Self::from_env`]）とプロファイル経由の経路（`config_for`）の
+    /// **両方でここ（の `os_data_dir` 版）を通る**——入口を増やさない（ADR-0042 §決定1）。
+    /// **保存した番号を [`ENV_PORT`] の値として混ぜない**（混ぜると出どころが `environment` になる）。
+    pub fn from_lookup_with_saved_port<F>(
+        lookup: F,
+        saved_port: Option<SavedPort>,
+    ) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        Self::from_lookup_with_data_dir_and_saved_port(lookup, os_data_dir(), saved_port)
+    }
+
+    /// **組み立ての本体。純粋関数。**
+    ///
+    /// `data_dir` は [`Self::from_lookup_with_data_dir`]、`saved_port` は
+    /// [`Self::from_lookup_with_saved_port`] の doc。**待ち受けのポートは [`resolve_port`] が決める。**
+    pub fn from_lookup_with_data_dir_and_saved_port<F>(
+        lookup: F,
+        data_dir: Option<PathBuf>,
+        saved_port: Option<SavedPort>,
+    ) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        // **アドレスではなくポートだけを読む。** `0.0.0.0:8080` のような値は
+        // 数値として読めないので、ここで弾かれる（[`resolve_port`]）。
+        let (port, port_source) = resolve_port(lookup(ENV_PORT).as_deref(), saved_port)?;
 
         // **未設定なら OS の作法の場所**（ADR-0041 §決定3）。
         // **カレントディレクトリへは落とさない**——決められなければ止める。
@@ -1129,6 +1259,7 @@ impl AppConfig {
 
         Ok(Self {
             bind: BindAddr::loopback(port),
+            port_source,
             database_path,
             web_dir,
             llm,
@@ -1146,6 +1277,8 @@ impl AppConfig {
     }
 
     /// 待ち受けアドレスを差し替える（テストのエフェメラルポート指定など）。
+    ///
+    /// **出どころ（[`Self::port_source`]）は変えない。**
     #[must_use]
     pub fn with_bind(mut self, bind: BindAddr) -> Self {
         self.bind = bind;
@@ -1233,6 +1366,12 @@ impl AppConfig {
     #[must_use]
     pub const fn bind(&self) -> BindAddr {
         self.bind
+    }
+
+    /// **待ち受けのポートが何から決まったか**（ADR-0057 §決定5）。
+    #[must_use]
+    pub const fn port_source(&self) -> PortSource {
+        self.port_source
     }
 
     /// SQLite ファイルのパス。
@@ -1757,6 +1896,155 @@ mod tests {
             config.llm().model().as_str(),
             "前提: 2つの設定に別の値を与えていること"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // 待ち受けのポートの効く順と出どころ（ADR-0057 §決定5 / 作業単位 F-12a）
+    // ------------------------------------------------------------------
+
+    /// 環境変数に書く番号。**保存の番号とも既定とも違う。**
+    const ENV_PORT_VALUE: u16 = 9101;
+
+    /// 保存した番号。**環境変数の番号とも既定とも違う。**
+    const SAVED_PORT_VALUE: u16 = 9202;
+
+    fn saved() -> SavedPort {
+        SavedPort::new(SAVED_PORT_VALUE).expect("前提: 範囲の中の番号であること")
+    }
+
+    /// **フィクスチャの3つの番号は全部違う**（同じだと取り違えが観測できない）。
+    #[test]
+    fn the_three_port_fixtures_differ() {
+        assert_ne!(ENV_PORT_VALUE, SAVED_PORT_VALUE);
+        assert_ne!(ENV_PORT_VALUE, DEFAULT_PORT);
+        assert_ne!(SAVED_PORT_VALUE, DEFAULT_PORT);
+    }
+
+    /// **効く順は 環境変数 → 保存 → 既定**（純粋関数の表）。
+    #[test]
+    fn the_port_comes_from_the_environment_then_the_saved_value_then_the_default() {
+        let env = ENV_PORT_VALUE.to_string();
+        assert_eq!(
+            resolve_port(Some(&env), Some(saved())).ok(),
+            Some((ENV_PORT_VALUE, PortSource::Environment)),
+            "環境変数が保存に勝つこと"
+        );
+        assert_eq!(
+            resolve_port(Some(&env), None).ok(),
+            Some((ENV_PORT_VALUE, PortSource::Environment))
+        );
+        assert_eq!(
+            resolve_port(None, Some(saved())).ok(),
+            Some((SAVED_PORT_VALUE, PortSource::Saved)),
+            "保存が既定に勝つこと"
+        );
+        assert_eq!(
+            resolve_port(None, None).ok(),
+            Some((DEFAULT_PORT, PortSource::Default))
+        );
+        // **前後の空白は落とす**（今までの `PERSONACORE_PORT` の読み方と同じ）。
+        assert_eq!(
+            resolve_port(Some(" 9101\t"), Some(saved())).ok(),
+            Some((ENV_PORT_VALUE, PortSource::Environment))
+        );
+        // **`0`（OS に選ばせる）は今までどおり環境変数の値として通る。**
+        assert_eq!(
+            resolve_port(Some("0"), Some(saved())).ok(),
+            Some((0, PortSource::Environment))
+        );
+    }
+
+    /// **読めない環境変数は、保存へ落ちずに止まる**（明示の誤りは今までどおり起動を止める）。
+    #[test]
+    fn an_unreadable_environment_port_stops_instead_of_falling_to_the_saved_value() {
+        for raw in ["", "abc", "65536", "-1", "0.0.0.0:8080"] {
+            assert!(
+                matches!(
+                    resolve_port(Some(raw), Some(saved())),
+                    Err(ConfigError::Port)
+                ),
+                "{raw:?} を通している"
+            );
+        }
+    }
+
+    /// **保存した番号は 1024〜65535 だけ**（ADR-0057 §決定5）。上端・下端の内外を見る。
+    #[test]
+    fn a_saved_port_is_only_from_1024_to_65535() {
+        assert_eq!(SavedPort::new(0), None);
+        assert_eq!(SavedPort::new(1023), None);
+        assert_eq!(SavedPort::new(1024).map(SavedPort::get), Some(1024));
+        assert_eq!(SavedPort::new(65535).map(SavedPort::get), Some(65535));
+        for (value, expected) in [
+            (-1_i64, None),
+            (0, None),
+            (1023, None),
+            (1024, Some(1024_u16)),
+            (65535, Some(65535)),
+            (65536, None),
+            (i64::MAX, None),
+            (i64::MIN, None),
+        ] {
+            assert_eq!(
+                SavedPort::from_integer(value).map(SavedPort::get),
+                expected,
+                "{value}"
+            );
+        }
+    }
+
+    /// **出どころの綴り**（関数の外の値で押さえる / 線の上の綴り）。
+    #[test]
+    fn the_port_source_labels_are_the_spellings_on_the_wire() {
+        assert_eq!(
+            PortSource::ALL.map(PortSource::label),
+            ["environment", "saved", "default"]
+        );
+    }
+
+    fn config_with_saved(
+        pairs: &[(&str, &str)],
+        saved: Option<SavedPort>,
+    ) -> Result<AppConfig, ConfigError> {
+        AppConfig::from_lookup_with_data_dir_and_saved_port(
+            lookup_of(pairs),
+            Some(PathBuf::from(PLANTED_DATA_DIR)),
+            saved,
+        )
+    }
+
+    /// **保存した番号は `from_lookup` 系の同じ入口から入り、出どころと一緒に `AppConfig` に載る。**
+    ///
+    /// **`PERSONACORE_PORT` の値として混ぜない**——混ぜると出どころが `environment` になる。
+    #[test]
+    fn the_saved_port_enters_through_the_same_door_and_keeps_its_source() {
+        let env = ENV_PORT_VALUE.to_string();
+
+        let both = config_with_saved(&[(ENV_PORT, &env)], Some(saved())).expect("組めること");
+        assert_eq!(both.bind(), BindAddr::loopback(ENV_PORT_VALUE));
+        assert_eq!(both.port_source(), PortSource::Environment);
+
+        let only_saved = config_with_saved(&[], Some(saved())).expect("組めること");
+        assert_eq!(only_saved.bind(), BindAddr::loopback(SAVED_PORT_VALUE));
+        assert_eq!(only_saved.port_source(), PortSource::Saved);
+
+        let neither = config_with_saved(&[], None).expect("組めること");
+        assert_eq!(neither.bind(), BindAddr::loopback(DEFAULT_PORT));
+        assert_eq!(neither.port_source(), PortSource::Default);
+
+        // **保存を渡さない入口は今までどおり**（出どころも言う）。
+        let plain = config_of(&[(ENV_PORT, &env)]).expect("組めること");
+        assert_eq!(plain.port_source(), PortSource::Environment);
+        assert_eq!(
+            config_of(&[]).expect("組めること").port_source(),
+            PortSource::Default
+        );
+
+        // **読めない環境変数は、保存があっても止まる。**
+        assert!(matches!(
+            config_with_saved(&[(ENV_PORT, "abc")], Some(saved())),
+            Err(ConfigError::Port)
+        ));
     }
 
     /// **抽出モデルの既定は本文モデルの既定と同じ綴り**（ADR-0021 §10 / 2026-08-21 の実測）。

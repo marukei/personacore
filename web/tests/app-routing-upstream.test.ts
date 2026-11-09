@@ -196,6 +196,8 @@ it("ナビから辿れる（並び順ごと固定する）", async () => {
     { href: "#/chat", text: "会話" },
     { href: "#/characters", text: "キャラクター" },
     { href: UPSTREAM_HREF, text: UPSTREAM_LABEL },
+    // **作業単位 F-12b で「設定」が最後に並んだ**（`tests/app-routing-settings.test.ts`）。
+    { href: "#/settings", text: "設定" },
   ]);
 
   await unmount(view, { outro: false });

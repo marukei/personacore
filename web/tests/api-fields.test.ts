@@ -82,7 +82,7 @@
  * | 向き | 省略可の条件 |
  * |---|---|
  * | 応答（`Serialize`） | **`skip_serializing_if` だけ。** `Option<T>` は `null` として必ず載る（だから `MemoryView::category` は `category: string \| null` であって `category?` ではない） |
- * | 要求（`Deserialize`） | **`#[serde(default)]` があるか、型が `Option<…>` か、のどちらか** |
+ * | 要求（`Deserialize`） | **`#[serde(default)]` があるか、型が `Option<…>` か、のどちらか**（**`deserialize_with` を付けた `Option<…>` は、`default` が無ければ省けない** / 作業単位 F-12b） |
  *
  * > **⚠ 要求側の「どちらか」は、`default` の綴りだけを見ていた版の訂正である**
  * > （B-18 のレビューが `serde` だけの小さなクレートで実測）。
@@ -255,6 +255,16 @@ const PROFILE_EDITOR_REQUEST_ONLY = [] as const;
 /** **写し元が `src/server/switch.rs` のもの**（`POST /admin/upstream/profile`）。 */
 const SWITCH_MIRRORED = ["SwitchRequest"] as const;
 
+/**
+ * **写し元が `src/server/listening_port.rs` のもの**（作業単位 F-12b / `GET /admin/server` / `PUT /admin/server/port`）。
+ *
+ * **ずれると「設定」の画面の行が `undefined` を出し、保存が 400 で断られる**
+ * （依頼の `SavePortRequest` は `deny_unknown_fields`）。
+ * **`SavePortRequest.port` は `Option` なのに省けない**（`deserialize_with` が付いている）——
+ * その読み方は `./support/rust-wire` の要求側の判定と、下の植えたソースの対照が持つ。
+ */
+const LISTENING_PORT_MIRRORED = ["ServerView", "SavePortView", "SavePortRequest"] as const;
+
 /** `api.ts` にあるが、写し元が `admin.rs` ではないもの。 */
 const FE_ONLY = ["ErrorBody", "ApiErrorDetail"] as const;
 
@@ -275,6 +285,11 @@ const PROFILE_EDITOR_RS = readFileSync(
 
 const SWITCH_RS = readFileSync(
   fileURLToPath(new URL("../../src/server/switch.rs", import.meta.url)),
+  "utf8",
+);
+
+const LISTENING_PORT_RS = readFileSync(
+  fileURLToPath(new URL("../../src/server/listening_port.rs", import.meta.url)),
   "utf8",
 );
 
@@ -314,6 +329,7 @@ describe("欄名は写し元と一致する", () => {
         ...UPSTREAM_MIRRORED,
         ...PROFILE_EDITOR_MIRRORED,
         ...SWITCH_MIRRORED,
+        ...LISTENING_PORT_MIRRORED,
         ...FE_ONLY,
       ]),
     );
@@ -482,6 +498,46 @@ describe("上流プロファイルの欄名は写し元と一致する（`profil
 });
 
 /**
+ * **待ち受けのポートの欄名も写しである**（作業単位 F-12b / `src/server/listening_port.rs`）。
+ *
+ * **走査は同じ関数**（`./support/rust-wire`）。広げたのはこの1ファイルだけ。
+ * **`SavePortView` は `ServerView` を `flatten` する** —— 写しの側は `extends` で同じ形にしてある。
+ */
+describe("待ち受けのポートの欄名は写し元と一致する（`listening_port.rs`）", () => {
+  it.each(LISTENING_PORT_MIRRORED)("`%s` の欄が `listening_port.rs` と一致する", (name) => {
+    expect(labelsOf(tsFieldsOf(API_TS, name))).toEqual(
+      labelsOf(rustFieldsOf(LISTENING_PORT_RS, name)),
+    );
+  });
+
+  /** **一覧が痩せたら赤くなる。** `serde` を通る構造体が増えた日に「写すか」を1回通る。 */
+  it("`listening_port.rs` の `serde` を通る構造体を1つ残らず分類してある", () => {
+    expect(new Set(rustStructNamesOf(LISTENING_PORT_RS))).toEqual(
+      new Set<string>(LISTENING_PORT_MIRRORED),
+    );
+  });
+
+  /**
+   * **対照: 実ファイルの上で、省けない `port` と、`flatten` で混ざる欄を読んでいる。**
+   *
+   * **期待値はここに直書きする**（走査の出力から作らない）。
+   */
+  it("対照: `port` は省けず、`SavePortView` は `ServerView` の欄に1つ足した形", () => {
+    expect(labelsOf(rustFieldsOf(LISTENING_PORT_RS, "SavePortRequest"))).toEqual(["port"]);
+    expect(labelsOf(rustFieldsOf(LISTENING_PORT_RS, "SavePortView"))).toEqual([
+      "editable",
+      "listening_port",
+      "listening_port_source",
+      "next_port",
+      "next_port_source",
+      "saved_port",
+      "saved_port_in_use",
+      "saved_port_unreadable",
+    ]);
+  });
+});
+
+/**
  * **`?` のキーの綴りも写しである**（`admin.rs` の `MemoryListQuery`）。
  *
  * # ⚠ **`?include=` の値の見張り番では届かない**
@@ -630,6 +686,36 @@ describe("Rust 側の走査（植えたソースを通す）", () => {
       "bare_option?",
       "optional?",
       "required",
+    ]);
+  });
+
+  /**
+   * **`deserialize_with` を付けた `Option<…>` は、`default` が無ければ省けない**（作業単位 F-12b）。
+   *
+   * `serde` が `Option<T>` の欠落を `None` として受けるのは、**読み方を差し替えていないときだけ**
+   * （`deserialize_with` があると、欠落は「欄が無い」で断られる）。
+   * `listening_port.rs` の `SavePortRequest.port` がこの形 ——**省いた本文を「消す」と読まないため**に、
+   * わざと省けなくしてある。**型だけを見ていると、写しに `port?` と書く経路ができる**
+   * （省いた本文は 400 で断られるのに、写しは省けると言う）。
+   */
+  it("`deserialize_with` を付けた `Option<…>` は、`default` が無ければ省けない", () => {
+    const planted = [
+      "#[derive(Debug, Deserialize)]",
+      "#[serde(deny_unknown_fields)]",
+      "pub(crate) struct Planted {",
+      '    #[serde(deserialize_with = "Option::deserialize")]',
+      "    #[schema(required = true, minimum = 1024, maximum = 65535)]",
+      "    present: Option<i64>,",
+      '    #[serde(default, deserialize_with = "somewhere")]',
+      "    omittable: Option<i64>,",
+      "    bare_option: Option<u32>,",
+      "}",
+    ].join("\n");
+
+    expect(labelsOf(rustFieldsOf(planted, "Planted"))).toEqual([
+      "bare_option?",
+      "omittable?",
+      "present",
     ]);
   });
 

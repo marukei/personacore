@@ -1284,6 +1284,50 @@ impl ApiError {
         }
     }
 
+    // ------------------------------------------------------------------
+    // 待ち受けのポートの保存（`PUT /admin/server/port` / ADR-0057 §決定5・6 / 作業単位 F-12a）
+    //
+    // **どれもパスも番号も載せない。** 置き場所と原因はログにだけ出す（`listening_port`）。
+    // ------------------------------------------------------------------
+
+    /// **保存できる範囲（1024〜65535）の外**（`0` と負の値を含む）。
+    ///
+    /// 400 なのは、数の範囲の誤りに 400 を返す先例 [`Self::invalid_max_tokens`] に倣う（ADR-0057 §決定6）。
+    /// **`invalid_body` に潰さない**——本文は読めていて、直すのは番号である。
+    #[must_use]
+    pub const fn invalid_listening_port() -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: "待ち受けのポートには 1024〜65535 の番号を指定してください",
+            kind: "invalid_request_error",
+            code: Some("invalid_listening_port"),
+        }
+    }
+
+    /// **この起動では待ち受けのポートを保存できない**（`PERSONACORE_UPSTREAMS` が別の場所を指している／置き場所が無い）。
+    ///
+    /// 409 なのは [`Self::upstream_profiles_read_only`] に倣う（要求は正しいが、この起動の状態と衝突する）。
+    #[must_use]
+    pub const fn listening_port_read_only() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: "この起動では待ち受けのポートを保存できません",
+            kind: "invalid_request_error",
+            code: Some("listening_port_read_only"),
+        }
+    }
+
+    /// **保存のファイルを書き換えられなかった**（書けない・消せない）。**前の中身は残っている。**
+    #[must_use]
+    pub const fn listening_port_write_failed() -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "待ち受けのポートの保存を書き換えられませんでした（前の中身は残っています）",
+            kind: "server_error",
+            code: Some("listening_port_write_failed"),
+        }
+    }
+
     /// **`Host` / `Origin` がこのサーバのものではない要求**（作業単位 B-58 / `host_guard` モジュール）。
     ///
     /// **届いた `Host` / `Origin` を反射しない**（ログにだけ出す / `host_guard::refuse`）。
@@ -1656,6 +1700,9 @@ pub fn error_catalog() -> Vec<(&'static str, ErrorShape)> {
     entry!(upstream_profile_invalid);
     entry!(upstream_profiles_write_failed);
     entry!(upstream_profiles_verify_failed);
+    entry!(invalid_listening_port);
+    entry!(listening_port_read_only);
+    entry!(listening_port_write_failed);
     entry!(request_origin_not_allowed);
     out
 }
@@ -1990,6 +2037,53 @@ mod tests {
                 "{error:?}"
             );
         }
+    }
+
+    /// **待ち受けのポートの保存の拒否は、互いにも、先例の拒否とも区別でき、状態は先例に倣う**
+    /// （ADR-0057 §決定6 / 作業単位 F-12a）。
+    ///
+    /// **先例（`invalid_max_tokens` / `upstream_profiles_read_only`）と同じ応答に潰さない**——
+    /// 状態は同じでも `code` で分かれること。
+    #[test]
+    fn listening_port_errors_are_distinguishable_and_follow_their_precedents() {
+        let port = [
+            ApiError::invalid_listening_port(),
+            ApiError::listening_port_read_only(),
+            ApiError::listening_port_write_failed(),
+        ];
+        let others = [
+            ApiError::invalid_body(),
+            ApiError::invalid_max_tokens(),
+            ApiError::upstream_profiles_read_only(),
+            ApiError::upstream_profiles_write_failed(),
+            ApiError::internal(),
+        ];
+        for (i, left) in port.iter().enumerate() {
+            for right in port[i + 1..].iter().chain(others.iter()) {
+                assert_ne!(left.code, right.code, "{left:?} / {right:?}");
+                assert_ne!(left.message, right.message, "{left:?} / {right:?}");
+            }
+        }
+        assert_eq!(
+            ApiError::invalid_listening_port().status(),
+            ApiError::invalid_max_tokens().status()
+        );
+        assert_eq!(
+            ApiError::invalid_listening_port().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ApiError::listening_port_read_only().status(),
+            ApiError::upstream_profiles_read_only().status()
+        );
+        assert_eq!(
+            ApiError::listening_port_read_only().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            ApiError::listening_port_write_failed().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     /// **属性のエラーは、対応する性格ステータスのエラーと別物**（作業単位 12a）。
