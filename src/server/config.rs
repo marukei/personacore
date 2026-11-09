@@ -446,6 +446,22 @@ pub const ENV_AXIS_TRIAL_LINE_PERCENT: &str = "PERSONACORE_AXIS_TRIAL_LINE_PERCE
 /// 既定の待ち受けポート。
 pub const DEFAULT_PORT: u16 = 8080;
 
+/// **待ち受けのポートを他のプログラムが使っていたときに、利用者へ言う文**
+/// （作業単位 B-76 / marukei/personacore#13）。
+///
+/// **ポートの番号と、[`ENV_PORT`] で変えられることを言う。** OS の文（`os error 10048` 等）だけでは、
+/// 何が何と重なったのかも、どう直すのかも分からない。
+///
+/// **エラー型の `Display` ではない**——`main` が `anyhow` の文脈として足す
+/// （`ServerError` の `Display` は定数文字列のまま / `ServerError::is_port_in_use`）。
+/// 配布物の README がこの文を [`DEFAULT_PORT`] で写している（`tests/distribution.rs` が突き合わせる）。
+pub fn port_in_use_message(port: u16) -> String {
+    format!(
+        "ポート {port} は他のプログラムが使っています。\
+         環境変数 {ENV_PORT} で別のポートを指定して起動し直してください"
+    )
+}
+
 /// [`ENV_STAT_DRIFT`] を on と読む綴り。**閉じた語彙**（小文字に畳んでから照合する）。
 const STAT_DRIFT_ON: [&str; 4] = ["1", "true", "on", "yes"];
 

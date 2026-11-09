@@ -41,6 +41,7 @@ mod body;
 mod browser;
 mod chat;
 mod config;
+mod console;
 mod context;
 mod counted_plan;
 mod drift;
@@ -83,8 +84,10 @@ pub use config::{
     ENV_DRIFT_DECAY, ENV_DRIFT_FORM, ENV_DRIFT_NOTE, ENV_DRIFT_SLOPE, ENV_DRIFT_STEP_COST,
     ENV_LLM_ENDPOINT, ENV_LLM_IDLE_TIMEOUT, ENV_MAIN_MODEL, ENV_PORT, ENV_STAT_DRIFT,
     ENV_SUB_LLM_ENDPOINT, ENV_SUB_MODEL, ENV_UPSTREAMS, ENV_WEB_DIR, database_path_under,
-    os_data_dir,
+    os_data_dir, port_in_use_message,
 };
+/// **起動に失敗したとき、ダブルクリックで開いた窓を理由と一緒に消さない**（作業単位 B-76 / `console` モジュール）。
+pub use console::{PRESS_ENTER_TO_CLOSE, wait_before_closing_if_alone};
 pub use error::ApiError;
 
 /// **失敗の応答の形の一覧**（API の形の指紋のため / 作業単位 O-7 / `error::error_catalog`）。
@@ -232,6 +235,20 @@ pub enum ServerError {
     /// こちらは「gguf が無い／`llama` が PATH に無い」——直す手がまるで違う。
     #[error("名指しされた上流を起こせませんでした")]
     Launch(#[source] launch::LaunchError),
+}
+
+impl ServerError {
+    /// **待ち受けのポートを、他のプログラムが使っていたので開けなかったか**
+    /// （作業単位 B-76 / marukei/personacore#13）。
+    ///
+    /// **`Display` は変えない**（定数文字列のまま）。ポートの番号と直し方を足すのは `main`
+    /// （[`port_in_use_message`]）で、**この判定が真のときだけ**足す——権限などの他の失敗の文は変わらない。
+    ///
+    /// Windows の `WSAEADDRINUSE`（10048）は、標準ライブラリが [`std::io::ErrorKind::AddrInUse`] に写す
+    /// （単体テストの `windows_reports_an_occupied_port_as_addr_in_use` が確かめる）。
+    pub fn is_port_in_use(&self) -> bool {
+        matches!(self, Self::Bind(source) if source.kind() == std::io::ErrorKind::AddrInUse)
+    }
 }
 
 /// ハンドラが共有する状態。
@@ -2861,5 +2878,88 @@ mod tests {
                 }
             })
             .sum()
+    }
+
+    // ------------------------------------------------------------------
+    // 使用中のポート（作業単位 B-76 / marukei/personacore#13）
+    // ------------------------------------------------------------------
+
+    /// **使用中と言うのは、待ち受けの失敗が `AddrInUse` のときだけ。**
+    ///
+    /// 権限（`PermissionDenied`）や、同じ kind でも待ち受け以外の失敗（`Serve`）には言わない
+    /// ——言うと「ポートを変えれば直る」と、違う直し方を案内する。
+    #[test]
+    fn only_a_bind_failure_of_kind_addr_in_use_is_reported_as_port_in_use() {
+        use std::io::{Error, ErrorKind};
+
+        let cases = [
+            (
+                ServerError::Bind(Error::from(ErrorKind::AddrInUse)),
+                true,
+                "待ち受け・使用中",
+            ),
+            (
+                ServerError::Bind(Error::from(ErrorKind::PermissionDenied)),
+                false,
+                "待ち受け・権限",
+            ),
+            (
+                ServerError::Bind(Error::from(ErrorKind::AddrNotAvailable)),
+                false,
+                "待ち受け・使えないアドレス",
+            ),
+            (
+                ServerError::Serve(Error::from(ErrorKind::AddrInUse)),
+                false,
+                "実行中の失敗（kind は同じ）",
+            ),
+            (
+                ServerError::DatabaseDir(Error::from(ErrorKind::AddrInUse)),
+                false,
+                "DB の置き場所（kind は同じ）",
+            ),
+        ];
+        for (err, expected, what) in cases {
+            assert_eq!(err.is_port_in_use(), expected, "{what}: {err:?}");
+        }
+    }
+
+    /// **Windows の `WSAEADDRINUSE`（10048）は `AddrInUse` に写る**（実際に出る os error の番号）。
+    #[cfg(windows)]
+    #[test]
+    fn windows_reports_an_occupied_port_as_addr_in_use() {
+        let err = ServerError::Bind(std::io::Error::from_raw_os_error(10048));
+        assert!(err.is_port_in_use(), "{err:?}");
+    }
+
+    /// **本物の待ち受けを2つ重ねると、使用中と判定される**（この OS の実際の失敗の形）。
+    #[tokio::test]
+    async fn binding_an_occupied_port_is_reported_as_port_in_use() {
+        let held = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ポートを取れること");
+        let addr = held.local_addr().expect("宛先を読めること");
+        let source = TcpListener::bind(addr)
+            .await
+            .expect_err("使用中のポートは開けないこと");
+        let err = ServerError::Bind(source);
+        assert!(err.is_port_in_use(), "{err:?}");
+    }
+
+    /// **文はポートの番号と、変える環境変数の名前を言う。** 期待の綴りは定数から作らない。
+    #[test]
+    fn the_port_in_use_message_names_the_port_and_the_setting() {
+        assert_eq!(
+            port_in_use_message(18_093),
+            "ポート 18093 は他のプログラムが使っています。\
+             環境変数 PERSONACORE_PORT で別のポートを指定して起動し直してください"
+        );
+    }
+
+    /// **`Display` は定数のまま**（ポートの番号を載せない / CLAUDE.md「エラー型の `Display` は定数文字列」）。
+    #[test]
+    fn a_port_in_use_keeps_the_constant_display() {
+        let err = ServerError::Bind(std::io::Error::from(std::io::ErrorKind::AddrInUse));
+        assert_eq!(err.to_string(), "待ち受けアドレスを開けませんでした");
     }
 }

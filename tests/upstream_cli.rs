@@ -58,7 +58,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use common::has_field;
-use personacore::server::API_VERSION;
+use personacore::server::{API_VERSION, PRESS_ENTER_TO_CLOSE};
 
 /// **API の版のヘッダの名前**（司令塔の決定の綴り / ADR-0047 §② P-2b）。定数から作らない。
 const API_VERSION_HEADER: &str = "X-Personacore-Api-Version";
@@ -3484,5 +3484,149 @@ fn without_the_no_ui_flag_a_missing_web_dir_is_still_warned_about() {
         !lines.iter().any(|line| line.contains(NO_UI_LINE_COPY)),
         "旗なしなのに「画面は配りません」と言っている\n{}",
         lines.join("\n")
+    );
+}
+
+// ----------------------------------------------------------------------
+// 使用中のポート（作業単位 B-76 / marukei/personacore#13）
+// ----------------------------------------------------------------------
+
+/// **使用中のときに言う文の頭**（`server::port_in_use_message` の写し。**定数から作らない**）。
+///
+/// 写しが古びると「言っていない」で赤になる（言う側の腕しか無いので、空振りは赤の側に倒れる）。
+const PORT_IN_USE_COPY: &str = "は他のプログラムが使っています";
+
+/// **使用中のポートの節で起こした personacore。**
+///
+/// **標準入力はパイプにして、開いたまま何も書かない**——読みに行けば返らない形にする。
+/// **`Stdio::null()` にしない**: null は読むとすぐ EOF を返すので、「常に待つ」実装でも終わってしまい、
+/// 「待たない」を観測できない。
+struct OnPort {
+    started: Started,
+    stdin: Option<std::process::ChildStdin>,
+    stderr: std::thread::JoinHandle<String>,
+}
+
+impl OnPort {
+    /// **止めて（生きていれば kill）、標準エラーを全部読む。**
+    fn finish(self) -> String {
+        let OnPort {
+            started,
+            stdin,
+            stderr,
+        } = self;
+        drop(started);
+        drop(stdin);
+        stderr.join().expect("標準エラーを読むスレッドが終わること")
+    }
+}
+
+/// **`port` で待ち受けさせて起こす。** 上流・DB・置き場所は全部隔離する（本物の llama を起こさない）。
+fn spawn_on_port(root: &Path, port: &str) -> OnPort {
+    let mut command = without_inherited_settings();
+    isolate_machine(&mut command, root);
+    command
+        .args(["--no-ui", "--no-browser"])
+        .env("PERSONACORE_DB_PATH", root.join("personacore.sqlite"))
+        // **存在しないファイルを指す**——既定の置き場所へ見本を書かせず、覚えた名前も読ませない。
+        .env("PERSONACORE_UPSTREAMS", root.join("no-such-upstreams.json"))
+        .env("PERSONACORE_PORT", port)
+        .env("PERSONACORE_LLM_ENDPOINT", DECOY_ENDPOINT)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().expect("実行ファイルを起こせること");
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take().expect("標準出力を取れること");
+    let stderr = child.stderr.take().expect("標準エラーを取れること");
+    let (sender, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let stderr = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut BufReader::new(stderr), &mut text);
+        text
+    });
+    OnPort {
+        started: Started {
+            running: Running(child),
+            lines,
+        },
+        stdin,
+        stderr,
+    }
+}
+
+/// **他のプログラムが待ち受けているポートで起こすと、番号と `PERSONACORE_PORT` を言って、待たずに止まる**
+/// （作業単位 B-76 / marukei/personacore#13 の閉じる条件1・2）。
+///
+/// | 主張 | 破れると |
+/// |---|---|
+/// | 0 以外で終わる | 黙って起動したように見える |
+/// | **標準エラーがポートの番号を言う** | 何が何と重なったのか分からない |
+/// | **標準エラーが `PERSONACORE_PORT` を言う** | 直し方が分からない |
+/// | OS の文に至る鎖（`待ち受けアドレスを開けませんでした`）が残る | 調べる手掛かりが消える |
+/// | **上限つきで終わる・Enter を待つと言わない** | 標準入力が端末でないのに待つ（テスト・CI が返らない） |
+///
+/// 対比は [`a_free_port_starts_without_the_port_in_use_message`]（同じ起こし方で、塞いでいないポート）。
+#[test]
+fn an_occupied_port_names_the_port_and_the_setting_and_never_waits() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
+    // **このテストが塞ぐ。** 利用者の 8080 には触らない（OS に選ばせる）。
+    let held = TcpListener::bind("127.0.0.1:0").expect("ポートを取れること");
+    let port = held.local_addr().expect("宛先を読めること").port();
+
+    let mut run = spawn_on_port(dir.path(), &port.to_string());
+    let status = run.started.running.wait_for_exit("使用中のポートでの起動");
+    let stderr = run.finish();
+    drop(held);
+
+    assert!(
+        !status.success(),
+        "使用中のポートなのに 0 で終わった（{status:?}）\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("ポート {port} {PORT_IN_USE_COPY}")),
+        "標準エラーがポートの番号 {port} を言っていない\n{stderr}"
+    );
+    assert!(
+        stderr.contains("PERSONACORE_PORT"),
+        "標準エラーが変え方（PERSONACORE_PORT）を言っていない\n{stderr}"
+    );
+    assert!(
+        stderr.contains("待ち受けアドレスを開けませんでした"),
+        "OS の文に至る鎖が消えている\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(PRESS_ENTER_TO_CLOSE),
+        "標準入力が端末でないのに、Enter を待つと言った\n{stderr}"
+    );
+}
+
+/// **対比: 塞いでいないポートでは、使用中の文を出さずに待ち受ける**（上の腕と同じ起こし方）。
+///
+/// 上の腕の赤が「起こし方が壊れていて、何をしても落ちる」から来ていないことを押さえる。
+#[test]
+fn a_free_port_starts_without_the_port_in_use_message() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
+
+    let mut run = spawn_on_port(dir.path(), "0");
+    let port = run.started.listening_port();
+    assert_ne!(port, 0, "実際に掴んだポートを言うこと");
+    assert!(
+        run.started.running.is_alive(),
+        "待ち受けを始めた後に終わっている"
+    );
+    let stderr = run.finish();
+
+    assert!(
+        !stderr.contains(PORT_IN_USE_COPY),
+        "塞いでいないポートで、使用中と言った\n{stderr}"
     );
 }

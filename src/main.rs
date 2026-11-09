@@ -9,17 +9,51 @@
 //! `ServerError` / `ConfigError` の `Display` は定数文字列なので、
 //! 詳細は `#[source]` 側（anyhow が `Caused by` として並べる）に出る。
 
+use std::process::ExitCode;
+
 use anyhow::Context;
 use personacore::llm::endpoint_for_log;
 use personacore::server::{
     App, AppConfig, Browser, ENV_UPSTREAMS, LaunchPlan, LaunchTiming, ProfileSettings,
-    SampleOutcome, Startup, Ui, UpstreamProfiles, VERSION_LINE, init_tracing, load_profiles,
-    overlay_profile, parse_args, read_remembered, remembered_path_beside, shutdown_signal,
-    upstreams_path_under, write_sample_if_missing,
+    SampleOutcome, ServerError, Startup, Ui, UpstreamProfiles, VERSION_LINE, init_tracing,
+    load_profiles, overlay_profile, parse_args, port_in_use_message, read_remembered,
+    remembered_path_beside, shutdown_signal, upstreams_path_under, wait_before_closing_if_alone,
+    write_sample_if_missing,
 };
 
+/// **失敗を言ってから、ダブルクリックで開いた窓なら Enter を待って終わる**（作業単位 B-76）。
+///
+/// 書き出しは標準ライブラリの `main` が `Result` を返したときと同じ形（`Error: {:?}` ＋ 終了コード 1）。
+/// **`eprintln!` を使わない**——標準エラーが閉じていると panic する（`--version` の doc と同じ）。
+/// **待つのは失敗の枝だけ。** 正常に終わったとき（Ctrl+C）は待たない。
+/// **実行時（tokio）を落とした後で待つ**——起こした子（`kill_on_drop`）を、待っている間に残さない。
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr().lock(), "Error: {err:?}");
+            wait_before_closing_if_alone();
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// **待ち受けを開けなかった理由が「他のプログラムが使っている」なら、番号と直し方を言う**
+/// （作業単位 B-76 / marukei/personacore#13）。
+///
+/// **それ以外の失敗の文は変えない**（今までどおり「サーバの実行に失敗しました」）。
+/// 見張り番は `tests/upstream_cli.rs` の `an_occupied_port_names_the_port_and_the_setting_and_never_waits`。
+fn explain_server_failure(err: ServerError, port: u16) -> anyhow::Error {
+    if err.is_port_in_use() {
+        anyhow::Error::new(err).context(port_in_use_message(port))
+    } else {
+        anyhow::Error::new(err).context("サーバの実行に失敗しました")
+    }
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<()> {
     // **引数はログより先に読む。** 綴り違いで止まる話に、起動ログは要らない。
     //
     // **`args_os` を使う**——`std::env::args()` は Unicode でない引数で **panic する**
@@ -189,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
     }
     App::run_with_upstreams(&config, startup.launch_timing(timing), shutdown_signal())
         .await
-        .context("サーバの実行に失敗しました")?;
+        .map_err(|err| explain_server_failure(err, config.bind().port()))?;
 
     tracing::info!("停止しました");
     Ok(())
