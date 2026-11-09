@@ -847,15 +847,45 @@ fn the_start_script_checks_the_port_only_when_it_was_named() {
         !otherwise.contains("http://"),
         "明示していない腕が URL を組み立てている（実行ファイルが選んだ番号と食い違いうる）"
     );
+    // **案内の文（二重引用符で始まる行）ごとに見る。** 腕の全体で探すと、コメントの `url=` で緑になる
+    // （作業単位 F-12b の変異で実測: 2つの案内から `url=` を消しても、コメントが残っていて全緑だった）。
+    let messages = message_lines(otherwise);
     assert!(
-        otherwise.contains(LOG_URL_FIELD),
-        "明示していない腕が、実行ファイルのログの `{LOG_URL_FIELD}` を案内していない"
+        !messages.is_empty(),
+        "明示していない腕に案内の文が無い（走査が空振りしている疑い）"
     );
-    // **既定の番号を読むのは、この腕の案内のため**（読んだ値が死んだ変数にならないこと）。
-    assert!(
-        otherwise.contains("$defaultPort"),
-        "明示していない腕の案内が、読んだ既定の番号を使っていない"
+    for message in &messages {
+        assert!(
+            message.contains(LOG_URL_FIELD),
+            "明示していない腕の案内が、実行ファイルのログの `{LOG_URL_FIELD}` を言っていない: {message}"
+        );
+        // **既定の番号を読むのは、この腕の案内のため**（読んだ値が死んだ変数にならないこと）。
+        assert!(
+            message.contains("$defaultPort"),
+            "明示していない腕の案内が、読んだ既定の番号を使っていない: {message}"
+        );
+    }
+}
+
+/// **二重引用符で始まる行**（案内の文）だけを、前後の空白を落として返す。コメントの行は入らない。
+fn message_lines(source: &str) -> Vec<&str> {
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('"'))
+        .collect()
+}
+
+/// `message_lines` は、渡されたソースの案内の文だけを拾うこと（コメントの中の同じ綴りを拾わない）。
+#[test]
+fn the_message_line_scan_reads_the_source_it_is_given() {
+    let planted = "    # url= を見る（コメント）\r\n    $x = if ($a) {\r\n        \"一つめ url=\"\r\n    }\r\n    else {\n        \"二つめ\"\n    }\n";
+    assert_eq!(
+        message_lines(planted),
+        vec!["\"一つめ url=\"", "\"二つめ\""],
+        "案内の文だけを、CRLF でも LF でも拾うこと"
     );
+    assert!(message_lines("# \"コメントの中\"\n").is_empty());
 }
 
 /// **既定の上流のエンドポイントも写さずに読むこと。**
