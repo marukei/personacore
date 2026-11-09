@@ -196,6 +196,11 @@ export type PortInput =
  *
  * **範囲は見ない**（このファイルの冒頭）。`+9001` や全角の数字は断る —— サーバは整数の JSON しか受けず、
  * こちらで黙って直すと、送った値と見えている値が食い違う。
+ *
+ * **⚠ 正確な整数として持てない大きさ（`Number.isSafeInteger` でない）は送らない**（作業単位 F-12b のレビュー）。
+ * 309 桁以上は `Infinity` になり、`JSON.stringify` が `{"port":null}` に変える ——**サーバはそれを
+ * 「保存を消す」と読み、画面は「Infinity を保存しました」と言っていた。** 16〜17 桁でも丸めが起き、
+ * 打った数と違う数を送る。これは範囲の判定ではない（送れる値かどうか。範囲は今もサーバが決める）。
  */
 export function parsePortInput(text: string): PortInput {
   const trimmed = text.trim();
@@ -205,7 +210,11 @@ export function parsePortInput(text: string): PortInput {
   if (!/^[0-9]+$/u.test(trimmed)) {
     return { ok: false, message: "番号は半角の数字だけで入れてください。" };
   }
-  return { ok: true, port: Number(trimmed) };
+  const port = Number(trimmed);
+  if (!Number.isSafeInteger(port)) {
+    return { ok: false, message: "番号が大きすぎます（1024〜65535 の番号を入れてください）。" };
+  }
+  return { ok: true, port };
 }
 
 /** **入力欄の初めの値**——保存した番号（無ければ空）。 */

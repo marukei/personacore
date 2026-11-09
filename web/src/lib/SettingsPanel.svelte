@@ -88,6 +88,10 @@
         return;
       }
       view = next;
+      // **入力欄も、サーバが読み直した保存した番号にする**（作業単位 F-12b のレビュー）。
+      // 消した後に前の番号が残ると、まだ保存されているように読める。保存の後も同じ扱いにし、
+      // 打った綴り（頭の 0・前後の空白）ではなく、行の「保存した番号」と同じ値を出す。
+      draft = initialDraft(next);
       outcome = describeSaved(requested, next);
     } catch (thrown) {
       if (lifetime.signal.aborted) {

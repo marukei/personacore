@@ -328,6 +328,25 @@ describe("保存する", () => {
     }
   });
 
+  /**
+   * **保存した後の入力欄は、サーバが読み直した番号になる**（作業単位 F-12b のレビュー）。
+   * 打った綴り（前後の空白・頭の 0）ではなく、行の「保存した番号」と同じ値を出す。
+   */
+  it("保存した後の入力欄は、応答の保存した番号になる", async () => {
+    const view = await opened();
+    try {
+      type(" 09001 ");
+      submit();
+      await vi.waitFor(() => {
+        expect(rows()[1]).toEqual(["保存した番号", "9001"]);
+      });
+      expect(JSON.parse(sent[1]?.body ?? "null")).toEqual({ port: 9001 });
+      expect(portInput()?.value).toBe("9001");
+    } finally {
+      await unmount(view, { outro: false });
+    }
+  });
+
   it("環境変数が効いているときは、保存しても次の起動では使われないと言う", async () => {
     readBody = { ...READ, listening_port_source: "environment", next_port_source: "environment" };
     putResponse = {
@@ -451,6 +470,24 @@ describe("保存する", () => {
     }
   });
 
+  /**
+   * **正確に持てない大きさの数字は送らない**（作業単位 F-12b のレビュー）。
+   * 送ると `Infinity` が `{"port":null}` になり、**サーバが保存を消す。**
+   */
+  it("大きすぎる数字は送らず、そう言う（保存は消えない）", async () => {
+    const view = await opened();
+    try {
+      type("9".repeat(400));
+      submit();
+      flushSync();
+      expect(alerts()).toEqual(["番号が大きすぎます（1024〜65535 の番号を入れてください）。"]);
+      expect(sent.map((s) => `${s.method} ${s.url}`)).toEqual(["GET /admin/server"]);
+      expect(rows()[1]).toEqual(["保存した番号", "8456"]);
+    } finally {
+      await unmount(view, { outro: false });
+    }
+  });
+
   /** **前の失敗を、次の成功の後に残さない。** */
   it("失敗の後に保存できたら、失敗の文を消す", async () => {
     const view = await opened();
@@ -499,6 +536,8 @@ describe("保存を消す", () => {
       );
       // **消した後は、もう一度消す操作を押せない。**
       expect(buttonNamed("保存を消して既定に戻す")?.disabled).toBe(true);
+      // **入力欄に前の番号を残さない**（残すと、消したのにまだ保存されているように読める / レビュー）。
+      expect(portInput()?.value).toBe("");
     } finally {
       await unmount(view, { outro: false });
     }

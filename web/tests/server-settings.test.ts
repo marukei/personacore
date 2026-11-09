@@ -313,6 +313,23 @@ describe("入力", () => {
     }
   });
 
+  /**
+   * **数として正確に持てない大きさの数字は送らない**（作業単位 F-12b のレビュー）。
+   *
+   * 309 桁以上は `Number` が `Infinity` になり、`JSON.stringify` が `{"port":null}` に変える ——
+   * **サーバはそれを「保存を消す」と読む。** 範囲の判定はしない（範囲はサーバ）。正確に送れるかだけを見る。
+   */
+  it("正確な整数として持てない大きさの数字は、送らずにそう言う", () => {
+    for (const text of ["9".repeat(400), "9".repeat(309), "9007199254740992"]) {
+      expect(parsePortInput(text), `${text.length} 桁`).toEqual({
+        ok: false,
+        message: "番号が大きすぎます（1024〜65535 の番号を入れてください）。",
+      });
+    }
+    // **対照: 正確に持てる最大の整数は、範囲の外でもそのまま送る**（範囲はサーバが断る）。
+    expect(parsePortInput("9007199254740991")).toEqual({ ok: true, port: 9007199254740991 });
+  });
+
   it("入力欄の初めの値は、保存した番号（無ければ空）", () => {
     expect(initialDraft(viewOf())).toBe("8456");
     expect(initialDraft(viewOf({ saved_port: null }))).toBe("");
