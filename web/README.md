@@ -3,10 +3,12 @@
 Svelte 5 + Vite 8 + TypeScript 7。**なぜこの組み合わせかは
 [ADR-0031](../docs/adr/0031-front-end-stack.md) にある**（ここには理由を写さない）。
 
-いまあるのは **6画面** ——**会話**（`#/chat`）、**キャラクター**（`#/characters`）、
+いまあるのは **8画面** ——**会話**（`#/chat`）、**キャラクター**（`#/characters`）、
 **記憶**（`#/memories/{識別子}`）、**性格値と変容**（`#/stats/{識別子}`。作業単位 D-4）、
 **上流モデル**（`#/upstream`。作業単位 D-9）、
-**属性と変更の記録**（`#/attributes/{識別子}`。作業単位 D-12a）。
+**属性と変更の記録**（`#/attributes/{識別子}`。作業単位 D-12a）、
+**約束・決まり**（`#/agreements/{識別子}`。作業単位 A-12a）、
+**設定**（`#/settings`。作業単位 F-12b）。
 2つ目は**一覧 ＋ 作成・編集**（作業単位 D-2。フォームは一覧の中で開く）**＋ 削除**
 （作業単位 D-7。**会話があるキャラクターは、しまってからでないと消せない** / 下記）
 **＋ しまう・戻す・完全に消す**（作業単位 A-10 / [ADR-0049](../docs/adr/0049-deleting-characters-and-conversations.md)。**しまった一覧は同じ画面の下** / 下記）**＋ 壊れた行の修復**
@@ -68,9 +70,9 @@ PERSONACORE_PORT=9000 pnpm dev
 **⚠ 開発中は `PERSONACORE_PORT` を明示して、`cargo run` と `pnpm dev` の両方に同じ値を渡すこと**
 （作業単位 F-12b / [ADR-0057](../docs/adr/0057-the-listening-port-shifts-when-taken-and-is-set-from-the-screen.md) §決定7）。
 `cargo run` は、明示しなければ画面の「設定」で保存した番号を読む（既定の置き場所の `listening-port.txt`。
-配布版の exe で保存した番号も同じファイルにある）。**proxy は保存のファイルを読まない** ——読ませない
+配布版の exe で保存した番号も同じファイルにある）。**proxy には保存のファイルを読ませない**
 （保存のファイルを読む実装を2つ持たない）。明示しないと、保存した番号で起きた API と、既定を向いた proxy がずれる
-（上の2行が両方に同じ値を渡しているのは、そのため）。
+（上のコードブロックの2行が両方に同じ値を渡しているのは、そのため）。
 
 **proxy は `Host` と `Origin` を書き換える**（作業単位 B-58）。personacore は `Host` / `Origin` が
 自分のもの（`127.0.0.1:<port>` / `localhost:<port>`）でない要求を 403 で断るので、
@@ -594,7 +596,7 @@ pnpm test
 ## ルータは**ハッシュ**。依存は足していない
 
 `#/chat` / `#/characters` / `#/upstream` / `#/settings` / `#/memories/{識別子}` /
-`#/stats/{識別子}` / `#/attributes/{識別子}`。
+`#/stats/{識別子}` / `#/attributes/{識別子}` / `#/agreements/{識別子}`。
 **`hashchange` を聞くだけ**なので、ルータのライブラリを入れていない（`src/lib/router.ts`）。
 
 **⚠ 識別子を運ぶ経路は3つある**（記憶 / 性格値 / 属性）。**綴りが1語しか違わない**ので、
