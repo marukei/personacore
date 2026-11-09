@@ -14,7 +14,9 @@
 //! |---|---|
 //! | `a_second_start_on_the_same_data_names_the_first_and_listens_nowhere` | 2つ目が待ち受ける（二重起動）／1つ目の URL を言わない／0 以外で終わる／**ポートを変えると止まらない** |
 //! | `a_second_start_uses_neither_fresh_nor_upstream_and_says_so` | 2つ目の `--fresh` が動いている側の DB を退避する／`--upstream` を読む／使わなかったと言わない |
-//! | `a_killed_first_leaves_no_lock_behind` | 異常終了したプロセスのロックが残り、次から起動できない |
+//! | `a_second_start_writes_nothing_into_the_default_place` | 2つ目が上流プロファイルの見本・覚えた名前・保存した番号を書く（ロックが見本より後） |
+//! | `another_database_in_the_same_directory_is_stopped_and_never_stashed` | 同じディレクトリの別の名前の DB の2つ目が止まらない／その `--fresh` が誰も開いていない DB を退避する |
+//! | `a_killed_first_leaves_no_lock_behind` | 異常終了したプロセスのロックが残り、次から起動できない（上限つきで起こし直す） |
 //! | `different_database_paths_run_side_by_side` | データのディレクトリが違うのに止まる |
 //! | `the_version_flag_answers_while_another_one_runs` | `--version` がロックを見る |
 //! | `the_second_start_opens_the_screen_only_when_asked_to` | 開く設定のときに開かない／`--no-browser` で開く／URL が違う／二重に開く |
@@ -36,7 +38,8 @@
 //! # 隔離（CLAUDE.md「exe を起こすときは、DB だけでなく上流の設定も隔離する」）
 //!
 //! **どの腕も `LOCALAPPDATA` / `XDG_DATA_HOME` / `HOME` / `USERPROFILE` を一時ディレクトリへ向け、
-//! `PERSONACORE_UPSTREAMS` を存在しないファイルへ向ける。** 上流の宛先は閉じたポート（[`DECOY_ENDPOINT`]）、
+//! `PERSONACORE_UPSTREAMS` を存在しないファイルへ向ける**（`a_second_start_writes_nothing_into_the_default_place`
+//! だけは外し、隔離した `LOCALAPPDATA` の下の既定の置き場所を使う）。上流の宛先は閉じたポート（[`DECOY_ENDPOINT`]）、
 //! `PATH` の先頭は偽の `llama`、待ち受けは OS から取った空きの番号。**`8080` には触らない。**
 //!
 //! # ブラウザ
@@ -57,6 +60,10 @@ const MAX_WAITS: usize = 300;
 
 /// 1回あたりの待ち時間。**上限は `MAX_WAITS` と合わせて 30 秒。**
 const WAIT_STEP: Duration = Duration::from_millis(100);
+
+/// **止めた後にロックを取り直す試みの上限**（回数。間に [`WAIT_STEP`] を置く）。
+/// OS がロックを外すのは、プロセスの終わりより少し遅れうる（`a_killed_first_leaves_no_lock_behind`）。
+const MAX_RELOCK_ATTEMPTS: usize = 50;
 
 /// **囮の上流の宛先**（閉じている loopback のポート）。
 const DECOY_ENDPOINT: &str = "http://127.0.0.1:9";
@@ -108,6 +115,18 @@ impl Started {
     ///
     /// **毎周「書き手が生きているか」を見る**——プロセスが死んだ瞬間、その行は永久に来ない。
     fn port_after(&mut self, after: &str) -> (u16, Vec<String>) {
+        match self.port_after_or_exit(after) {
+            Ok(found) => found,
+            Err(seen) => panic!(
+                "待ち受けの行と「{after}」を読む前にプロセスが終了した\n{}",
+                seen.join("\n")
+            ),
+        }
+    }
+
+    /// [`Self::port_after`] と同じ。**ただし、読む前にプロセスが終わったら、読めた行を `Err` で返す**
+    /// （ロックを取れずに案内して終わった起動を、起こし直す側が見分けるため）。**待ちの上限では panic する。**
+    fn port_after_or_exit(&mut self, after: &str) -> Result<(u16, Vec<String>), Vec<String>> {
         let mut seen = Vec::new();
         let mut port = None;
         for _ in 0..MAX_WAITS {
@@ -120,17 +139,21 @@ impl Started {
                     let done = line.contains(after);
                     seen.push(line);
                     if done && let Some(port) = port {
-                        return (port, seen);
+                        return Ok((port, seen));
                     }
+                    continue;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                // **書き手が標準出力を閉じた**——終わったか、終わるところ。残りの行は来ない。
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = self.running.0.wait();
+                    return Err(seen);
+                }
             }
             if !self.running.is_alive() {
-                panic!(
-                    "待ち受けの行と「{after}」を読む前にプロセスが終了した\n{}",
-                    seen.join("\n")
-                );
+                // 終わった後に届いた行も拾ってから返す。
+                seen.extend(self.lines.try_iter().map(|line| strip_ansi(&line)));
+                return Err(seen);
             }
         }
         panic!(
@@ -260,7 +283,11 @@ fn machine_command(root: &Path, port: u16, args: &[&str], extra: &[(&str, &Path)
 
 /// **1つ目として起こす**（標準出力を行で読み続ける）。
 fn start_first(root: &Path, port: u16, args: &[&str], extra: &[(&str, &Path)]) -> Started {
-    let mut command = machine_command(root, port, args, extra);
+    start(machine_command(root, port, args, extra))
+}
+
+/// **組んだコマンドを起こす**（標準出力を行で読み続ける）。
+fn start(mut command: Command) -> Started {
     command.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = command.spawn().expect("実行ファイルを起こせること");
     let stdout = child.stdout.take().expect("標準出力を取れること");
@@ -493,9 +520,24 @@ fn a_killed_first_leaves_no_lock_behind() {
     first.running.0.kill().expect("1つ目を止められること");
     first.running.0.wait().expect("1つ目の終わりを待てること");
 
-    let mut again = start_first(root, 0, &["--no-ui", "--no-browser"], &[]);
-    let (port, _) = again.port_after(AFTER_ANNOUNCE_NO_UI);
+    // **取れるまで起こし直す（上限つき）。** `LockFileEx` のロックの解除は、プロセスの終わりより
+    // 少し遅れうる（文書上、同時とは保証されない）。**「最初の1回で取れた」ことは主張しない**——
+    // 主張は「上限の内に取れる＝残り続けない」。取れなかった回は、案内して終わる（待ち受けない）。
+    let mut attempts = 0;
+    let (mut again, port) = loop {
+        attempts += 1;
+        let mut candidate = start_first(root, 0, &["--no-ui", "--no-browser"], &[]);
+        match candidate.port_after_or_exit(AFTER_ANNOUNCE_NO_UI) {
+            Ok((port, _)) => break (candidate, port),
+            Err(_) if attempts < MAX_RELOCK_ATTEMPTS => std::thread::sleep(WAIT_STEP),
+            Err(seen) => panic!(
+                "1つ目を止めた後、{attempts} 回起こし直しても同じデータで待ち受けられなかった（ロックが残っている）\n{}",
+                seen.join("\n")
+            ),
+        }
+    };
     assert_ne!(port, 0, "前提: 実際に掴んだ番号を言うこと");
+    assert!(again.running.is_alive(), "止めた後の起動が終わった");
 
     // **後の起動が言う URL は、新しい起動の実際の番号**（設定の `0` を言わない）。
     // kill で残った古い中身を消すことは、`src/server/instance_lock.rs` の単体テストが見る
@@ -661,6 +703,113 @@ fn the_second_start_never_opens_a_screen_the_first_withholds() {
         recorded_calls(&log).is_empty(),
         "画面を配っていない相手をブラウザで開いた: {:?}",
         recorded_calls(&log)
+    );
+    assert!(first.running.is_alive(), "1つ目が止まった");
+}
+
+/// **2つ目は、既定の置き場所に何も書かない**——上流プロファイルの見本（`upstreams.json`）を作り直さない、
+/// 覚えた名前（`selected-upstream.txt`）も保存した番号（`listening-port.txt`）も作らない。
+///
+/// **この腕だけ `PERSONACORE_UPSTREAMS` を外す**（ほかの腕は存在しないファイルへ向けるので、`main` の
+/// 見本を書く枝に入らない）。置き場所は隔離した `LOCALAPPDATA` の下。**8080 には行かない**——
+/// 保存した番号のファイルは無く、`PERSONACORE_PORT` を空いている番号で渡す。
+///
+/// 1つ目が見本を書いたことを確かめてから消し、2つ目の後も無いことを見る（ロックが見本より後に取られると、
+/// 2つ目が見本を書いてから止まる）。
+#[test]
+fn a_second_start_writes_nothing_into_the_default_place() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
+    let root = dir.path();
+    let [first_port, second_port] = distinct_free_ports::<2>();
+    let app_dir = app_dir_of(root);
+    let sample = app_dir.join("upstreams.json");
+    let at_default_place = |port: u16| {
+        let mut command = machine_command(root, port, &["--no-ui", "--no-browser"], &[]);
+        command.env_remove("PERSONACORE_UPSTREAMS");
+        command
+    };
+
+    let mut first = start(at_default_place(first_port));
+    first.port_after(AFTER_ANNOUNCE_NO_UI);
+    assert!(
+        sample.is_file(),
+        "前提: 1つ目が既定の置き場所に見本を書くこと（この腕が見本の枝を通っている）"
+    );
+    std::fs::remove_file(&sample).expect("見本を消せること");
+    let names_before = file_names(&app_dir);
+    for name in [
+        "upstreams.json",
+        "selected-upstream.txt",
+        "listening-port.txt",
+    ] {
+        assert!(
+            !names_before.iter().any(|present| present == name),
+            "前提: {name} が無いこと: {names_before:?}"
+        );
+    }
+
+    let ended = run_to_end(at_default_place(second_port), "既定の置き場所の2つ目");
+    assert_guided_to(&ended, first_port);
+    assert!(!sample.exists(), "2つ目が見本を書いた");
+    assert_eq!(
+        names_before,
+        file_names(&app_dir),
+        "2つ目が既定の置き場所のファイルを増やした・減らした"
+    );
+    assert!(first.running.is_alive(), "1つ目が止まった");
+}
+
+/// **ロックはディレクトリに1つ**——同じディレクトリの**別の名前の DB** を指した2つ目も止まる。
+/// **その2つ目の `--fresh` は、誰も開いていない自分の DB も退避しない。**
+///
+/// 動いている側の DB を退避しようとしても、Windows では OS が改名を断る（開いているので）。
+/// **誰も開いていない DB を指させれば、改名は通る**——退避を試みる実装は、この機でもここで赤になる
+/// （`a_second_start_uses_neither_fresh_nor_upstream_and_says_so` の Windows での穴を埋める）。
+///
+/// 退避の跡の形は `src/server/fresh.rs` の `stash_database`（`<名前>.bak-<時刻>`。`-wal` / `-shm` も同じ接尾辞）。
+#[test]
+fn another_database_in_the_same_directory_is_stopped_and_never_stashed() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
+    let root = dir.path();
+    let [first_port, second_port] = distinct_free_ports::<2>();
+
+    let mut first = start_first(root, first_port, &["--no-ui", "--no-browser"], &[]);
+    first.port_after(AFTER_ANNOUNCE_NO_UI);
+    let app_dir = app_dir_of(root);
+    let other = app_dir.join("other.sqlite");
+    std::fs::write(&other, "OTHER-DB-NOBODY-OPENED").expect("別の DB を置けること");
+    let names_before = file_names(&app_dir);
+
+    let ended = run_to_end(
+        machine_command(
+            root,
+            second_port,
+            &["--no-ui", "--no-browser", "--fresh"],
+            &[("PERSONACORE_DB_PATH", &other)],
+        ),
+        "同じディレクトリの別の DB を指す2つ目",
+    );
+    assert_guided_to(&ended, first_port);
+    assert!(
+        ended
+            .stdout
+            .contains(&format!("{NOT_USED_HEAD}--fresh{NOT_USED_TAIL}")),
+        "--fresh を使わなかったと言っていない\n{}",
+        ended.stdout
+    );
+    assert_eq!(
+        std::fs::read_to_string(&other).expect("別の DB が残っていること"),
+        "OTHER-DB-NOBODY-OPENED",
+        "2つ目が自分の DB を退避した・書き換えた"
+    );
+    let names_after = file_names(&app_dir);
+    assert!(
+        !names_after.iter().any(|name| name.contains(".bak-")),
+        "退避した跡がある: {names_after:?}"
+    );
+    assert_eq!(
+        names_before, names_after,
+        "2つ目が置き場所のファイルを増やした・減らした"
     );
     assert!(first.running.is_alive(), "1つ目が止まった");
 }
