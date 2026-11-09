@@ -293,11 +293,19 @@ impl ServerError {
     /// （ADR-0057 §決定3 / 作業単位 F-11b）。
     ///
     /// **[`Self::is_port_in_use`] とは重ならない**——あちらは明示した1つの番号の話（B-76 の文）、
-    /// こちらは範囲の話（[`ports_in_use_message`]）。`main` はこちらを先に見る。
+    /// こちらは範囲の話（[`ports_in_use_message`]）。`main` は [`Self::ports_taken`] を先に見る。
     #[must_use]
-    pub const fn tried_ports(&self) -> Option<(u16, u16)> {
+    pub fn tried_ports(&self) -> Option<(u16, u16)> {
+        self.ports_taken()
+            .map(|taken| (taken.first(), taken.last()))
+    }
+
+    /// **ずらす範囲を全部試して開けなかったなら、その中身**（範囲と、範囲の中で飛ばした番号）。
+    /// `main` はこれを [`ports_in_use_message`] に渡す。
+    #[must_use]
+    pub const fn ports_taken(&self) -> Option<&PortsTaken> {
         match self {
-            Self::PortsTaken(taken) => Some((taken.first(), taken.last())),
+            Self::PortsTaken(taken) => Some(taken),
             _ => None,
         }
     }
@@ -1557,7 +1565,11 @@ impl App {
                 port_source = %opened.source().label(),
                 skipped_ports = ?opened.skipped(),
                 "{}",
-                port_search::shifted_message(opened.requested(), local_addr.port())
+                port_search::shifted_message(
+                    opened.requested(),
+                    local_addr.port(),
+                    opened.requested_was_skipped()
+                )
             );
         }
 

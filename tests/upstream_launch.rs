@@ -169,11 +169,46 @@ fn serve(config: AppConfig, plan: LaunchPlan) -> Serving {
     }
 }
 
-/// **設定を組む。** プロファイルの4つを重ね、待ち受けと DB だけを差し替える。
+/// **設定を組む。** プロファイルの4つを重ね、待ち受けの番号を `PERSONACORE_PORT` で明示し、DB を差し替える。
 ///
-/// **環境変数は1つも読まない**（`|_| None`）——
+/// **プロセスの環境変数は1つも読まない**（参照関数が答えるのは `PERSONACORE_PORT` だけ）——
 /// **測定中の機に立っている `PERSONACORE_*` に結果を左右させない。**
+///
+/// # 番号は明示する（F-11b のレビュー是正）
+///
+/// **出どころが `default`（`with_bind`）だと、`port` を他の誰かが掴んでいたとき黙って次の番号へずれて起きる**
+/// （ADR-0057 §決定1）。そのとき腕は `port` の `/admin/upstream` を読み、**並んで走る別の腕のサーバに答えさせて
+/// 緑になりうる**（F-11b より前は `Bind` で赤だった）。明示なら今までどおり待ち受けに失敗する。
+/// 出どころが `default` である必要がある腕は [`default_config_of`] を使う。
 fn config_of(
+    profiles: &UpstreamProfiles,
+    name: &str,
+    dir: &Path,
+    port: u16,
+) -> (AppConfig, LaunchPlan) {
+    let profile = profiles.select(name).expect("プロファイルが在ること");
+    let settings = profile.settings();
+    let port_text = port.to_string();
+    let config = AppConfig::from_lookup_with_data_dir(
+        overlay_profile(&settings, move |key| {
+            (key == ENV_PORT).then(|| port_text.clone())
+        }),
+        Some(dir.to_path_buf()),
+    )
+    .expect("設定を組めること")
+    .with_database_path(dir.join("db").join("personacore.sqlite"));
+    assert_eq!(
+        config.port_source(),
+        PortSource::Environment,
+        "前提: 明示の番号であること"
+    );
+    (config, LaunchPlan::of(profile))
+}
+
+/// **出どころが `default` のままの設定**（`with_bind` で番号だけを差し替える）。**塞がっていれば次の空きへずれる。**
+///
+/// **ずれることそのものを使う腕だけが使う**（`the_conflict_check_sees_the_port_actually_opened_after_shifting`）。
+fn default_config_of(
     profiles: &UpstreamProfiles,
     name: &str,
     dir: &Path,
@@ -188,6 +223,11 @@ fn config_of(
     .expect("設定を組めること")
     .with_bind(BindAddr::loopback(port))
     .with_database_path(dir.join("db").join("personacore.sqlite"));
+    assert_eq!(
+        config.port_source(),
+        PortSource::Default,
+        "前提: ずらす出どころであること"
+    );
     (config, LaunchPlan::of(profile))
 }
 
@@ -837,35 +877,6 @@ async fn a_missing_gguf_starts_nothing_and_stops_the_startup() {
     assert!(!answers(port).await, "止まったのに待ち受けが残っている");
 }
 
-/// **`PERSONACORE_PORT` を明示した設定**（[`config_of`] と同じ形で、出どころだけが `environment`）。
-///
-/// **待ち受けに失敗させる腕はこれを使う**（作業単位 F-11b）——[`config_of`] の `with_bind` は出どころが
-/// `default` のままなので、塞がった番号から次の空きへずれて起きる（ADR-0057 §決定1）。
-fn explicit_config_of(
-    profiles: &UpstreamProfiles,
-    name: &str,
-    dir: &Path,
-    port: u16,
-) -> (AppConfig, LaunchPlan) {
-    let profile = profiles.select(name).expect("プロファイルが在ること");
-    let settings = profile.settings();
-    let port_text = port.to_string();
-    let config = AppConfig::from_lookup_with_data_dir(
-        overlay_profile(&settings, move |key| {
-            (key == ENV_PORT).then(|| port_text.clone())
-        }),
-        Some(dir.to_path_buf()),
-    )
-    .expect("設定を組めること")
-    .with_database_path(dir.join("db").join("personacore.sqlite"));
-    assert_eq!(
-        config.port_source(),
-        PortSource::Environment,
-        "前提: 明示の番号であること"
-    );
-    (config, LaunchPlan::of(profile))
-}
-
 /// **待ち受けに失敗したら、子は1本も居ない**（ADR-0042 §決定3 の順序）。
 ///
 /// # なぜこれが順序の見張り番なのか
@@ -874,7 +885,7 @@ fn explicit_config_of(
 /// **起こした後に `bind` が失敗すると、止める人がもう居ない。**
 /// **偽の `llama` が一度も呼ばれないこと**が、順序そのものの観測である。
 ///
-/// **番号は明示する**（作業単位 F-11b で [`explicit_config_of`] に替えた）——明示していない番号は、
+/// **番号は明示する**（[`config_of`] が `PERSONACORE_PORT` で渡す / 作業単位 F-11b）——明示していない番号は、
 /// 塞がっていれば次の空きへずれて起きる（ADR-0057 §決定1）ので、待ち受けに失敗しない。
 /// 範囲が全部塞がって止まる形は `tests/server_listening_port.rs` の
 /// `a_whole_range_taken_stops_and_names_the_range` が見る（そこでも `Store::connect` より前で止まる）。
@@ -903,7 +914,7 @@ async fn a_failed_bind_leaves_no_child_behind() {
         })
         .to_string(),
     );
-    let (config, plan) = explicit_config_of(&profiles, "planted", dir.path(), blocked);
+    let (config, plan) = config_of(&profiles, "planted", dir.path(), blocked);
 
     let err = App::run_with_upstreams(&config, plan, bounded_shutdown())
         .await
@@ -1080,12 +1091,7 @@ async fn the_conflict_check_sees_the_port_actually_opened_after_shifting() {
         })
         .to_string(),
     );
-    let (config, plan) = config_of(&profiles, "planted", dir.path(), blocked);
-    assert_eq!(
-        config.port_source(),
-        PortSource::Default,
-        "前提: ずらす出どころであること"
-    );
+    let (config, plan) = default_config_of(&profiles, "planted", dir.path(), blocked);
 
     let err = App::run_with_upstreams(&config, plan, bounded_shutdown())
         .await

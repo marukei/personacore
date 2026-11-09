@@ -382,7 +382,7 @@ fn port_source_schema() -> Object {
 /// |---|---|
 /// | `listening_port` | **いま実際に待ち受けている番号**（`local_addr`。`PERSONACORE_PORT=0` なら OS が選んだ番号） |
 /// | `listening_port_source` | **試し始めた番号**の出どころ（`environment` / `saved` / `default`）。ずらしても変わらない |
-/// | `listening_port_requested` | **元の番号**（試し始めた番号。`PERSONACORE_PORT=0` なら `0`）。ずらしていなければ `listening_port` と同じ |
+/// | `listening_port_requested` | **元の番号**（試し始めた番号。`PERSONACORE_PORT=0` なら `0`）。ずらしておらず、`0` でもなければ `listening_port` と同じ |
 /// | `listening_port_shifted` | **元の番号を使えず、別の番号で待ち受けたか**（`0` で OS に選ばせたのは `false`） |
 /// | `listening_port_skipped` | **探すときに飛ばした番号**（llama の面が使う番号のうち、開けた番号より前のもの。ずらしていなければ空） |
 /// | `saved_port` | 保存した番号（無い・読めない・保存できない置き場所なら `null`） |

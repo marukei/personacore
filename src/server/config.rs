@@ -476,18 +476,52 @@ pub fn port_in_use_message(port: u16) -> String {
 /// * **毎回 [`ENV_PORT`] を打たなくて済むように**、起動できた後に画面の「設定」で番号を保存すれば、
 ///   次からはそこから試すことを添える（ADR-0057 の背景 —— 配布物の利用者に環境変数を打たせ続けない）。
 ///
-/// 範囲が1つの番号しか無い（元の番号が 65535）ときは「〜」を書かない。
+/// # 何を言うかは、範囲の中で飛ばした番号（`skipped`）で決める（F-11b のレビュー是正）
+///
+/// | 範囲の中 | 文の頭 |
+/// |---|---|
+/// | 飛ばした番号が無い | 「ポート {範囲} は、どれも他のプログラムが使っているか、使えない番号でした」 |
+/// | 飛ばした番号が在り、試した番号も在る | 「…は、上流プロファイルの llama の面が使う番号（{飛ばした番号}）を除いて、どれも…」 |
+/// | **全部を飛ばした**（1つも試していない） | 「…は、どれも上流プロファイルの llama の面が使う番号なので、試せる番号がありませんでした」 |
+///
+/// **飛ばしていないのに「面の番号は試していない」と言わない**——`upstreams.json` が読めず、飛ばす番号が空の
+/// 起動がある。**1つも試していないのに「他のプログラムが使っている」と言わない**——保存した番号が 65535 で、
+/// それが面の番号なら、列は1つで、それも飛ばす。
+///
+/// 範囲が1つの番号しか無い（元の番号が 65535）ときは「〜」を書かず、試した番号が1つなら「どれも」を書かない。
 /// **写しが `tests/listening_port_cli.rs` の `a_whole_range_taken_names_the_range_and_how_to_get_out` に在る。**
-pub fn ports_in_use_message(first: u16, last: u16) -> String {
-    let (range, every) = if first == last {
-        (first.to_string(), "")
+pub fn ports_in_use_message(first: u16, last: u16, skipped: &[u16]) -> String {
+    let range = if first == last {
+        first.to_string()
     } else {
-        (format!("{first}〜{last}"), "どれも")
+        format!("{first}〜{last}")
+    };
+    let total = usize::from(last.saturating_sub(first)) + 1;
+    let tried = total.saturating_sub(skipped.len());
+    let head = if tried == 0 {
+        let every = if total > 1 { "どれも" } else { "" };
+        format!(
+            "ポート {range} は、{every}上流プロファイルの llama の面が使う番号なので、\
+             試せる番号がありませんでした"
+        )
+    } else {
+        let every = if tried > 1 { "どれも" } else { "" };
+        if skipped.is_empty() {
+            format!("ポート {range} は、{every}他のプログラムが使っているか、使えない番号でした")
+        } else {
+            let skipped = skipped
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("・");
+            format!(
+                "ポート {range} は、上流プロファイルの llama の面が使う番号（{skipped}）を除いて、\
+                 {every}他のプログラムが使っているか、使えない番号でした"
+            )
+        }
     };
     format!(
-        "ポート {range} は、{every}他のプログラムが使っているか、使えない番号でした\
-         （上流プロファイルの llama の面が使う番号は試していません）。\
-         環境変数 {ENV_PORT} で空いているポートを指定して起動し直してください\
+        "{head}。環境変数 {ENV_PORT} で空いているポートを指定して起動し直してください\
          （起動できたら、画面の「設定」でその番号を保存すると、次からは指定しなくてもその番号から試します）"
     )
 }
@@ -2198,23 +2232,69 @@ mod tests {
     /// （[`port_in_use_message`]）とは違う文で、範囲が1つの番号なら「〜」を書かない。
     #[test]
     fn the_range_message_names_the_range_and_both_ways_out() {
-        let message = ports_in_use_message(18_090, 18_100);
+        let message = ports_in_use_message(18_090, 18_100, &[]);
         assert!(
             message.starts_with(
-                "ポート 18090〜18100 は、どれも他のプログラムが使っているか、使えない番号でした"
+                "ポート 18090〜18100 は、どれも他のプログラムが使っているか、使えない番号でした。"
             ),
             "{message}"
         );
+        // **飛ばしていないのに、面の番号を試していないと言わない**（読めない `upstreams.json` の起動）。
+        assert!(!message.contains("llama"), "{message}");
         assert!(message.contains(ENV_PORT), "{message}");
         assert!(message.contains("画面の「設定」"), "{message}");
         assert_ne!(message, port_in_use_message(18_090));
 
-        let single = ports_in_use_message(65535, 65535);
+        let single = ports_in_use_message(65535, 65535, &[]);
         assert!(
             single.starts_with("ポート 65535 は、他のプログラムが"),
             "{single}"
         );
         assert!(!single.contains('〜'), "{single}");
+    }
+
+    /// **飛ばした番号が在るときだけ、それを除いたと言う。1つも試していなければ、試せる番号が無かったと言い、
+    /// 「他のプログラムが使っている」と言わない**（F-11b のレビュー是正）。
+    #[test]
+    fn the_range_message_says_what_was_skipped_and_never_blames_an_untried_port() {
+        let some = ports_in_use_message(18_090, 18_100, &[18_091, 18_095]);
+        assert!(
+            some.starts_with(
+                "ポート 18090〜18100 は、上流プロファイルの llama の面が使う番号（18091・18095）を除いて、\
+                 どれも他のプログラムが使っているか、使えない番号でした。"
+            ),
+            "{some}"
+        );
+
+        // **保存した番号が 65535 で、それが面の番号**——列は1つで、それも飛ばした。
+        let top = ports_in_use_message(65535, 65535, &[65535]);
+        assert!(
+            top.starts_with(
+                "ポート 65535 は、上流プロファイルの llama の面が使う番号なので、試せる番号がありませんでした。"
+            ),
+            "{top}"
+        );
+        assert!(!top.contains("他のプログラム"), "{top}");
+        assert!(top.contains(ENV_PORT), "{top}");
+
+        let all: Vec<u16> = (18_090..=18_100).collect();
+        let every = ports_in_use_message(18_090, 18_100, &all);
+        assert!(
+            every.starts_with(
+                "ポート 18090〜18100 は、どれも上流プロファイルの llama の面が使う番号なので、"
+            ),
+            "{every}"
+        );
+        assert!(!every.contains("他のプログラム"), "{every}");
+
+        // **試したのが1つだけなら「どれも」と言わない。**
+        let one_tried = ports_in_use_message(65534, 65535, &[65535]);
+        assert!(
+            one_tried.starts_with(
+                "ポート 65534〜65535 は、上流プロファイルの llama の面が使う番号（65535）を除いて、他の"
+            ),
+            "{one_tried}"
+        );
     }
 
     /// **抽出モデルの既定は本文モデルの既定と同じ綴り**（ADR-0021 §10 / 2026-08-21 の実測）。

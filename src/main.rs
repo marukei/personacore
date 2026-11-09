@@ -64,7 +64,7 @@ fn main() -> ExitCode {
 ///
 /// | 失敗 | 言う文 |
 /// |---|---|
-/// | **番号を明示していない起動が、ずらす範囲を全部試しても開けなかった**（`ServerError::tried_ports`） | **試した範囲**と直し方（`ports_in_use_message` / ADR-0057 §決定3 / 作業単位 F-11b） |
+/// | **番号を明示していない起動が、ずらす範囲を全部試しても開けなかった**（`ServerError::ports_taken`） | **試した範囲**（飛ばした面の番号があればそれも）と直し方（`ports_in_use_message` / ADR-0057 §決定3 / 作業単位 F-11b） |
 /// | 明示した番号（`PERSONACORE_PORT`）が使われていた | 今までどおり、その番号と `PERSONACORE_PORT`（`port_in_use_message`） |
 /// | それ以外 | 今までどおり「サーバの実行に失敗しました」 |
 ///
@@ -72,8 +72,11 @@ fn main() -> ExitCode {
 /// `an_occupied_port_names_the_port_and_the_setting_and_never_waits` と、`tests/listening_port_cli.rs` の
 /// `a_whole_range_taken_names_the_range_and_how_to_get_out`。
 fn explain_server_failure(err: ServerError, port: u16) -> anyhow::Error {
-    if let Some((first, last)) = err.tried_ports() {
-        anyhow::Error::new(err).context(ports_in_use_message(first, last))
+    if let Some(message) = err
+        .ports_taken()
+        .map(|taken| ports_in_use_message(taken.first(), taken.last(), taken.skipped()))
+    {
+        anyhow::Error::new(err).context(message)
     } else if err.is_port_in_use() {
         anyhow::Error::new(err).context(port_in_use_message(port))
     } else {

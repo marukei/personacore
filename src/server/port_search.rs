@@ -141,18 +141,29 @@ impl OpenedPort {
     pub(crate) fn skipped(&self) -> &[u16] {
         &self.skipped
     }
+
+    /// **元の番号そのものを、llama の面が使う番号として飛ばしたか**（塞がっていたのではない）。
+    ///
+    /// ずらしの警告（[`shifted_message`]）はこれで文を選ぶ——「使えなかった」「次はまた元の番号から試す」は、
+    /// 面の番号で飛ばした元の番号には偽になる（次の起動でも試さない）。
+    pub(crate) fn requested_was_skipped(&self) -> bool {
+        self.skipped.first() == Some(&self.requested)
+    }
 }
 
 /// **範囲の番号をどれも開けなかった**（`ServerError::PortsTaken` の `#[source]`）。
 ///
 /// **番号は置き場所でも秘密でもない**ので、文面に載せる（`main` は利用者向けの文を
 /// `config::ports_in_use_message` で別に足す）。最後に試した番号の OS の失敗を `#[source]` に持つ
-/// （全部を飛ばしたときは無い）。
+/// （全部を飛ばしたときは無い）。**範囲の中で飛ばした番号**も持つ——利用者向けの文は、それが在るときだけ
+/// 「面の番号は試していない」と言い、1つも試せなかったときはそう言う（読めない `upstreams.json` で飛ばす番号が
+/// 空の起動に、飛ばしたと言わない）。
 #[derive(Debug, thiserror::Error)]
 #[error("ポート {first}〜{last} を順に試しましたが、どれも開けませんでした")]
 pub struct PortsTaken {
     first: u16,
     last: u16,
+    skipped: Vec<u16>,
     #[source]
     source: Option<std::io::Error>,
 }
@@ -168,6 +179,12 @@ impl PortsTaken {
     #[must_use]
     pub const fn last(&self) -> u16 {
         self.last
+    }
+
+    /// **範囲の中で、llama の面が使う番号として飛ばした番号**（試していない）。昇順。
+    #[must_use]
+    pub fn skipped(&self) -> &[u16] {
+        &self.skipped
     }
 }
 
@@ -229,21 +246,37 @@ where
     Err(SearchFailure::Exhausted(PortsTaken {
         first: search.requested,
         last: search.last(),
+        skipped,
         source: last_error,
     }))
 }
 
 /// **ずらしたときの警告の本文**（ADR-0057 §決定4）。**番号を2つ言う。**
 ///
-/// **写しが `tests/listening_port_cli.rs` の `PORT_SHIFTED_HEAD` に在る**（文面を変えたら、そちらは
-/// 「言っていない」で赤になる）。元の番号・実際の番号・出どころ・飛ばした番号は、同じ行の欄にも出る。
-pub(crate) fn shifted_message(requested: u16, port: u16) -> String {
-    format!(
-        "ポート {requested} は使えなかったので、{port} で待ち受けます\
-         （ずらした番号は覚えず、次の起動ではまた {requested} から試します。\
-         ブックマークや外部のクライアントに書いた番号は、実際の番号に合わせてください。\
-         番号は画面の「設定」で変えられます）"
-    )
+/// | 元の番号 | 文の頭 |
+/// |---|---|
+/// | 塞がっていた（`requested_was_skipped` が偽） | 「ポート {元} は使えなかったので、{実際} で待ち受けます」。次の起動はまた元の番号から試す |
+/// | **llama の面が使う番号として飛ばした**（真） | 「ポート {元} は上流プロファイルの llama の面が使う番号なので、{実際} で待ち受けます」。次の起動でも試さないので「また試す」と言わない |
+///
+/// **写しは `tests/listening_port_cli.rs` の `shifted_head`（文の頭だけ）**——括弧の中を変えても、そちらは
+/// 赤にならない（括弧の中の「画面の「設定」」は、このモジュールの単体テストが見る）。元の番号・実際の番号・
+/// 出どころ・飛ばした番号は、同じ行の欄にも出る。
+pub(crate) fn shifted_message(requested: u16, port: u16, requested_was_skipped: bool) -> String {
+    if requested_was_skipped {
+        format!(
+            "ポート {requested} は上流プロファイルの llama の面が使う番号なので、{port} で待ち受けます\
+             （ずらした番号は覚えません。\
+             ブックマークや外部のクライアントに書いた番号は、実際の番号に合わせてください。\
+             番号は画面の「設定」で変えられます）"
+        )
+    } else {
+        format!(
+            "ポート {requested} は使えなかったので、{port} で待ち受けます\
+             （ずらした番号は覚えず、次の起動ではまた {requested} から試します。\
+             ブックマークや外部のクライアントに書いた番号は、実際の番号に合わせてください。\
+             番号は画面の「設定」で変えられます）"
+        )
+    }
 }
 
 #[cfg(test)]
@@ -493,6 +526,32 @@ mod tests {
         );
     }
 
+    /// **保存した番号が 65535 で、それが面の番号なら、1つも試さずに範囲（65535）で止まり、飛ばした番号を持つ**
+    /// ——利用者向けの文はこれで「試せる番号が無かった」と言う（`config::ports_in_use_message`）。
+    #[tokio::test]
+    async fn a_saved_top_port_that_a_face_uses_tries_nothing_and_says_so() {
+        let search = PortSearch::plan(65535, PortSource::Saved, &faces(&[65535]));
+        assert_eq!(search.steps(), [Skip(65535)].as_slice());
+        let mut seen = Vec::new();
+        let outcome = walk(&search, &[], &mut seen).await;
+        let Err(SearchFailure::Exhausted(taken)) = outcome else {
+            panic!("範囲として止まっていない: {outcome:?}");
+        };
+        assert!(seen.is_empty(), "飛ばす番号を開きに行っている");
+        assert_eq!((taken.first(), taken.last()), (65535, 65535));
+        assert_eq!(taken.skipped(), [65535].as_slice());
+        let message = super::super::config::ports_in_use_message(
+            taken.first(),
+            taken.last(),
+            taken.skipped(),
+        );
+        assert!(
+            message.contains("試せる番号がありませんでした"),
+            "{message}"
+        );
+        assert!(!message.contains("他のプログラム"), "{message}");
+    }
+
     /// **全部を飛ばしたときも範囲を言って止まる**（OS の失敗は無い）。
     #[tokio::test]
     async fn every_port_skipped_names_the_range_too() {
@@ -553,11 +612,70 @@ mod tests {
     /// **警告は元の番号と実際の番号を、その順で言う。**
     #[test]
     fn the_warning_names_both_ports_in_order() {
-        let message = shifted_message(8080, 8082);
+        let message = shifted_message(8080, 8082, false);
         assert!(
             message.starts_with("ポート 8080 は使えなかったので、8082 で待ち受けます"),
             "{message}"
         );
+        assert!(
+            message.contains("次の起動ではまた 8080 から試します"),
+            "{message}"
+        );
         assert!(message.contains("画面の「設定」"), "{message}");
+    }
+
+    /// **元の番号を面の番号として飛ばしたときは、「使えなかった」「また試す」と言わない**
+    /// （塞がっていたのではなく、次の起動でも試さない）。
+    #[test]
+    fn the_warning_for_a_skipped_requested_port_says_why_and_promises_no_retry() {
+        let message = shifted_message(9100, 9101, true);
+        assert!(
+            message.starts_with(
+                "ポート 9100 は上流プロファイルの llama の面が使う番号なので、9101 で待ち受けます"
+            ),
+            "{message}"
+        );
+        assert!(!message.contains("使えなかった"), "{message}");
+        assert!(!message.contains("また 9100 から試します"), "{message}");
+        assert!(message.contains("画面の「設定」"), "{message}");
+    }
+
+    /// **元の番号を飛ばしたかは、飛ばした番号の先頭が元の番号か**で決まる（塞がっていた元の番号の後で面の番号を
+    /// 飛ばした形は偽）。範囲が尽きたときは、範囲の中で飛ばした番号を全部持つ。
+    #[tokio::test]
+    async fn the_skipped_ports_tell_apart_a_skipped_requested_port_and_reach_the_failure() {
+        let mut seen = Vec::new();
+        let (_, skipped_first) = walk(
+            &PortSearch::plan(9100, PortSource::Saved, &faces(&[9100])),
+            &[],
+            &mut seen,
+        )
+        .await
+        .expect("開けること");
+        assert!(skipped_first.requested_was_skipped());
+
+        let (_, taken_first) = walk(
+            &PortSearch::plan(9100, PortSource::Saved, &faces(&[9101])),
+            &[(9100, std::io::ErrorKind::AddrInUse)],
+            &mut seen,
+        )
+        .await
+        .expect("開けること");
+        assert!(!taken_first.requested_was_skipped());
+        assert_eq!(taken_first.skipped(), [9101].as_slice());
+
+        let taken: Vec<(u16, std::io::ErrorKind)> = (9100..=9110)
+            .map(|port| (port, std::io::ErrorKind::AddrInUse))
+            .collect();
+        let outcome = walk(
+            &PortSearch::plan(9100, PortSource::Saved, &faces(&[9103, 9107, 9200])),
+            &taken,
+            &mut seen,
+        )
+        .await;
+        let Err(SearchFailure::Exhausted(exhausted)) = outcome else {
+            panic!("範囲として止まっていない: {outcome:?}");
+        };
+        assert_eq!(exhausted.skipped(), [9103, 9107].as_slice());
     }
 }

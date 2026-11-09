@@ -87,23 +87,43 @@ const FACE_PORTS_UNREADABLE_LINE: &str =
 /// **範囲の幅の写し**（`port_search::PORT_SHIFT_SPAN`）。**定数から作らない。**
 const SPAN: u16 = 10;
 
-/// **ずらしたときの警告の頭**（`port_search::shifted_message` の写し。**定数から作らない**）。
-fn shifted_head(requested: u16, port: u16) -> String {
-    format!("ポート {requested} は使えなかったので、{port} で待ち受けます")
+/// **元の番号を、なぜ使わなかったか**（ずらしの警告の文の頭が違う / `port_search::shifted_message`）。
+#[derive(Clone, Copy)]
+enum Why {
+    /// 塞がっていた（「使えなかったので」）。
+    Taken,
+    /// llama の面が使う番号として飛ばした（「…面が使う番号なので」）。
+    FacePort,
 }
+
+/// **ずらしたときの警告の頭**（`port_search::shifted_message` の写し。**定数から作らない**）。
+///
+/// **写すのは文の頭だけ**——括弧の中（次の起動・ブックマーク・「設定」）を変えても、これは赤にならない。
+fn shifted_head(requested: u16, port: u16, why: Why) -> String {
+    match why {
+        Why::Taken => format!("ポート {requested} は使えなかったので、{port} で待ち受けます"),
+        Why::FacePort => format!(
+            "ポート {requested} は上流プロファイルの llama の面が使う番号なので、{port} で待ち受けます"
+        ),
+    }
+}
+
+/// **ずらしの警告の行に必ず入る綴り**（両方の文の括弧の頭 / 写し）。ずらしの警告を拾うのに使う。
+const SHIFT_WARNING_MARK: &str = "（ずらした番号は覚え";
 
 /// **ずれたかを起動ログから確かめ、`GET /admin/server` の `listening_port_shifted` が言うべき値を返す。**
 ///
 /// * 実際の番号が元の番号と同じなら、**ずらしたという警告が無い**こと。
-/// * 違うなら、**同じ1行が**元の番号・実際の番号を文で言い、欄（`requested_port` / `port` / `port_source`）も持つこと。
-fn assert_shift_said(lines: &[String], requested: u16, port: u16, source: &str) -> bool {
+/// * 違うなら、**同じ1行が**元の番号・実際の番号を `why` の文で言い、欄（`requested_port` / `port` /
+///   `port_source`）も持つこと。
+fn assert_shift_said(lines: &[String], requested: u16, port: u16, source: &str, why: Why) -> bool {
     let shifted = port != requested;
     let said: Vec<&String> = lines
         .iter()
-        .filter(|line| line.contains("は使えなかったので、"))
+        .filter(|line| line.contains(SHIFT_WARNING_MARK))
         .collect();
     if shifted {
-        let head = shifted_head(requested, port);
+        let head = shifted_head(requested, port, why);
         assert!(
             said.iter().any(|line| line.contains(&head)
                 && line.contains("WARN")
@@ -496,7 +516,7 @@ fn a_saved_port_is_where_a_bare_start_listens_and_the_api_moves_it() {
         let lines = first.all_lines(early);
         assert_settings_line(&lines, first_port, "saved");
         // **保存した番号で待ち受ける。放してから子が開くまでに取られていたら、ずれたと言う**（モジュールの doc）。
-        let shifted = assert_shift_said(&lines, first_port, port, "saved");
+        let shifted = assert_shift_said(&lines, first_port, port, "saved", Why::Taken);
 
         assert_eq!(
             server_report(port),
@@ -551,7 +571,7 @@ fn a_saved_port_is_where_a_bare_start_listens_and_the_api_moves_it() {
     let lines = second.all_lines(early);
     // **API で保存した番号から、次の起動が試し始める**（取られていたら、ずれたと言う）。
     assert_settings_line(&lines, second_port, "saved");
-    let shifted = assert_shift_said(&lines, second_port, port, "saved");
+    let shifted = assert_shift_said(&lines, second_port, port, "saved", Why::Taken);
     let report = server_report(port);
     assert_eq!(report["listening_port_requested"], second_port, "{report}");
     assert_eq!(report["listening_port_shifted"], shifted, "{report}");
@@ -594,7 +614,7 @@ fn the_upstream_flag_path_listens_on_the_saved_port_too() {
     let lines = started.all_lines(early);
     // **`--upstream` の起動も保存した番号から試し始める**（取られていたら、ずれたと言う）。
     assert_settings_line(&lines, saved_port, "saved");
-    assert_shift_said(&lines, saved_port, port, "saved");
+    assert_shift_said(&lines, saved_port, port, "saved", Why::Taken);
     assert!(
         lines
             .iter()
@@ -644,15 +664,22 @@ fn a_remembered_profile_on_the_saved_port_is_kept_and_the_saved_port_is_skipped(
         let (port, early) = started.listening_port_keeping_lines();
         let lines = started.all_lines(early);
         assert_ne!(port, saved_port, "面が使う保存した番号で待ち受けた");
+        // **元の番号は塞がっていたのではなく面の番号なので、警告は「面が使う番号なので」の文で言う**
+        // （「使えなかった」「次の起動ではまた試す」は偽になる / F-11b のレビュー是正）。
         assert!(
-            assert_shift_said(&lines, saved_port, port, "saved"),
+            assert_shift_said(&lines, saved_port, port, "saved", Why::FacePort),
             "前提: ずれていること"
         );
         assert!(
-            lines
+            !lines
                 .iter()
-                .any(|line| line.contains("は使えなかったので、")
-                    && has_field(line, &format!("skipped_ports=[{saved_port}]"))),
+                .any(|line| line.contains("は使えなかったので、")),
+            "面の番号で飛ばした元の番号を「使えなかった」と言っている\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines.iter().any(|line| line.contains(SHIFT_WARNING_MARK)
+                && has_field(line, &format!("skipped_ports=[{saved_port}]"))),
             "飛ばした番号（保存した番号）を言っていない\n{}",
             lines.join("\n")
         );
@@ -990,12 +1017,18 @@ fn a_taken_saved_port_shifts_past_a_face_port_and_the_log_and_the_api_say_so() {
         lines.join("\n")
     );
     // **警告の同じ1行が、元の番号・実際の番号（文と欄）・出どころ・飛ばした番号を言う。**
-    assert!(assert_shift_said(&lines, saved_port, port, "saved"));
+    assert!(assert_shift_said(
+        &lines,
+        saved_port,
+        port,
+        "saved",
+        Why::Taken
+    ));
     assert!(
-        lines
-            .iter()
-            .any(|line| line.contains(&shifted_head(saved_port, port))
-                && has_field(line, &format!("skipped_ports=[{face_port}]"))),
+        lines.iter().any(
+            |line| line.contains(&shifted_head(saved_port, port, Why::Taken))
+                && has_field(line, &format!("skipped_ports=[{face_port}]"))
+        ),
         "警告の同じ行が飛ばした番号を言っていない\n{}",
         lines.join("\n")
     );
@@ -1086,7 +1119,9 @@ fn a_whole_range_taken_names_the_range_and_how_to_get_out() {
 /// 番号を明示した起動は読まない**（ADR-0057 §決定3）。
 ///
 /// * 1回目（明示しない・保存した番号）: 警告がちょうど1本・`WARN`・置き場所を言う。止まらない。
-/// * 2回目（**対照**: `PERSONACORE_PORT=0`）: 警告が無い（読まない）。
+/// * 2回目・3回目（**対照**: `PERSONACORE_PORT` を `0` と、0 でない空いている番号で明示）: 警告が無い（読まない）。
+///   **0 でない腕が要る**——「明示か」を `bind().port() == 0` で決める実装は、`0` の腕だけでは見分けられない
+///   （F-11b のレビューが予想した変異 M19）。
 #[test]
 fn an_unreadable_profile_file_warns_once_and_the_start_goes_on() {
     let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
@@ -1117,22 +1152,32 @@ fn an_unreadable_profile_file_warns_once_and_the_start_goes_on() {
             warnings[0]
         );
         assert_settings_line(&lines, saved_port, "saved");
-        assert_shift_said(&lines, saved_port, port, "saved");
+        assert_shift_said(&lines, saved_port, port, "saved", Why::Taken);
         assert!(started.running.is_alive(), "止まっている");
     }
 
-    let mut started = spawn_on_machine(
-        root,
-        &[],
-        &[("PERSONACORE_PORT", std::ffi::OsStr::new("0"))],
-    );
-    let (_port, early) = started.listening_port_keeping_lines();
-    let lines = started.all_lines(early);
-    assert!(
-        !lines
-            .iter()
-            .any(|line| line.contains(FACE_PORTS_UNREADABLE_LINE)),
-        "番号を明示した起動が、飛ばす番号のために upstreams.json を読んでいる\n{}",
-        lines.join("\n")
-    );
+    // **明示の番号は、OS が配らない帯から取る**（放してから子が開くまでに取られにくい / `hold_quiet_range`）。
+    let (held, quiet) = hold_quiet_range();
+    drop(held);
+    for explicit in ["0".to_owned(), quiet.to_string()] {
+        let mut started = spawn_on_machine(
+            root,
+            &[],
+            &[("PERSONACORE_PORT", std::ffi::OsStr::new(&explicit))],
+        );
+        let (_port, early) = started.listening_port_keeping_lines();
+        let lines = started.all_lines(early);
+        assert_settings_line(
+            &lines,
+            explicit.parse().expect("番号であること"),
+            "environment",
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains(FACE_PORTS_UNREADABLE_LINE)),
+            "番号を明示した起動（{explicit}）が、飛ばす番号のために upstreams.json を読んでいる\n{}",
+            lines.join("\n")
+        );
+    }
 }
