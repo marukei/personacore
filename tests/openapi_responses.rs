@@ -1246,6 +1246,77 @@ async fn the_profile_endpoints_answer_as_documented_when_the_file_is_editable() 
     server.stop().await;
 }
 
+/// **待ち受けのポートの口を、保存できる起動で**（ADR-0057 §決定6 / 作業単位 F-12a）。
+///
+/// | 作る応答 | 検証すること |
+/// |---|---|
+/// | `GET /admin/server`（保存なし） | `ServerView`（`saved_port` が `null`） |
+/// | 保存の 200（空いている番号・掴まれた番号） | `SavePortView`（`saved_port_in_use` が `false` と `true`。`saved_port` が整数） |
+/// | 保存を消した 200 | `SavePortView`（`saved_port` と `saved_port_in_use` が `null`） |
+/// | 400 `invalid_listening_port` / 400 `invalid_body` | `default` の `ErrorBody` |
+#[tokio::test]
+async fn the_server_endpoints_answer_as_documented_when_the_file_is_editable() {
+    const GET: &str = "/admin/server";
+    const PUT: &str = "/admin/server/port";
+    let spec = Spec::load();
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作成できること");
+    let path = dir.path().join("upstreams.json");
+    std::fs::write(&path, "{}").expect("プロファイルを置けること");
+    let server = EditableServer::start(dir.path(), path.clone()).await;
+
+    let (status, report) = server.send(Method::GET, GET, None).await;
+    assert_eq!(status, StatusCode::OK, "{report:#}");
+    assert!(report["saved_port"].is_null(), "前提: 保存なし: {report:#}");
+    spec.check(GET, "get", status, &report);
+
+    let free = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("ポートを取れること")
+        .port();
+    let (status, saved) = server
+        .send(Method::PUT, PUT, Some(json!({ "port": free })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved:#}");
+    assert_eq!(saved["saved_port_in_use"], json!(false), "前提: {saved:#}");
+    spec.check(PUT, "put", status, &saved);
+
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("ポートを取れること");
+    let held_port = held.local_addr().expect("宛先を読めること").port();
+    let (status, taken) = server
+        .send(Method::PUT, PUT, Some(json!({ "port": held_port })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{taken:#}");
+    assert_eq!(taken["saved_port_in_use"], json!(true), "前提: {taken:#}");
+    spec.check(PUT, "put", status, &taken);
+    drop(held);
+
+    let (status, read) = server.send(Method::GET, GET, None).await;
+    assert_eq!(read["saved_port"], json!(held_port), "前提: {read:#}");
+    spec.check(GET, "get", status, &read);
+
+    let (status, forgot) = server
+        .send(Method::PUT, PUT, Some(json!({ "port": null })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{forgot:#}");
+    assert!(
+        forgot["saved_port"].is_null() && forgot["saved_port_in_use"].is_null(),
+        "前提: {forgot:#}"
+    );
+    spec.check(PUT, "put", status, &forgot);
+
+    for (body, code) in [
+        (json!({ "port": 80 }), "invalid_listening_port"),
+        (json!({}), "invalid_body"),
+    ] {
+        let (status, refused) = server.send(Method::PUT, PUT, Some(body.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {refused:#}");
+        assert_eq!(refused["error"]["code"], json!(code), "{body}: {refused:#}");
+        spec.check(PUT, "put", status, &refused);
+    }
+
+    server.stop().await;
+}
+
 /// **対照: 検証の道具は、仕様書と食い違う応答を通さない**（植えた応答）。
 ///
 /// 道具が何でも通す形に壊れていると、上の検証は全部緑のまま何も見ていない。

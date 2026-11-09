@@ -503,6 +503,78 @@ async fn a_foreign_host_cannot_save_a_profile_and_nothing_is_written() {
     server.stop().await;
 }
 
+/// **外の `Host` / `Origin` から待ち受けのポートの保存の口を叩いても 403 で、保存のファイルは1バイトも変わらない**
+/// （ADR-0057 §決定6「`PUT` は設定を書く口なので、DNS rebinding の検査が守る経路そのもの」/ 作業単位 F-12a）。
+///
+/// **最後に正しい `Host` で同じ依頼を送り、実際に書けることを確かめる**（上の保存の口の腕と同じ理由）。
+#[tokio::test]
+async fn a_foreign_host_cannot_save_the_listening_port_and_nothing_is_written() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let profiles_dir = dir.path().join("app");
+    std::fs::create_dir_all(&profiles_dir).expect("作れること");
+    let path = profiles_dir.join("upstreams.json");
+    std::fs::write(&path, one_profile().to_string()).expect("置けること");
+    let saved = profiles_dir.join("listening-port.txt");
+    std::fs::write(&saved, "8090\n").expect("置けること");
+    let original = std::fs::read(&saved).expect("読めること");
+
+    let server = Serving::start(dir.path(), path.clone()).await;
+    let port = server.port;
+    let other = assert_ports_differ(port);
+    let own = format!("127.0.0.1:{port}");
+    let body = json!({ "port": 9123 }).to_string();
+
+    let refused_arms: [(&str, Vec<(&str, String)>); 4] = [
+        ("外の Host", vec![host(format!("evil.example:{port}"))]),
+        (
+            "ポートだけ違う Host",
+            vec![host(format!("127.0.0.1:{other}"))],
+        ),
+        (
+            "外の Origin",
+            vec![host(&own), origin(format!("http://evil.example:{port}"))],
+        ),
+        ("Origin: null", vec![host(&own), origin("null")]),
+    ];
+    for (label, headers) in &refused_arms {
+        let reply = raw(port, "PUT", "/admin/server/port", headers, Some(&body)).await;
+        reply.assert_refused(label);
+        assert_eq!(
+            std::fs::read(&saved).expect("読めること"),
+            original,
+            "{label}: 断ったのに保存のファイルが変わった"
+        );
+    }
+    // **読む口も同じ検査を通る**（`GET` だけ素通しする形を作らない）。
+    raw(
+        port,
+        "GET",
+        "/admin/server",
+        &[host(format!("evil.example:{port}"))],
+        None,
+    )
+    .await
+    .assert_refused("外の Host の GET");
+
+    // **対照: 正しい `Host`（と自分の `Origin`）なら同じ依頼で書ける。**
+    let accepted = raw(
+        port,
+        "PUT",
+        "/admin/server/port",
+        &[host(&own), origin(format!("http://{own}"))],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(accepted.status, 200, "{}", accepted.body);
+    assert_eq!(
+        std::fs::read_to_string(&saved).expect("読めること"),
+        "9123\n",
+        "対照: 正しい Host でも書けていない（フィクスチャが書けない形になっている）"
+    );
+
+    server.stop().await;
+}
+
 /// **`Host` は `127.0.0.1` / `localhost` と、実際に待ち受けているポートの組だけが通る。**
 ///
 /// **設定のポートは 0** なので、設定値と比べる実装は通るべき行まで断って赤になる。

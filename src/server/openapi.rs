@@ -79,7 +79,7 @@ use utoipa::{OpenApi, PartialSchema, ToSchema};
 use super::chat::{ASSISTANT_ROLE, finish_reason_schema};
 use super::error::{ApiError, ErrorBody};
 use super::relay::{CHUNK_OBJECT, DONE_DATA};
-use super::{admin, chat, models, profile_editor, switch, upstream};
+use super::{admin, chat, listening_port, models, profile_editor, switch, upstream};
 
 /// **実験中の口に付ける拡張の名前**（ADR-0047 §② P-2b「安定度を口ごとに名乗る」）。
 ///
@@ -133,7 +133,12 @@ const STABILITY_EXTENSION: &str = "x-personacore-stability";
 ///
 /// **この版から、上げ忘れは `tests/api_shape_fingerprint.rs` が赤にする**（版 → 形の指紋の表。
 /// 失敗の形は `error::error_catalog` から畳み込む）。
-pub const API_VERSION: &str = "1.4";
+///
+/// **`1.5`**（作業単位 F-12a / ADR-0057 §決定6 の F-12 の行）: 待ち受けのポートの口2本
+/// （`GET /admin/server`・`PUT /admin/server/port`）と、その新しい失敗（400 `invalid_listening_port`・
+/// 409 `listening_port_read_only`・500 `listening_port_write_failed`）。口の追加なので小さい側。
+/// 既存の口の形は変えていない。**`1.5` は公開の版には現れない**（F-11 が同じ v0.4.1 の中で `1.6` へ上げる）。
+pub const API_VERSION: &str = "1.5";
 
 /// **ルータに届いた要求への全部の応答に付ける、API の版のヘッダの名前**
 /// （HTTP では大文字小文字を区別しない。仕様書の `headers` の鍵もこの綴り）。
@@ -228,6 +233,8 @@ impl ToSchema for OpenApiDocument {
         switch::switch_profile,
         profile_editor::list_profiles,
         profile_editor::save_profile,
+        listening_port::get_server,
+        listening_port::save_listening_port,
         admin::list_characters,
         admin::create_character,
         admin::update_character,
@@ -1228,9 +1235,10 @@ mod tests {
         let routes = routes_in(include_str!("mod.rs"));
         assert_eq!(
             routes.len(),
-            29,
+            31,
             "前提: 走査がルート表を読めていること（2026-09-30 は 22。作業単位 A-12a で取り決めの4つを足して 26、\
-             A-12c-1 で提案の採否の2つを足して 28、B-66 で上流へいま照会する口を足して 29 / 数えたのは走査の外）: {routes:?}"
+             A-12c-1 で提案の採否の2つを足して 28、B-66 で上流へいま照会する口を足して 29、\
+             F-12a で待ち受けのポートの2つを足して 31 / 数えたのは走査の外）: {routes:?}"
         );
         assert_eq!(routes, documented_operations(&document()));
     }
@@ -1314,6 +1322,8 @@ mod tests {
             switch::__path_switch_profile,
             profile_editor::__path_list_profiles,
             profile_editor::__path_save_profile,
+            listening_port::__path_get_server,
+            listening_port::__path_save_listening_port,
             admin::__path_list_characters,
             admin::__path_create_character,
             admin::__path_update_character,
@@ -1422,6 +1432,7 @@ mod tests {
     fn closed_fields() -> Vec<(&'static str, &'static str, BTreeSet<String>)> {
         use super::super::admin::{delta_to_wire, role_to_wire, subject_to_wire};
         use super::super::chat::{ASSISTANT_ROLE, COMPLETION_OBJECT, finish_reason_to_wire};
+        use super::super::config::PortSource;
         use super::super::error::ApiError;
         use super::super::launch::FaceState;
         use super::super::models::{LIST_OBJECT, MODEL_OBJECT, OWNED_BY};
@@ -1584,6 +1595,17 @@ mod tests {
                 set_of(with_null(AnsweredBy::ALL.map(AnsweredBy::label))),
             ),
             ("LaunchView", "state", set_of(some(FaceState::all_labels()))),
+            // **待ち受けのポートの出どころ**（ADR-0057 §決定5 / 作業単位 F-12a）。
+            (
+                "ServerView",
+                "listening_port_source",
+                set_of(some(PortSource::ALL.map(PortSource::label))),
+            ),
+            (
+                "ServerView",
+                "next_port_source",
+                set_of(some(PortSource::ALL.map(PortSource::label))),
+            ),
             // **最後の照会の結果**（作業単位 B-66）。「照会していない」と結果の4つ。
             (
                 "UpstreamView",
@@ -1727,6 +1749,17 @@ mod tests {
                     json!("approved"),
                     json!("not_approved"),
                 ],
+            ),
+            // **待ち受けのポートの出どころ**（作業単位 F-12a / ADR-0057 §決定6 の表の綴り）。
+            (
+                "ServerView",
+                "listening_port_source",
+                vec![json!("environment"), json!("saved"), json!("default")],
+            ),
+            (
+                "ServerView",
+                "next_port_source",
+                vec![json!("environment"), json!("saved"), json!("default")],
             ),
         ] {
             let expected: BTreeSet<String> = spelled.iter().map(Value::to_string).collect();
@@ -1973,6 +2006,7 @@ mod tests {
             "SaveRequest",
             "WrittenFaceRequest",
             "SwitchRequest",
+            "SavePortRequest",
         ] {
             assert_eq!(
                 schema(&document, name)["additionalProperties"],
@@ -2091,6 +2125,53 @@ mod tests {
         assert!(required(axis).contains(&"value"));
         assert!(admits_null(&axis["properties"]["value"]));
         assert!(!admits_null(&axis["properties"]["charge"]));
+    }
+
+    /// **待ち受けのポートの保存は `port` を省けず、`null`（消す）を受ける。範囲も名乗る**
+    /// （`listening_port::SavePortRequest` の doc / 作業単位 F-12a）。
+    ///
+    /// **応答の `saved_port` / `next_port` / `saved_port_in_use` は常に載って `null` になりうる。**
+    /// `listening_port` は `null` にならない（同じ型の中で対を見る）。
+    #[test]
+    fn the_port_request_cannot_omit_the_port_but_may_clear_it() {
+        let document = document();
+        let request = schema(&document, "SavePortRequest");
+        assert_eq!(required(request), vec!["port"], "{request}");
+        let port = &request["properties"]["port"];
+        assert!(
+            admits_null(port),
+            "port は null（消す）を受けること: {port}"
+        );
+        assert_eq!(port["minimum"], json!(1024), "{port}");
+        assert_eq!(port["maximum"], json!(65535), "{port}");
+
+        let view = schema(&document, "ServerView");
+        for field in ["saved_port", "next_port"] {
+            assert!(required(view).contains(&field), "{field}: {view}");
+            assert!(admits_null(&view["properties"][field]), "{field}: {view}");
+        }
+        assert!(
+            !admits_null(&view["properties"]["listening_port"]),
+            "{view}"
+        );
+
+        let saved = schema(&document, "SavePortView");
+        let carries_in_use = parts(saved).into_iter().any(|part| {
+            required(part).contains(&"saved_port_in_use")
+                && admits_null(&part["properties"]["saved_port_in_use"])
+        });
+        assert!(
+            carries_in_use,
+            "saved_port_in_use が必須かつ null 可でない: {saved}"
+        );
+        assert!(
+            saved["allOf"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|part| part["$ref"] == json!("#/components/schemas/ServerView")),
+            "保存の応答が GET と同じ形（ServerView）を含んでいない: {saved}"
+        );
     }
 
     /// **エラーの形**（`{"error": {"message", "type", "code"?}}` / `error` モジュールの doc）。

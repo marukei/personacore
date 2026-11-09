@@ -35,6 +35,7 @@ repeat every field.
 - [Memories](#memories)
 - [Conversation history](#conversation-history)
 - [Upstream inference servers](#upstream-inference-servers)
+- [The listening port](#the-listening-port)
 - [Errors](#errors)
 - [Versioning and compatibility](#versioning-and-compatibility)
 - [Walkthrough with curl](#walkthrough-with-curl)
@@ -136,6 +137,10 @@ PERSONACORE_PORT=8123 ./personacore --no-ui
 $env:PERSONACORE_PORT = "8123"; .\personacore.exe --no-ui
 ```
 
+A port can also be saved through the API (`PUT /admin/server/port`, see
+[The listening port](#the-listening-port)); it is used from the next start. The order is
+`PERSONACORE_PORT`, then the saved port, then `8080`.
+
 The startup log prints the address it listens on.
 
 **Where data lives.** By default everything is under a `personacore` directory in the
@@ -148,17 +153,19 @@ operating system's per-user data directory:
 | Other Unix | `$XDG_DATA_HOME/personacore/` (or `~/.local/share/personacore/`) |
 
 It holds the SQLite database (`personacore.sqlite`), the upstream profiles
-(`upstreams.json`) and the name of the last selected profile (`selected-upstream.txt`).
+(`upstreams.json`), the name of the last selected profile (`selected-upstream.txt`) and
+the saved listening port (`listening-port.txt`, only after a port has been saved).
 Only Windows has actually been run.
 
 `PERSONACORE_DB_PATH` moves **only the database**. The upstream profiles stay in the
 data directory unless you also set `PERSONACORE_UPSTREAMS` to another file. This matters
 when you run a second instance for testing: with only `PERSONACORE_DB_PATH` set, it
-still reads your real profiles and selects the profile you last selected. It does not
+still reads your real profiles and selects the profile you last selected (and listens on
+your saved port unless `PERSONACORE_PORT` is set). It does not
 start that profile's process at launch, but a `POST /admin/upstream/profile` with the
 same name, or `--upstream <name>`, starts a process from your real profiles. Setting
 `PERSONACORE_UPSTREAMS` to a file that does not exist gives an instance that starts no
-upstream.
+upstream and neither reads nor saves a listening port.
 
 **Upstream.** personacore does not ship a model. By default it sends requests to an
 OpenAI-compatible server on the same machine (LM Studio's default address); set
@@ -188,7 +195,7 @@ itself. It is served with `--no-ui` too, because it is part of the API, not of t
 carries the API version:
 
 ```
-x-personacore-api-version: 1.4
+x-personacore-api-version: 1.5
 ```
 
 That includes errors, 404 and 405 responses, the event stream and `/openapi.json`.
@@ -687,6 +694,51 @@ the API can make personacore run a program of its choosing; see
 [Security model](#security-model-local-only-no-authentication). The switch request
 itself carries only a profile name.
 
+## The listening port
+
+| Route | Purpose |
+|---|---|
+| `GET /admin/server` | The port personacore is listening on, where it came from, the saved port, and the port the next start will use |
+| `PUT /admin/server/port` | Save a port for the next start (`{"port": 8090}`), or clear the saved port (`{"port": null}`) |
+
+The port is decided at start, in this order: `PERSONACORE_PORT`, then the saved port,
+then `8080`. **Saving does not move the running server**; the saved port is used from
+the next start.
+
+`GET /admin/server` returns:
+
+| Field | Meaning |
+|---|---|
+| `listening_port` | The port personacore is actually listening on (with `PERSONACORE_PORT=0`, the port the operating system chose) |
+| `listening_port_source` | Where that port came from: `environment` (`PERSONACORE_PORT`), `saved` or `default` |
+| `saved_port` | The saved port, or `null` when none is saved, the file cannot be read, or ports cannot be saved in this run |
+| `next_port` | The port the next start will use, worked out now from this process's `PERSONACORE_PORT` and the saved port (`null` if `PERSONACORE_PORT` cannot be read as a port, in which case the next start stops) |
+| `next_port_source` | Where `next_port` comes from (same values as `listening_port_source`) |
+| `editable` | Whether a port can be saved in this run |
+
+`PUT /admin/server/port` takes `{"port": <number or null>}`; `port` cannot be omitted.
+A saved port must be from 1024 to 65535; `0` (let the operating system choose) can only
+be given through `PERSONACORE_PORT`. The response has the same fields as
+`GET /admin/server`, plus `saved_port_in_use`: whether another program on this machine
+is using the saved port on `127.0.0.1` right now (`false` for the port this personacore
+is listening on, `null` after clearing). A port in use is still saved.
+
+| Status | When |
+|---|---|
+| 200 | Saved or cleared |
+| 400 `invalid_body` | The body cannot be read, `port` is missing, or `port` is not an integer |
+| 400 `invalid_listening_port` | `port` is outside 1024 to 65535 |
+| 409 `listening_port_read_only` | Ports cannot be saved in this run (`editable` is `false`) |
+| 500 `listening_port_write_failed` | The file could not be written or removed; what was saved before is kept |
+
+The saved port lives in `listening-port.txt` next to `upstreams.json` (see
+[Running personacore without the UI](#running-personacore-without-the-ui)). Like the
+remembered profile name, it is read and written **only when the profiles live in the
+default place**: with `PERSONACORE_UPSTREAMS` set, the file is not read and saving
+answers 409. A file that cannot be read (not a single number from 1024 to 65535) is
+reported once in the startup log and ignored; it is not deleted. When `PERSONACORE_PORT`
+is set, it wins over the saved port, and `next_port_source` says `environment`.
+
 ## Errors
 
 Errors from the API (every route under `/v1/*` and `/admin/*`, `/openapi.json`, and
@@ -717,7 +769,7 @@ header.
 
 ## Versioning and compatibility
 
-The current API version is `1.4`.
+The current API version is `1.5`.
 
 The API version is kept separately from the application version and is stated in the
 OpenAPI document (`info.version`) and in the `X-Personacore-Api-Version` header. The
@@ -753,6 +805,11 @@ segment (such as `v1`) into the paths under `/admin`.
   working; requests that reached personacore some other way (for example through another
   host name) may start to be refused within `1.x`. The `Host` / `Origin` checks were added
   this way.
+
+Changes in `1.5` (from `1.4`): the two listening port routes, `GET /admin/server` and
+`PUT /admin/server/port` (see [The listening port](#the-listening-port)), and their new
+failures: 400 `invalid_listening_port`, 409 `listening_port_read_only` and 500
+`listening_port_write_failed`. No existing route changed.
 
 Changes in `1.4` (from `1.3`): on the upstream routes (see
 [Upstream inference servers](#upstream-inference-servers)), the new route
