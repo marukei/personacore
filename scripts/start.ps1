@@ -306,7 +306,8 @@ if (-not $PSBoundParameters.ContainsKey('Upstream')) {
 #    既定の番号で事前検査して URL を組み立てると、保存した番号で起きる起動を誤って止め、開かない URL を案内する。
 #    見張り番は tests/start_script.rs の the_start_script_checks_the_port_only_when_it_was_named。
 #
-# ⚠ **引き継いだ PERSONACORE_PORT は、在るだけで明示とみなす**（空白だけの値も。personacore と同じ受理集合）。
+# ⚠ **引き継いだ PERSONACORE_PORT は、在るだけで明示とみなす**（空白だけの値も。在る・無いの判定は personacore と同じ。
+#    ただし 0 は、personacore は「OS に選ばせる」として受けるが、このスクリプトは止める —— 事前検査も URL も組めないため）。
 #    personacore は在る値を前後の空白を落として番号に読み、読めなければ止まる。ここで空白だけを
 #    「明示していない」と読むと、事前に見ずに渡して personacore の側で止まり、止まる場所と文が食い違う。
 #    （PowerShell からは空の値を立てにくいが、親のプロセスから引き継ぐことはある。）
