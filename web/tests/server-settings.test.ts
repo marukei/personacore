@@ -84,6 +84,72 @@ describe("出どころの言い方", () => {
   });
 });
 
+/**
+ * **ずらして起きたときの、いまの番号の行**（作業単位 F-11c の実機確認で見つかった是正）。
+ *
+ * **ずらした番号に「（保存した番号）」とだけ付けると、帯から来た利用者には矛盾して見える**（保存したのは元の番号）。
+ * 文は帯と同じ分け方（`listening_port_skipped` が元の番号を含むか）。
+ */
+describe("ずらして起きたときの、いまの番号の行", () => {
+  it("元の番号が使えなかった（保存した番号から）", () => {
+    expect(
+      rowsOf(
+        viewOf({
+          listening_port: 23101,
+          listening_port_requested: 23100,
+          listening_port_shifted: true,
+          listening_port_skipped: [],
+        }),
+      )[0],
+    ).toEqual(["いま待ち受けている番号", "23101（保存した番号 23100 が使えなかったので、ずらした番号）"]);
+  });
+
+  it("元の番号を llama の面の番号として飛ばした", () => {
+    expect(
+      rowsOf(
+        viewOf({
+          listening_port: 23101,
+          listening_port_requested: 23100,
+          listening_port_shifted: true,
+          listening_port_skipped: [23100],
+        }),
+      )[0],
+    ).toEqual([
+      "いま待ち受けている番号",
+      "23101（保存した番号 23100 が llama の面の番号なので、ずらした番号）",
+    ]);
+  });
+
+  it("出どころが既定で、元の番号の後に面の番号を飛ばした（使えなかった方の文）", () => {
+    expect(
+      rowsOf(
+        viewOf({
+          listening_port: 8082,
+          listening_port_source: "default",
+          listening_port_requested: 8080,
+          listening_port_shifted: true,
+          listening_port_skipped: [8081],
+        }),
+      )[0],
+    ).toEqual(["いま待ち受けている番号", "8082（既定の番号 8080 が使えなかったので、ずらした番号）"]);
+  });
+
+  /** **0 の起動（OS に選ばせた）は、元の番号と違ってもずらしていない**——サーバの `shifted` に従う。 */
+  it("0 の起動では、ずらしたと言わない", () => {
+    const row = rowsOf(
+      viewOf({
+        listening_port: 51234,
+        listening_port_source: "environment",
+        listening_port_requested: 0,
+        listening_port_shifted: false,
+        listening_port_skipped: [],
+      }),
+    )[0];
+    expect(row).toEqual(["いま待ち受けている番号", "51234（環境変数 PERSONACORE_PORT）"]);
+    expect(row?.[1]).not.toContain("ずらした");
+  });
+});
+
 describe("行", () => {
   it("いま・保存・次の起動を、この順に並べる（出どころは保存）", () => {
     expect(rowsOf(viewOf())).toEqual([

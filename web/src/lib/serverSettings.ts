@@ -59,6 +59,28 @@ function portWithSource(port: number, source: string): string {
 }
 
 /**
+ * **いま待ち受けている番号の行の値**（作業単位 F-11c の実機確認で見つかった是正 / ADR-0057 §決定4）。
+ *
+ * **ずらして起きたときは、元の番号と、ずらしたことを言う**——ずらした番号に「（保存した番号）」とだけ付けると、
+ * 帯（「ポート 23100 は…使えなかったので、23101 で起動しました」）から来た利用者には矛盾して見える。
+ * 理由の分け方は帯と同じ（`listening_port_skipped` が元の番号を含めば llama の面の番号 / `portShift.ts`）。
+ * 帯より短い形で、帯と矛盾しない言い方（「使えなかった」）にする。
+ *
+ * **ずらしたかはサーバの `listening_port_shifted` だけで決める**——番号を比べると、`PERSONACORE_PORT=0` の起動
+ * （元の番号 0、実際は OS が選んだ番号）を「ずらした」と取り違える。
+ */
+function listeningPortText(view: ServerView): string {
+  if (!view.listening_port_shifted) {
+    return portWithSource(view.listening_port, view.listening_port_source);
+  }
+  const requested = view.listening_port_requested;
+  const why = view.listening_port_skipped.includes(requested)
+    ? "が llama の面の番号なので"
+    : "が使えなかったので";
+  return `${view.listening_port}（${portSourceLabel(view.listening_port_source)} ${requested} ${why}、ずらした番号）`;
+}
+
+/**
  * **保存した番号の行の値。**
  *
  * **3つの「`saved_port` が `null`」を見分ける** —— 保存できない起動（読みもしない）・壊れたファイルが在る・
@@ -94,7 +116,7 @@ export function serverRows(view: ServerView): SettingRow[] {
   return [
     {
       label: "いま待ち受けている番号",
-      value: portWithSource(view.listening_port, view.listening_port_source),
+      value: listeningPortText(view),
     },
     { label: "保存した番号", value: savedPortText(view) },
     { label: "次の起動で使う番号", value: nextPortText(view) },
