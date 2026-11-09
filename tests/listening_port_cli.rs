@@ -60,6 +60,11 @@ const TOUCH_MARKER: &str = "fake-llama-was-started";
 const SAVED_PORT_UNREADABLE_LINE: &str =
     "保存した待ち受けのポートを読めないので、使わずに起動します";
 
+/// **同じ警告の行が、直す場所として名指す画面**（作業単位 F-12b）。**写しである。**
+///
+/// 画面の「設定」で保存し直すか消せば直る（ファイルを手で直さなくてよい）ことを、警告が言う。
+const SAVED_PORT_UNREADABLE_SCREEN: &str = "画面の「設定」";
+
 /// **覚えた名前が使えないときの警告の本文**（`src/main.rs` の `REMEMBERED_UNUSABLE`）。**写しである。**
 const REMEMBERED_UNUSABLE_LINE: &str =
     "覚えていた上流プロファイルを使えないので、環境変数の既定で起動します";
@@ -680,6 +685,12 @@ fn an_unreadable_saved_port_warns_and_the_file_is_kept() {
         assert!(
             warnings[0].contains("listening-port.txt"),
             "{arm}: 警告の同じ行が置き場所を言っていない: {}",
+            warnings[0]
+        );
+        // **同じ行が、直せる画面を名指す**（作業単位 F-12b）。
+        assert!(
+            warnings[0].contains(SAVED_PORT_UNREADABLE_SCREEN),
+            "{arm}: 警告の同じ行が「設定」の画面を名指していない: {}",
             warnings[0]
         );
         // **前提: 警告の行は `WARN` を名乗る**（下の「GET が警告を積まない」の検出が空振りしないこと）。
