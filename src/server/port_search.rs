@@ -64,6 +64,9 @@ impl PortStep {
 pub(crate) struct PortSearch {
     requested: u16,
     source: PortSource,
+    /// **ずらすか**（明示でも `0` でもない）。**列の長さからは決めない**——保存した番号が 65535 なら、
+    /// ずらす起動でも列は1つしか無い（そこで明示と取り違えると、範囲でなく1つの番号の文で止まる）。
+    shifts: bool,
     steps: Vec<PortStep>,
 }
 
@@ -74,9 +77,8 @@ impl PortSearch {
     /// **明示（`environment`）と `0` では見ない**——明示した番号が面と同じなら、今までどおり
     /// `LaunchPlan::port_conflict`（B-52）が止める。
     pub(crate) fn plan(requested: u16, source: PortSource, face_ports: &BTreeSet<u16>) -> Self {
-        let steps = if source == PortSource::Environment || requested == 0 {
-            vec![PortStep::Try(requested)]
-        } else {
+        let shifts = source != PortSource::Environment && requested != 0;
+        let steps = if shifts {
             // **`RangeInclusive<u16>` は `u16::MAX` を含めて止まる**（`saturating_add` で上端を 65535 に打ち切る）。
             (requested..=requested.saturating_add(PORT_SHIFT_SPAN))
                 .map(|port| {
@@ -87,17 +89,15 @@ impl PortSearch {
                     }
                 })
                 .collect()
+        } else {
+            vec![PortStep::Try(requested)]
         };
         Self {
             requested,
             source,
+            shifts,
             steps,
         }
-    }
-
-    /// **ずらすか**（明示でも `0` でもない）。
-    fn shifts(&self) -> bool {
-        self.steps.len() > 1
     }
 
     /// 範囲の最後の番号（試した範囲を言う文に使う）。
@@ -221,7 +221,7 @@ where
                         },
                     ));
                 }
-                Err(err) if search.shifts() && shifts_past(&err) => last_error = Some(err),
+                Err(err) if search.shifts && shifts_past(&err) => last_error = Some(err),
                 Err(err) => return Err(SearchFailure::Stopped(err)),
             },
         }
@@ -266,7 +266,7 @@ mod tests {
             let search = PortSearch::plan(8080, source, &faces(&[]));
             assert_eq!(search.steps(), tries(8080..=8090).as_slice(), "{source:?}");
             assert_eq!(search.last(), 8090);
-            assert!(search.shifts());
+            assert!(search.shifts);
         }
     }
 
@@ -276,7 +276,7 @@ mod tests {
         let search = PortSearch::plan(8081, PortSource::Environment, &faces(&[8081, 8082]));
         assert_eq!(search.steps(), [Try(8081)].as_slice());
         assert_eq!(search.last(), 8081);
-        assert!(!search.shifts());
+        assert!(!search.shifts);
     }
 
     /// **`0`（OS に選ばせる）はずらさない**——出どころを問わない（テストが `with_bind(0)` で組む形も）。
@@ -285,7 +285,7 @@ mod tests {
         for source in PortSource::ALL {
             let search = PortSearch::plan(0, source, &faces(&[0, 1]));
             assert_eq!(search.steps(), [Try(0)].as_slice(), "{source:?}");
-            assert!(!search.shifts());
+            assert!(!search.shifts);
         }
     }
 
@@ -459,6 +459,38 @@ mod tests {
             "OS の失敗を落とした"
         );
         assert_eq!(seen.len(), 10, "飛ばす 8081 を除く 10 個を試すこと");
+    }
+
+    /// **保存した番号が 65535（範囲が1つの番号しか無い）でも、明示とは扱わない**——塞がっていれば
+    /// 範囲（65535〜65535）を言って止まる（`ports_in_use_message`）。1つの番号の文（B-76 の明示の文）にしない。
+    ///
+    /// **列の長さで「ずらすか」を決めると、ここで明示と取り違える**（作業単位 F-11b の変異の準備中に見つけた）。
+    #[tokio::test]
+    async fn a_saved_port_at_the_top_is_still_a_range_of_one() {
+        let search = PortSearch::plan(65535, PortSource::Saved, &faces(&[]));
+        let mut seen = Vec::new();
+        let outcome = walk(
+            &search,
+            &[(65535, std::io::ErrorKind::AddrInUse)],
+            &mut seen,
+        )
+        .await;
+        let Err(SearchFailure::Exhausted(taken)) = outcome else {
+            panic!("範囲として止まっていない（明示と取り違えた）: {outcome:?}");
+        };
+        assert_eq!((taken.first(), taken.last()), (65535, 65535));
+
+        // **`PermissionDenied` も同じ**（ずらす失敗なので、明示の `Bind` にしない）。
+        let outcome = walk(
+            &search,
+            &[(65535, std::io::ErrorKind::PermissionDenied)],
+            &mut seen,
+        )
+        .await;
+        assert!(
+            matches!(outcome, Err(SearchFailure::Exhausted(_))),
+            "{outcome:?}"
+        );
     }
 
     /// **全部を飛ばしたときも範囲を言って止まる**（OS の失敗は無い）。
