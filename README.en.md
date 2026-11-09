@@ -81,7 +81,10 @@ logs under `data/` in the repository by default instead; see
 [scripts/README-start.md](scripts/README-start.md).) `PERSONACORE_DB_PATH` moves the
 database. The port is chosen at start, in this order: `PERSONACORE_PORT`, then the port
 saved on the settings screen (設定) in the web UI, then the default. A saved port takes
-effect from the next start.
+effect from the next start. If the saved port or the default port is taken, personacore
+starts on the next free port (up to ten above it) and says so in a banner at the top of
+the web UI and in the startup log. A port set with `PERSONACORE_PORT` is never moved; if
+it is taken, personacore stops.
 The default port is set in `src/server/config.rs` as `DEFAULT_PORT`, and the startup
 log prints the address.
 

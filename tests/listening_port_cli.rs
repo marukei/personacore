@@ -13,10 +13,20 @@
 //! |---|---|
 //! | `a_saved_port_is_where_a_bare_start_listens_and_the_api_moves_it` | 環境変数の既定の経路が保存した番号を見ない／出どころを言わない／保存が次の起動に効かない／`null` で消えない |
 //! | `the_upstream_flag_path_listens_on_the_saved_port_too` | プロファイル経由の経路（`config_for`）が保存した番号を見ない |
-//! | `a_remembered_profile_that_collides_with_the_saved_port_is_not_used` | 覚えた名前の事前検査が保存した番号を見ない |
+//! | `a_remembered_profile_on_the_saved_port_is_kept_and_the_saved_port_is_skipped` | 明示していないのに、覚えた名前を番号の取り合いで捨てる／面が使う保存した番号で待ち受ける（作業単位 F-11b） |
 //! | `the_environment_wins_over_the_saved_port` | 環境変数が保存に負ける／`GET /admin/server` の次の起動が環境変数を見ない |
 //! | `an_overridden_profile_file_neither_reads_nor_writes_the_saved_port` | `PERSONACORE_UPSTREAMS` の起動が保存を読む・書く |
 //! | `an_unreadable_saved_port_warns_and_the_file_is_kept` | 読めないファイルで止まる・黙る・ファイルを消す |
+//! | `a_taken_saved_port_shifts_past_a_face_port_and_the_log_and_the_api_say_so` | 保存した番号が塞がっていると止まる／`upstreams.json` の gguf の面の番号を飛ばさない／警告・`addr=`・`bind=`・`GET /admin/server` が実際と食い違う（F-11b） |
+//! | `a_whole_range_taken_names_the_range_and_how_to_get_out` | 範囲が全部塞がっているのに起きる／止まる文が範囲と直し方を言わない（F-11b） |
+//! | `an_unreadable_profile_file_warns_once_and_the_start_goes_on` | 飛ばす番号のために読む `upstreams.json` が読めないと止まる・黙る／明示した起動でも読む（F-11b） |
+//!
+//! # ずれたときの主張（作業単位 F-11b / marukei/personacore#14 の持ち越し）
+//!
+//! **空いている番号を OS から取って放し、子に保存させて待ち受けさせる形には隙がある**（放してから子が
+//! `bind` するまでに、他のテストがその番号を取りうる）。F-12 の間はそこで「待ち受けの行を読む前に
+//! プロセスが終了した」になった。**いまは保存した番号が塞がっていれば子がずれて起きる**ので、
+//! 「保存した番号で待ち受ける」腕は [`assert_shift_said`] で**「ずれたら、そう言う」**を主張する。
 //!
 //! # 隔離（CLAUDE.md「exe を起こすときは、DB だけでなく上流の設定も隔離する」）
 //!
@@ -68,6 +78,110 @@ const SAVED_PORT_UNREADABLE_SCREEN: &str = "画面の「設定」";
 /// **覚えた名前が使えないときの警告の本文**（`src/main.rs` の `REMEMBERED_UNUSABLE`）。**写しである。**
 const REMEMBERED_UNUSABLE_LINE: &str =
     "覚えていた上流プロファイルを使えないので、環境変数の既定で起動します";
+
+/// **飛ばす番号のために読む `upstreams.json` が読めないときの警告の本文**
+/// （`src/main.rs` の `FACE_PORTS_UNREADABLE`）。**写しである。**
+const FACE_PORTS_UNREADABLE_LINE: &str =
+    "上流プロファイルを読めないので、待ち受けのポートを探すときに llama の面の番号を飛ばせません";
+
+/// **範囲の幅の写し**（`port_search::PORT_SHIFT_SPAN`）。**定数から作らない。**
+const SPAN: u16 = 10;
+
+/// **元の番号を、なぜ使わなかったか**（ずらしの警告の文の頭が違う / `port_search::shifted_message`）。
+#[derive(Clone, Copy)]
+enum Why {
+    /// 塞がっていた（「使えなかったので」）。
+    Taken,
+    /// llama の面が使う番号として飛ばした（「…面が使う番号なので」）。
+    FacePort,
+}
+
+/// **ずらしたときの警告の頭**（`port_search::shifted_message` の写し。**定数から作らない**）。
+///
+/// **写すのは文の頭だけ**——括弧の中（次の起動・ブックマーク・「設定」）を変えても、これは赤にならない。
+fn shifted_head(requested: u16, port: u16, why: Why) -> String {
+    match why {
+        Why::Taken => format!("ポート {requested} は使えなかったので、{port} で待ち受けます"),
+        Why::FacePort => format!(
+            "ポート {requested} は上流プロファイルの llama の面が使う番号なので、{port} で待ち受けます"
+        ),
+    }
+}
+
+/// **ずらしの警告の行に必ず入る綴り**（両方の文の括弧の頭 / 写し）。ずらしの警告を拾うのに使う。
+const SHIFT_WARNING_MARK: &str = "（ずらした番号は覚え";
+
+/// **ずれたかを起動ログから確かめ、`GET /admin/server` の `listening_port_shifted` が言うべき値を返す。**
+///
+/// * 実際の番号が元の番号と同じなら、**ずらしたという警告が無い**こと。
+/// * 違うなら、**同じ1行が**元の番号・実際の番号を `why` の文で言い、欄（`requested_port` / `port` /
+///   `port_source`）も持つこと。
+fn assert_shift_said(lines: &[String], requested: u16, port: u16, source: &str, why: Why) -> bool {
+    let shifted = port != requested;
+    let said: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains(SHIFT_WARNING_MARK))
+        .collect();
+    if shifted {
+        let head = shifted_head(requested, port, why);
+        assert!(
+            said.iter().any(|line| line.contains(&head)
+                && line.contains("WARN")
+                && has_field(line, &format!("requested_port={requested}"))
+                && has_field(line, &format!("port={port}"))
+                && has_field(line, &format!("port_source={source}"))),
+            "{requested} から {port} へずれたのに、同じ行がそう言っていない\n{}",
+            lines.join("\n")
+        );
+    } else {
+        assert!(
+            said.is_empty(),
+            "ずれていないのに、ずらしたと言っている\n{}",
+            lines.join("\n")
+        );
+    }
+    shifted
+}
+
+/// **OS が自分では配らない番号の帯（20000〜28999）で、続いた 11 個（元の番号〜+10）の空きを全部掴む。**
+///
+/// **既定の 8080 を含まない**（帯の外）。**OS に選ばせた番号の近くを使わない理由**は
+/// `tests/server_listening_port.rs` の同名の関数の doc（Windows は `127.0.0.1:0` の番号をプロセスをまたいで
+/// 順に配るので、その近くの 11 個を掴むと、並んで走る他の腕が放した番号を奪う。作業単位 F-11b で実測）。
+fn hold_quiet_range() -> (Vec<TcpListener>, u16) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let seed = std::process::id().wrapping_mul(2_654_435_761);
+    for _ in 0..200 {
+        let call = CALLS.fetch_add(1, Ordering::Relaxed);
+        let offset = seed.wrapping_add(call.wrapping_mul(7_919)) % 9_000;
+        let first = 20_000 + u16::try_from(offset).expect("9000 未満であること");
+        let mut held = Vec::new();
+        for port in first..=first + SPAN {
+            match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => held.push(listener),
+                Err(_) => break,
+            }
+        }
+        if held.len() == usize::from(SPAN) + 1 {
+            return (held, first);
+        }
+    }
+    panic!("前提: 続いた 11 個の空きを 200 回で掴めなかった");
+}
+
+/// **元の番号だけを掴んだまま返す**（+1〜+10 は空いていることを確かめてから放す / [`hold_quiet_range`]）。
+fn hold_a_free_port() -> (TcpListener, u16) {
+    let (mut held, first) = hold_quiet_range();
+    let kept = held.swap_remove(0);
+    drop(held);
+    (kept, first)
+}
+
+/// **元の番号から +10 までの 11 個を、全部このテストが掴む。**
+fn hold_a_whole_range() -> (Vec<TcpListener>, u16) {
+    hold_quiet_range()
+}
 
 /// **起こした実行ファイルの番人。`Drop` で必ず止める**（`tests/upstream_cli.rs` の `Running` と同じ）。
 struct Running(Child);
@@ -251,11 +365,11 @@ fn prepended_path(bin_dir: &Path) -> std::ffi::OsString {
     value
 }
 
-/// **隔離した機で起こす。** 親から `PERSONACORE_*` を1つも継がせない。
+/// **隔離した機で起こすコマンド。** 親から `PERSONACORE_*` を1つも継がせない。
 ///
 /// **`PERSONACORE_PORT` も `PERSONACORE_UPSTREAMS` も、`extra` で渡したときだけ立つ**
 /// （保存を読む腕は既定の置き場所が要るので、`PERSONACORE_UPSTREAMS` を渡さない）。
-fn spawn_on_machine(root: &Path, args: &[&str], extra: &[(&str, &std::ffi::OsStr)]) -> Started {
+fn machine_command(root: &Path, args: &[&str], extra: &[(&str, &std::ffi::OsStr)]) -> Command {
     let bin_dir = fake_llama_dir(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_personacore"));
     for (key, _) in std::env::vars() {
@@ -275,7 +389,42 @@ fn spawn_on_machine(root: &Path, args: &[&str], extra: &[(&str, &std::ffi::OsStr
     for (key, value) in extra {
         command.env(key, value);
     }
+    command
+}
 
+/// **止まるはずの起動を、終わるまで（上限つきで）待ち、終了の状態と標準エラーを返す。**
+///
+/// **上限を過ぎたら止めて赤にする**——止まるはずの起動が起きてしまう実装で、テストが返らなくならないように。
+fn run_to_exit(
+    root: &Path,
+    args: &[&str],
+    extra: &[(&str, &std::ffi::OsStr)],
+) -> (std::process::ExitStatus, String) {
+    let mut command = machine_command(root, args, extra);
+    command.stdout(Stdio::null()).stderr(Stdio::piped());
+    let mut child = command.spawn().expect("実行ファイルを起こせること");
+    let stderr = child.stderr.take().expect("標準エラーを取れること");
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut BufReader::new(stderr), &mut text);
+        text
+    });
+    let mut running = Running(child);
+    for _ in 0..MAX_WAITS {
+        if let Ok(Some(status)) = running.0.try_wait() {
+            let text = reader.join().expect("標準エラーを読むスレッドが終わること");
+            return (status, text);
+        }
+        std::thread::sleep(WAIT_STEP);
+    }
+    drop(running);
+    let text = reader.join().expect("標準エラーを読むスレッドが終わること");
+    panic!("止まるはずの起動が {MAX_WAITS} 回待っても終わらなかった\n{text}");
+}
+
+/// **隔離した機で起こす**（[`machine_command`]）。
+fn spawn_on_machine(root: &Path, args: &[&str], extra: &[(&str, &std::ffi::OsStr)]) -> Started {
+    let mut command = machine_command(root, args, extra);
     let mut child = command.spawn().expect("実行ファイルを起こせること");
     let stdout = child.stdout.take().expect("標準出力を取れること");
     let (sender, lines) = mpsc::channel();
@@ -364,15 +513,19 @@ fn a_saved_port_is_where_a_bare_start_listens_and_the_api_moves_it() {
     {
         let mut first = spawn_on_machine(root, &[], &[]);
         let (port, early) = first.listening_port_keeping_lines();
-        assert_eq!(port, first_port, "保存した番号で待ち受けていない");
         let lines = first.all_lines(early);
         assert_settings_line(&lines, first_port, "saved");
+        // **保存した番号で待ち受ける。放してから子が開くまでに取られていたら、ずれたと言う**（モジュールの doc）。
+        let shifted = assert_shift_said(&lines, first_port, port, "saved", Why::Taken);
 
         assert_eq!(
             server_report(port),
             serde_json::json!({
-                "listening_port": first_port,
+                "listening_port": port,
                 "listening_port_source": "saved",
+                "listening_port_requested": first_port,
+                "listening_port_shifted": shifted,
+                "listening_port_skipped": [],
                 "saved_port": first_port,
                 "saved_port_unreadable": false,
                 "next_port": first_port,
@@ -391,8 +544,11 @@ fn a_saved_port_is_where_a_bare_start_listens_and_the_api_moves_it() {
         assert_eq!(
             saved,
             serde_json::json!({
-                "listening_port": first_port,
+                "listening_port": port,
                 "listening_port_source": "saved",
+                "listening_port_requested": first_port,
+                "listening_port_shifted": shifted,
+                "listening_port_skipped": [],
                 "saved_port": second_port,
                 "saved_port_unreadable": false,
                 "next_port": second_port,
@@ -412,11 +568,13 @@ fn a_saved_port_is_where_a_bare_start_listens_and_the_api_moves_it() {
 
     let mut second = spawn_on_machine(root, &[], &[]);
     let (port, early) = second.listening_port_keeping_lines();
-    assert_eq!(
-        port, second_port,
-        "API で保存した番号で、次の起動が待ち受けていない"
-    );
-    assert_settings_line(&second.all_lines(early), second_port, "saved");
+    let lines = second.all_lines(early);
+    // **API で保存した番号から、次の起動が試し始める**（取られていたら、ずれたと言う）。
+    assert_settings_line(&lines, second_port, "saved");
+    let shifted = assert_shift_said(&lines, second_port, port, "saved", Why::Taken);
+    let report = server_report(port);
+    assert_eq!(report["listening_port_requested"], second_port, "{report}");
+    assert_eq!(report["listening_port_shifted"], shifted, "{report}");
 
     let (status, forgot) = call(
         port,
@@ -453,12 +611,10 @@ fn the_upstream_flag_path_listens_on_the_saved_port_too() {
 
     let mut started = spawn_on_machine(root, &["--upstream", "plain"], &[]);
     let (port, early) = started.listening_port_keeping_lines();
-    assert_eq!(
-        port, saved_port,
-        "--upstream の起動が保存した番号で待ち受けていない"
-    );
     let lines = started.all_lines(early);
+    // **`--upstream` の起動も保存した番号から試し始める**（取られていたら、ずれたと言う）。
     assert_settings_line(&lines, saved_port, "saved");
+    assert_shift_said(&lines, saved_port, port, "saved", Why::Taken);
     assert!(
         lines
             .iter()
@@ -470,13 +626,19 @@ fn the_upstream_flag_path_listens_on_the_saved_port_too() {
     assert_eq!(server_report(port)["listening_port_source"], "saved");
 }
 
-/// **覚えた名前の事前検査も、保存した番号を見る**（ADR-0057 §決定5「覚えた名前の事前検査も、この番号を見る」）。
+/// **覚えた名前のプロファイルの gguf の面が保存した番号を使っていても、覚えた名前は捨てない。
+/// 待ち受けは保存した番号を飛ばす**（ADR-0057 §決定3「事前検査は、番号を明示したときだけ番号の取り合いで
+/// プロファイルを捨てる」「明示していなければ元の番号も面と同じなら飛ばす」/ 作業単位 F-11b）。
 ///
-/// 覚えた名前のプロファイルの gguf の面が、**保存した番号**と同じポートを使う。事前検査が保存した番号を見れば
-/// 取り合いで覚えた名前を使わず（今までどおりの振る舞い）、環境変数の既定の経路で**保存した番号**で起きる。
+/// **F-12 の間は逆だった**（取り合いで覚えた名前を捨て、環境変数の既定の経路で保存した番号で起きた）。
+///
+/// * 1回目（番号を明示しない）: 覚えた名前で起き（`upstream_profile_from=remembered`）、使えないと言わない。
+///   保存した番号は面が使うので開かず、ずれたと言う（飛ばした番号 = 保存した番号）。
+/// * 2回目（**対照**: 同じ番号を `PERSONACORE_PORT` で明示）: 今までどおり、取り合いで覚えた名前を捨てる。
+///
 /// **偽の `llama` は1度も呼ばれない**（覚えた名前の起動は起こさない／使わない）。
 #[test]
-fn a_remembered_profile_that_collides_with_the_saved_port_is_not_used() {
+fn a_remembered_profile_on_the_saved_port_is_kept_and_the_saved_port_is_skipped() {
     let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
     let root = dir.path();
     let [saved_port] = distinct_free_ports::<1>();
@@ -493,20 +655,74 @@ fn a_remembered_profile_that_collides_with_the_saved_port_is_not_used() {
         } } })
         .to_string(),
     )
-    .expect("取り合うプロファイルを置けること");
+    .expect("保存した番号を使うプロファイルを置けること");
     std::fs::write(app_dir_of(root).join("selected-upstream.txt"), "beta\n")
         .expect("覚えた名前を置けること");
 
-    let mut started = spawn_on_machine(root, &[], &[]);
+    {
+        let mut started = spawn_on_machine(root, &[], &[]);
+        let (port, early) = started.listening_port_keeping_lines();
+        let lines = started.all_lines(early);
+        assert_ne!(port, saved_port, "面が使う保存した番号で待ち受けた");
+        // **元の番号は塞がっていたのではなく面の番号なので、警告は「面が使う番号なので」の文で言う**
+        // （「使えなかった」「次の起動ではまた試す」は偽になる / F-11b のレビュー是正）。
+        assert!(
+            assert_shift_said(&lines, saved_port, port, "saved", Why::FacePort),
+            "前提: ずれていること"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("は使えなかったので、")),
+            "面の番号で飛ばした元の番号を「使えなかった」と言っている\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines.iter().any(|line| line.contains(SHIFT_WARNING_MARK)
+                && has_field(line, &format!("skipped_ports=[{saved_port}]"))),
+            "飛ばした番号（保存した番号）を言っていない\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains(REMEMBERED_UNUSABLE_LINE)),
+            "番号を明示していないのに、覚えた名前を取り合いで捨てた\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("設定を読み込みました")
+                    && has_field(line, "upstream_profile_from=remembered")
+                    && has_field(line, "bind_from=saved")),
+            "覚えた名前で、保存した番号から起きたと言っていない\n{}",
+            lines.join("\n")
+        );
+        let report = server_report(port);
+        assert_eq!(
+            report["listening_port_skipped"],
+            serde_json::json!([saved_port]),
+            "{report}"
+        );
+    }
+
+    // **対照: 同じ番号を明示すると、今までどおり覚えた名前を捨てる**（明示した番号はずらさず、面と取り合う）。
+    let explicit = saved_port.to_string();
+    let mut started = spawn_on_machine(
+        root,
+        &[],
+        &[("PERSONACORE_PORT", std::ffi::OsStr::new(&explicit))],
+    );
     let (port, early) = started.listening_port_keeping_lines();
-    assert_eq!(port, saved_port, "保存した番号で待ち受けていない");
+    assert_eq!(port, saved_port, "明示した番号で待ち受けていない");
     let lines = started.all_lines(early);
     assert!(
         lines
             .iter()
             .any(|line| line.contains(REMEMBERED_UNUSABLE_LINE)
                 && has_field(line, "upstream_profile=\"beta\"")),
-        "保存した番号と取り合う覚えた名前を、使えないと言っていない\n{}",
+        "明示した番号と取り合う覚えた名前を、使えないと言っていない\n{}",
         lines.join("\n")
     );
     assert!(
@@ -514,11 +730,11 @@ fn a_remembered_profile_that_collides_with_the_saved_port_is_not_used() {
             .iter()
             .any(|line| line.contains("設定を読み込みました")
                 && has_field(line, "upstream_profile_from=-")
-                && has_field(line, "bind_from=saved")),
-        "環境変数の既定の経路で、保存した番号で起きたと言っていない\n{}",
+                && has_field(line, "bind_from=environment")),
+        "環境変数の既定の経路で、明示した番号で起きたと言っていない\n{}",
         lines.join("\n")
     );
-    assert!(!marker.exists(), "使わないはずの上流を起こしている");
+    assert!(!marker.exists(), "起こさないはずの上流を起こしている");
 }
 
 /// **環境変数が保存に勝つ。`GET /admin/server` は保存した番号と、次の起動も環境変数で決まることを言う。**
@@ -543,6 +759,9 @@ fn the_environment_wins_over_the_saved_port() {
         serde_json::json!({
             "listening_port": env_port,
             "listening_port_source": "environment",
+            "listening_port_requested": env_port,
+            "listening_port_shifted": false,
+            "listening_port_skipped": [],
             "saved_port": saved_port,
             "saved_port_unreadable": false,
             "next_port": env_port,
@@ -592,6 +811,17 @@ fn an_overridden_profile_file_neither_reads_nor_writes_the_saved_port() {
     assert_eq!(
         report["listening_port"],
         serde_json::json!(port),
+        "{report}"
+    );
+    // **元の番号は設定の `0`、ずらしてはいない**（OS に選ばせた番号は「ずれた」ではない / 作業単位 F-11b）。
+    assert_eq!(
+        report["listening_port_requested"],
+        serde_json::json!(0),
+        "{report}"
+    );
+    assert_eq!(
+        report["listening_port_shifted"],
+        serde_json::json!(false),
         "{report}"
     );
     assert_eq!(report["saved_port"], serde_json::Value::Null, "{report}");
@@ -733,5 +963,286 @@ fn an_unreadable_saved_port_warns_and_the_file_is_kept() {
             "{arm}: 読めない保存のファイルを書き換えた"
         );
         assert!(started.running.is_alive(), "{arm}: 止まっている");
+    }
+}
+
+// ----------------------------------------------------------------------
+// ずらし（作業単位 F-11b / ADR-0057 §決定1・3・4）
+// ----------------------------------------------------------------------
+//
+// **ずらしの観測は保存した番号で行う**（ADR-0057 §却下した選択肢「F-11 を先に入れる」の理由）。
+// **既定の 8080 を経由する腕は作らない**——利用者の別のサーバが 8080 を使っていることがある。
+// 見本の `upstreams.json` の 8081 を飛ばす形は、`port_search` の単体テスト
+// （`the_sample_profiles_make_a_taken_default_port_skip_8081`）が純粋関数で見る。
+
+/// **保存した番号が塞がっていると、`upstreams.json` の gguf の面の番号を飛ばして次の空きで待ち受け、
+/// 警告・待ち受けの行の `addr=`・`GET /admin/server` が実際の番号を言う。`bind=` は保存した番号のまま。**
+///
+/// 保存した番号 `P` をこのテストが掴み、**選ばれていないプロファイル**の gguf の面を `P+1` に置く
+/// （起動の計画に入っているかを問わず飛ばす / ADR-0057 §決定3）。待ち受けは `P+2` 以降で、飛ばした番号は `P+1`。
+/// **偽の `llama` は1度も呼ばれない**（プロファイルを選んでいない起動は何も起こさない）。
+///
+/// **gguf の面を持つプロファイルを、名前の順で2つ目に置く**（1つ目 `aa-external` は外の上流だけ）——
+/// 最初のプロファイルだけを見る実装を、ここでも赤にする（変異 M15 で、単体テストだけが止めていたのを足した）。
+#[test]
+fn a_taken_saved_port_shifts_past_a_face_port_and_the_log_and_the_api_say_so() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
+    let root = dir.path();
+    let (blocker, saved_port) = hold_a_free_port();
+    let face_port = saved_port + 1;
+    plant_saved_port(root, &format!("{saved_port}\n"));
+    let marker = root.join(TOUCH_MARKER);
+    std::fs::write(
+        app_dir_of(root).join("upstreams.json"),
+        serde_json::json!({
+            "aa-external": { "main": {
+                "endpoint": DECOY_ENDPOINT, "model": "external-model",
+            } },
+            "zz-unchosen": { "main": {
+                "endpoint": format!("http://127.0.0.1:{face_port}"), "model": "unchosen-model",
+                "gguf": root.join("planted-unchosen.gguf"),
+                "args": ["--pc-touch", marker],
+            } },
+        })
+        .to_string(),
+    )
+    .expect("プロファイルを置けること");
+
+    let mut started = spawn_on_machine(root, &[], &[]);
+    let (port, early) = started.listening_port_keeping_lines();
+    let lines = started.all_lines(early);
+    assert!(
+        port > face_port && port <= saved_port + SPAN,
+        "面の番号を飛ばした範囲の中で待ち受けていない（保存 {saved_port}・面 {face_port}・実際 {port}）\n{}",
+        lines.join("\n")
+    );
+    // **警告の同じ1行が、元の番号・実際の番号（文と欄）・出どころ・飛ばした番号を言う。**
+    assert!(assert_shift_said(
+        &lines,
+        saved_port,
+        port,
+        "saved",
+        Why::Taken
+    ));
+    assert!(
+        lines.iter().any(
+            |line| line.contains(&shifted_head(saved_port, port, Why::Taken))
+                && has_field(line, &format!("skipped_ports=[{face_port}]"))
+        ),
+        "警告の同じ行が飛ばした番号を言っていない\n{}",
+        lines.join("\n")
+    );
+    // **`bind=` は元の番号（出どころの番号）のまま**（ADR-0057 §決定4）。**実際の番号は待ち受けの行の `addr=`**
+    // （`listening_port_keeping_lines` がそこから読んだ番号が `port`）。
+    assert_settings_line(&lines, saved_port, "saved");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("待ち受けを開始しました")
+                && has_field(line, &format!("addr=127.0.0.1:{port}"))),
+        "待ち受けの行の addr= が実際の番号を言っていない\n{}",
+        lines.join("\n")
+    );
+
+    assert_eq!(
+        server_report(port),
+        serde_json::json!({
+            "listening_port": port,
+            "listening_port_source": "saved",
+            "listening_port_requested": saved_port,
+            "listening_port_shifted": true,
+            "listening_port_skipped": [face_port],
+            "saved_port": saved_port,
+            "saved_port_unreadable": false,
+            "next_port": saved_port,
+            "next_port_source": "saved",
+            "editable": true,
+        })
+    );
+    // **ずらした番号は覚えない**（保存のファイルは保存した番号のまま）。
+    assert_eq!(
+        std::fs::read_to_string(saved_port_file_of(root)).expect("読めること"),
+        format!("{saved_port}\n"),
+        "ずらした番号を保存している"
+    );
+    assert!(
+        !marker.exists(),
+        "選んでいないプロファイルの上流を起こしている"
+    );
+    drop(started);
+    drop(blocker);
+}
+
+/// **範囲（保存した番号〜+10）が全部塞がっていると、範囲と直し方を言って止まる**（ADR-0057 §決定3）。
+///
+/// 11 個とも、このテストが掴んだもの。**止まる文**（`config::ports_in_use_message` の写し）は、範囲・
+/// `PERSONACORE_PORT`・画面の「設定」を言い、**1つの番号の文（B-76）は言わない。**
+#[test]
+fn a_whole_range_taken_names_the_range_and_how_to_get_out() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
+    let root = dir.path();
+    let (held, first) = hold_a_whole_range();
+    let last = first + SPAN;
+    plant_saved_port(root, &format!("{first}\n"));
+
+    let (status, stderr) = run_to_exit(root, &[], &[]);
+    drop(held);
+    assert!(
+        !status.success(),
+        "範囲が全部塞がっているのに 0 で終わった\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "ポート {first}〜{last} は、どれも他のプログラムが使っているか、使えない番号でした"
+        )),
+        "止まる文が試した範囲を言っていない\n{stderr}"
+    );
+    assert!(
+        stderr.contains("PERSONACORE_PORT"),
+        "止まる文が PERSONACORE_PORT を言っていない\n{stderr}"
+    );
+    assert!(
+        stderr.contains("画面の「設定」"),
+        "止まる文が画面の「設定」を言っていない\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(&format!("ポート {first} は他のプログラムが使っています")),
+        "範囲の失敗を、1つの番号の文で言っている\n{stderr}"
+    );
+    assert!(
+        stderr.contains("待ち受けアドレスを開けませんでした"),
+        "OS の文に至る鎖が消えている\n{stderr}"
+    );
+    // **鎖の `Caused by` の行（`PortsTaken` の文）も、試した数を偽りなく言う**（F-11 の再レビュー是正）。
+    assert!(
+        stderr.contains(&format!(
+            "ポート {first}〜{last} のうち 11 個を順に試しましたが、どれも開けませんでした"
+        )),
+        "鎖の文が試した数を言っていない\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("を除いて"),
+        "飛ばしていないのに、面の番号を除いたと言っている\n{stderr}"
+    );
+}
+
+/// **範囲の中に llama の面の番号が在ると、止まる文がその番号を「除いて」と言う**（F-11 の再レビュー是正）。
+///
+/// 範囲の 11 個のうち `first+5` だけを塞がずに残し、その番号を gguf の面に持つプロファイルを置く
+/// （選ばない）。`first+5` は空いているが面の番号なので試さず、ほかの 10 個は塞がっているので止まる。
+/// **`main` が飛ばした番号を文へ渡す配線**（`taken.skipped()`）を見る——渡さなければ「を除いて」が出ない
+/// （変異 M20）。`a_whole_range_taken_names_the_range_and_how_to_get_out` は `upstreams.json` を置かない
+/// （見本に 8081 があるだけ）ので、この配線を区別できない。
+#[test]
+fn a_whole_range_with_a_face_port_names_the_skipped_port() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
+    let root = dir.path();
+    let (mut held, first) = hold_a_whole_range();
+    let last = first + SPAN;
+    let face_port = first + 5;
+    // **`first+5` だけを放す**（並びは `first` から順なので、6 番目）。
+    drop(held.remove(5));
+    plant_saved_port(root, &format!("{first}\n"));
+    let marker = root.join(TOUCH_MARKER);
+    std::fs::write(
+        app_dir_of(root).join("upstreams.json"),
+        serde_json::json!({ "unchosen": { "main": {
+            "endpoint": format!("http://127.0.0.1:{face_port}"), "model": "unchosen-model",
+            "gguf": root.join("planted-unchosen.gguf"),
+            "args": ["--pc-touch", marker],
+        } } })
+        .to_string(),
+    )
+    .expect("プロファイルを置けること");
+
+    let (status, stderr) = run_to_exit(root, &[], &[]);
+    drop(held);
+    assert!(
+        !status.success(),
+        "面の番号のほかが全部塞がっているのに 0 で終わった（面の番号 {face_port} で待ち受けた？）\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "ポート {first}〜{last} は、上流プロファイルの llama の面が使う番号（{face_port}）を除いて、\
+             どれも他のプログラムが使っているか、使えない番号でした"
+        )),
+        "止まる文が、飛ばした面の番号を除いたと言っていない\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "ポート {first}〜{last} のうち 10 個を順に試しましたが、どれも開けませんでした"
+        )),
+        "鎖の文が、試した数（飛ばした番号を除く）を言っていない\n{stderr}"
+    );
+    assert!(
+        !marker.exists(),
+        "選んでいないプロファイルの上流を起こしている"
+    );
+}
+
+/// **飛ばす番号のために読む `upstreams.json` が読めなければ、警告を1本出して、飛ばさずに起きる。
+/// 番号を明示した起動は読まない**（ADR-0057 §決定3）。
+///
+/// * 1回目（明示しない・保存した番号）: 警告がちょうど1本・`WARN`・置き場所を言う。止まらない。
+/// * 2回目・3回目（**対照**: `PERSONACORE_PORT` を `0` と、0 でない空いている番号で明示）: 警告が無い（読まない）。
+///   **0 でない腕が要る**——「明示か」を `bind().port() == 0` で決める実装は、`0` の腕だけでは見分けられない
+///   （F-11b のレビューが予想した変異 M19）。
+#[test]
+fn an_unreadable_profile_file_warns_once_and_the_start_goes_on() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
+    let root = dir.path();
+    let [saved_port] = distinct_free_ports::<1>();
+    plant_saved_port(root, &format!("{saved_port}\n"));
+    std::fs::write(app_dir_of(root).join("upstreams.json"), "{ not json")
+        .expect("壊れたプロファイルを置けること");
+
+    {
+        let mut started = spawn_on_machine(root, &[], &[]);
+        let (port, early) = started.listening_port_keeping_lines();
+        let lines = started.all_lines(early);
+        let warnings: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains(FACE_PORTS_UNREADABLE_LINE))
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "読めない upstreams.json を、警告1本で言っていない\n{}",
+            lines.join("\n")
+        );
+        assert!(warnings[0].contains("WARN"), "{}", warnings[0]);
+        assert!(
+            warnings[0].contains("upstreams.json"),
+            "警告の同じ行が置き場所を言っていない: {}",
+            warnings[0]
+        );
+        assert_settings_line(&lines, saved_port, "saved");
+        assert_shift_said(&lines, saved_port, port, "saved", Why::Taken);
+        assert!(started.running.is_alive(), "止まっている");
+    }
+
+    // **明示の番号は、OS が配らない帯から取る**（放してから子が開くまでに取られにくい / `hold_quiet_range`）。
+    let (held, quiet) = hold_quiet_range();
+    drop(held);
+    for explicit in ["0".to_owned(), quiet.to_string()] {
+        let mut started = spawn_on_machine(
+            root,
+            &[],
+            &[("PERSONACORE_PORT", std::ffi::OsStr::new(&explicit))],
+        );
+        let (_port, early) = started.listening_port_keeping_lines();
+        let lines = started.all_lines(early);
+        assert_settings_line(
+            &lines,
+            explicit.parse().expect("番号であること"),
+            "environment",
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains(FACE_PORTS_UNREADABLE_LINE)),
+            "番号を明示した起動（{explicit}）が、飛ばす番号のために upstreams.json を読んでいる\n{}",
+            lines.join("\n")
+        );
     }
 }

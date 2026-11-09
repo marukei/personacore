@@ -29,6 +29,9 @@ const SETTINGS_LABEL = "設定";
 const SERVER: ServerView = {
   listening_port: 8123,
   listening_port_source: "default",
+  listening_port_requested: 8123,
+  listening_port_shifted: false,
+  listening_port_skipped: [],
   saved_port: null,
   saved_port_unreadable: false,
   next_port: 8789,
@@ -98,7 +101,9 @@ it("`#/settings` は、待ち受けのポートを読んで出す", async () => 
     await vi.waitFor(() => {
       expect(rows().length).toBe(3);
     });
-    expect(urls).toEqual(["/admin/server"]);
+    // **2回**——設定の画面と、全部の画面の上のずらしの帯（作業単位 F-11c / `PortShiftNotice.svelte`）が、
+    // それぞれ開いたときに1回ずつ読む。ほかの口は読まない。
+    expect(urls).toEqual(["/admin/server", "/admin/server"]);
     expect(target.querySelector("main h1")?.textContent?.trim()).toBe(SETTINGS_LABEL);
     expect(rows()[0]).toEqual(["いま待ち受けている番号", "8123（既定の番号）"]);
   } finally {

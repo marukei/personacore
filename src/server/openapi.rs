@@ -137,8 +137,14 @@ const STABILITY_EXTENSION: &str = "x-personacore-stability";
 /// **`1.5`**（作業単位 F-12a / ADR-0057 §決定6 の F-12 の行）: 待ち受けのポートの口2本
 /// （`GET /admin/server`・`PUT /admin/server/port`）と、その新しい失敗（400 `invalid_listening_port`・
 /// 409 `listening_port_read_only`・500 `listening_port_write_failed`）。口の追加なので小さい側。
-/// 既存の口の形は変えていない。**`1.5` は公開の版には現れない**（F-11 が同じ v0.4.1 の中で `1.6` へ上げる）。
-pub const API_VERSION: &str = "1.5";
+/// 既存の口の形は変えていない。**`1.5` は公開の版には現れない**（F-11 が同じ v0.4.1 の中で `1.6` へ上げた）。
+///
+/// **`1.6`**（作業単位 F-11b / ADR-0057 §決定4・6 の F-11 の行）: `GET /admin/server`（と `PUT /admin/server/port`
+/// の応答）に欄を3つ足した——`listening_port_requested`（元の番号）・`listening_port_shifted`（ずらしたか）・
+/// `listening_port_skipped`（飛ばした番号）。応答の欄の追加なので小さい側。**振る舞いも変わった**: 番号を
+/// 明示していない起動は、塞がっていれば止まらずに次の空きへずれる（`listening_port_source` は元の番号の
+/// 出どころ）。口・失敗の形は増減していない。
+pub const API_VERSION: &str = "1.6";
 
 /// **ルータに届いた要求への全部の応答に付ける、API の版のヘッダの名前**
 /// （HTTP では大文字小文字を区別しない。仕様書の `headers` の鍵もこの綴り）。

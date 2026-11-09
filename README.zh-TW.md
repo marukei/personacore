@@ -50,7 +50,7 @@ personacore (Rust / axum)  ←→  SQLite
    它會以預設瀏覽器開啟網頁介面。如果沒有開啟，請自行開啟 `url=` 之後所顯示的 URL。按 **Ctrl+C** 即可停止；這也會一併停止它所啟動的 llama.cpp。
 4. 在網頁介面中開啟上游畫面（上流モデル），將你的 gguf 檔案路徑寫入某個設定檔（profile），儲存後切換到該設定檔。
 
-執行該執行檔時，資料會存放在 `%LOCALAPPDATA%\personacore\` 底下：SQLite 資料庫、上游設定檔（`upstreams.json`），以及 personacore 所啟動的 llama.cpp 處理程序的日誌。（下文的 `scripts/start.ps1` 則預設改為將資料庫與日誌存放在儲存庫內的 `data/` 底下；請參閱 [scripts/README-start.md](scripts/README-start.md)。）`PERSONACORE_DB_PATH` 可移動資料庫位置。連接埠在啟動時依下列順序決定：`PERSONACORE_PORT`、在網頁介面的設定畫面（設定）中儲存的連接埠、預設值。儲存的連接埠從下次啟動起生效。
+執行該執行檔時，資料會存放在 `%LOCALAPPDATA%\personacore\` 底下：SQLite 資料庫、上游設定檔（`upstreams.json`），以及 personacore 所啟動的 llama.cpp 處理程序的日誌。（下文的 `scripts/start.ps1` 則預設改為將資料庫與日誌存放在儲存庫內的 `data/` 底下；請參閱 [scripts/README-start.md](scripts/README-start.md)。）`PERSONACORE_DB_PATH` 可移動資料庫位置。連接埠在啟動時依下列順序決定：`PERSONACORE_PORT`、在網頁介面的設定畫面（設定）中儲存的連接埠、預設值。儲存的連接埠從下次啟動起生效。若儲存的連接埠或預設連接埠已被佔用，personacore 會改用下一個可用的連接埠（最多往上 10 個）啟動，並在網頁介面上方的橫幅與啟動日誌中告知。以 `PERSONACORE_PORT` 指定的連接埠不會改變；若已被佔用，personacore 會停止。
 預設連接埠在 `src/server/config.rs` 中以 `DEFAULT_PORT` 設定，啟動日誌也會印出位址。
 
 其他旗標：`--no-ui`（僅提供 API：不提供網頁介面，也不開啟瀏覽器）、`--no-browser`、`--upstream <name>`（啟動時啟動已儲存的設定檔）、`--fresh`（將目前的資料庫移到一旁而不刪除，並以全新的空資料庫啟動）、`--version`。

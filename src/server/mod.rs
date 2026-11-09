@@ -7,7 +7,8 @@
 //!
 //! ```text
 //! init_tracing → AppConfig::from_env → App::run
-//!   ├ bind  … 待ち受け開始 → 失敗しうる構築 → **最後に** DB接続＋マイグレーション
+//!   ├ bind  … 待ち受け開始（明示していない番号が塞がっていれば次の空きへ / `port_search`）
+//!   │         → 失敗しうる構築 → **最後に** DB接続＋マイグレーション
 //!   └ serve … 引き直しの開始 → graceful shutdown まで応答
 //!             → 引き直しの停止 → Store::close
 //! ```
@@ -49,10 +50,12 @@ mod error;
 mod extract;
 mod fresh;
 mod host_guard;
+mod instance_lock;
 mod launch;
 mod listening_port;
 mod models;
 mod openapi;
+mod port_search;
 mod profile_editor;
 mod relay;
 mod remembered;
@@ -85,11 +88,25 @@ pub use config::{
     ENV_DRIFT_DECAY, ENV_DRIFT_FORM, ENV_DRIFT_NOTE, ENV_DRIFT_SLOPE, ENV_DRIFT_STEP_COST,
     ENV_LLM_ENDPOINT, ENV_LLM_IDLE_TIMEOUT, ENV_MAIN_MODEL, ENV_PORT, ENV_STAT_DRIFT,
     ENV_SUB_LLM_ENDPOINT, ENV_SUB_MODEL, ENV_UPSTREAMS, ENV_WEB_DIR, PortSource, SAVED_PORT_MIN,
-    SavedPort, database_path_under, os_data_dir, port_in_use_message, resolve_port,
+    SavedPort, database_path_from, database_path_from_env, database_path_under, os_data_dir,
+    port_in_use_message, ports_in_use_message, resolve_port,
 };
 /// **起動に失敗したとき、ダブルクリックで開いた窓を理由と一緒に消さない**（作業単位 B-76 / `console` モジュール）。
 pub use console::{PRESS_ENTER_TO_CLOSE, wait_before_closing_if_alone};
 pub use error::ApiError;
+/// **同じデータを使う personacore を2つ動かさない**（ADR-0057 §決定2 / 作業単位 F-11a / `instance_lock` モジュール）。
+///
+/// **`main` が起動の最初に [`acquire_beside`] を呼び、取れたら [`Startup::holding`] で渡す。**
+/// **URL を書く口（`InstanceLock::announce`）は公開しない**——書くのは待ち受けを開いた後の
+/// [`App::run_with_upstreams`] だけ。
+pub use instance_lock::{
+    Acquired, InstanceLock, InstanceLockError, LOCK_FILE_NAME, OtherInstance, RUNNING_FILE_NAME,
+    acquire_beside, guide_second_start, lock_dir_of,
+};
+/// **待ち受けのポートが使われていたら、空いている次の番号で待ち受ける**（ADR-0057 §決定1・3 /
+/// 作業単位 F-11b / `port_search` モジュール）。**探すのは `App::bind` の中だけ**（公開するのは範囲の幅と、
+/// 範囲を全部試しても開けなかったときの `#[source]`）。
+pub use port_search::{PORT_SHIFT_SPAN, PortsTaken};
 
 /// **失敗の応答の形の一覧**（API の形の指紋のため / 作業単位 O-7 / `error::error_catalog`）。
 #[cfg(any(test, feature = "testing"))]
@@ -136,12 +153,14 @@ pub use launch::{FaceState, LaunchError, LaunchPlan, LaunchStates, UPSTREAM_LOG_
 
 /// **上流プロファイル**（ADR-0042 §決定1 / 作業単位 F-4b-1 / `upstreams` モジュール）。
 ///
-/// `main` が `--upstream <名前>` を受けたときだけ読む。**旗が無ければ1度も触らない。**
+/// `main` が上流を選ぶために読むのは、`--upstream <名前>` か覚えた名前があるときだけ。
+/// **番号を明示していない起動は、待ち受けを探すときに飛ばす番号のためにも読む**（[`launch_ports_at`] /
+/// ADR-0057 §決定3 / 作業単位 F-11b）——**その中身で上流を決めることはしない。**
 pub use upstreams::{
     DEFAULT_COMMAND, FACE_KEYS, FACE_NAMES, FaceLaunch, ProfileError, ProfileFace, ProfileLaunch,
     ProfileSettings, SAMPLE_PROFILES, SampleOutcome, SampleWriteError, UPSTREAMS_FILE_NAME,
-    UpstreamProfile, UpstreamProfiles, home_dir, load_profiles, overlay_profile, parse_profiles,
-    upstreams_path_under, write_sample_if_missing,
+    UpstreamProfile, UpstreamProfiles, home_dir, launch_ports_at, load_profiles, overlay_profile,
+    parse_profiles, upstreams_path_under, write_sample_if_missing,
 };
 
 /// **最後に選んだ上流プロファイルの名前**（ADR-0042 §決定9 / 作業単位 F-4f / `remembered` モジュール）。
@@ -220,8 +239,20 @@ pub enum ServerError {
     DatabaseDir(#[source] std::io::Error),
 
     /// 待ち受けアドレスを開けない（ポートが使用中など）。
+    ///
+    /// **番号を明示した起動（`PERSONACORE_PORT`）か、ずらす対象でない失敗**（ADR-0057 §決定1・3）。
+    /// 明示していない起動が範囲を全部試して開けなかったときは [`Self::PortsTaken`]。
     #[error("待ち受けアドレスを開けませんでした")]
     Bind(#[source] std::io::Error),
+
+    /// **番号を明示していない起動が、ずらす範囲（元の番号〜`+`[`PORT_SHIFT_SPAN`]）のどの番号でも
+    /// 待ち受けを開けなかった**（飛ばした番号は試していない / ADR-0057 §決定3 / 作業単位 F-11b）。
+    ///
+    /// **`Display` は [`Self::Bind`] と同じ定数文字列**（どちらも「待ち受けを開けなかった」）。範囲と飛ばした番号は
+    /// [`Self::ports_taken`] で読む——`main` はそれで [`ports_in_use_message`] を足す（[`Self::tried_ports`] は
+    /// 範囲だけを返す、テスト向けの近道）。
+    #[error("待ち受けアドレスを開けませんでした")]
+    PortsTaken(#[source] PortsTaken),
 
     /// 実行中に HTTP サーバが失敗した。
     #[error("HTTP サーバの実行に失敗しました")]
@@ -257,6 +288,28 @@ impl ServerError {
     /// （単体テストの `windows_reports_an_occupied_port_as_addr_in_use` が確かめる）。
     pub fn is_port_in_use(&self) -> bool {
         matches!(self, Self::Bind(source) if source.kind() == std::io::ErrorKind::AddrInUse)
+    }
+
+    /// **ずらす範囲のどの番号でも開けなかったなら、その範囲**（元の番号, 範囲の最後の番号）
+    /// （ADR-0057 §決定3 / 作業単位 F-11b）。**飛ばした番号は言わない**——利用者向けの文に要るので、`main` は
+    /// [`Self::ports_taken`] を読む。
+    ///
+    /// **[`Self::is_port_in_use`] とは重ならない**——あちらは明示した1つの番号の話（B-76 の文）、
+    /// こちらは範囲の話（[`ports_in_use_message`]）。`main` は [`Self::ports_taken`] を先に見る。
+    #[must_use]
+    pub fn tried_ports(&self) -> Option<(u16, u16)> {
+        self.ports_taken()
+            .map(|taken| (taken.first(), taken.last()))
+    }
+
+    /// **ずらす範囲を全部試して開けなかったなら、その中身**（範囲と、範囲の中で飛ばした番号）。
+    /// `main` はこれを [`ports_in_use_message`] に渡す。
+    #[must_use]
+    pub const fn ports_taken(&self) -> Option<&PortsTaken> {
+        match self {
+            Self::PortsTaken(taken) => Some(taken),
+            _ => None,
+        }
     }
 }
 
@@ -781,6 +834,8 @@ pub struct Startup {
     remember: Option<String>,
     /// **この起動が選んだプロファイルの名前**（作業単位 F-10b / [`Self::selecting`]）。
     selected: Option<String>,
+    /// **`main` が起動の最初に取った、データのディレクトリのロック**（ADR-0057 §決定2 / [`Self::holding`]）。
+    instance: Option<instance_lock::InstanceLock>,
 }
 
 impl Startup {
@@ -796,7 +851,19 @@ impl Startup {
             ui: Ui::Serve,
             remember: None,
             selected: None,
+            instance: None,
         }
+    }
+
+    /// **この起動が持っている、データのディレクトリのロック**（ADR-0057 §決定2 / 作業単位 F-11a）。
+    ///
+    /// **待ち受けを開いた後に、実際の URL と画面を配るか（[`Self::ui`]）をロックの隣へ書き、
+    /// [`App::run_with_upstreams`] が返るまで持ち続ける**——同じデータで起こした2つ目は、それを読んで案内する。
+    /// **渡さなければ何も書かない**（テストの入口の既定）。
+    #[must_use]
+    pub fn holding(mut self, lock: instance_lock::InstanceLock) -> Self {
+        self.instance = Some(lock);
+        self
     }
 
     /// **この起動はプロファイル `name` で起きた**（作業単位 F-10b / ADR-0055 §決定3）。
@@ -906,9 +973,9 @@ pub struct App {
     llm: Arc<dyn LlmClient>,
     listener: TcpListener,
     local_addr: SocketAddr,
-    /// **待ち受けのポートが何から決まったか**（ADR-0057 §決定5 / `AppConfig::port_source`）。
-    /// `serve` が `GET /admin/server` へ渡す。
-    port_source: PortSource,
+    /// **待ち受けをどう開けたか**——元の番号・その出どころ・ずらしたか・飛ばした番号
+    /// （ADR-0057 §決定4・5 / 作業単位 F-11b / `port_search::OpenedPort`）。`serve` が `GET /admin/server` へ渡す。
+    opened: port_search::OpenedPort,
     /// **共有の予算と、まだ走り出していない引き直しを束ねたもの**（ADR-0020）。
     ///
     /// **予算と照会先を別々のフィールドで持たない。** 別々に持つと `serve` で
@@ -1024,6 +1091,8 @@ impl App {
         F: Future<Output = ()> + Send + 'static,
     {
         let startup = startup.into();
+        // **ロックは `serve` が返るまで持つ**（下の `drop`）。`bind` が失敗して `?` で抜けても、ここで手放す。
+        let instance = startup.instance;
         let mut app =
             Self::bind_launching(config, startup.plan, startup.timing, startup.ui).await?;
 
@@ -1040,6 +1109,14 @@ impl App {
         app.profiles_file = startup.profiles_file;
         app.selected_profile = startup.selected;
 
+        // **待ち受けを開いた後に、実際の URL と画面を配るかを、ロックの隣へ書く**（ADR-0057 §決定2 / 作業単位 F-11a）。
+        // **`local_addr` から書く**（設定の番号ではない。`PERSONACORE_PORT=0` でも実際の番号を言う）。
+        // **書けなくても止めない**（`announce` は警告だけ）——`bind` と `serve` の間に `?` を置かない約束を破らない。
+        // **下のブラウザの行より前に書く**——`tests/instance_lock_cli.rs` は、その行を「書いた後」の印として待つ。
+        if let Some(lock) = &instance {
+            lock.announce(app.local_addr, startup.ui);
+        }
+
         // **画面を配らないなら、ブラウザの指定を見ない**（作業単位 P-1）——開く頁が無い。
         // **この1行が「画面は配らない」を言う唯一の行**（`Ui` の doc の表）。
         // `ui_source` は待ち受けの行と同じ欄・同じ綴り（集計はこの欄で引く）。
@@ -1050,11 +1127,17 @@ impl App {
                 // 待ち受けの行の `ui_source=none` と綴りが割れて集計で引けない（実測）。
                 tracing::info!(ui_source = %web::UI_SOURCE_NONE, "{NO_UI_LINE}");
             }
-            (Ui::Serve, Browser::Open) => browser::open(&url),
+            (Ui::Serve, Browser::Open) => {
+                // 開けなかったことは `browser::open` が WARN で言う（ここでは止めない）。
+                let _opened = browser::open(&url);
+            }
             (Ui::Serve, Browser::Stay) => tracing::info!(url = %url, "ブラウザは開きません"),
         }
 
-        app.serve(shutdown).await
+        let served = app.serve(shutdown).await;
+        // **`serve` が返る（`Store` を閉じ、起こした子を止めた）まで、ロックを持つ。**
+        drop(instance);
+        served
     }
 
     /// 待ち受けを開始し、**最後に** DB へ接続する（マイグレーション適用込み）。
@@ -1071,6 +1154,11 @@ impl App {
     ///
     /// **`Store::connect` より下に `?` を書かないこと。** 失敗しうる構築
     /// （上流クライアント等）は、すべて `Store::connect` より前に置く。
+    ///
+    /// # 待ち受けを探すのも、`Store::connect` より前（ADR-0057 §決定3 / 作業単位 F-11b）
+    ///
+    /// **番号を明示していない起動は、塞がっていれば次の空きへずらす**（`port_search` モジュール）。
+    /// 範囲を全部試して開けなければ [`ServerError::PortsTaken`] で止まる——そこでも閉じるものはまだ無い。
     pub async fn bind(config: &AppConfig) -> Result<Self, ServerError> {
         Self::bind_launching(
             config,
@@ -1453,10 +1541,39 @@ impl App {
 
         // --- ここから: 失敗しても閉じるものが無い区間。新しい構築はこの中に足す。 ---
 
-        let listener = TcpListener::bind(config.bind().socket_addr())
-            .await
-            .map_err(ServerError::Bind)?;
+        // **待ち受けを開く。番号を明示していなければ、塞がっているとき次の空きへずらす**
+        // （ADR-0057 §決定1・3 / 作業単位 F-11b / `port_search` モジュール）。
+        //
+        // **ここで完結させる**——`Store::connect` より前なので、範囲を全部試して開けなくても閉じるものが無い
+        // （`App::bind` の doc の約束）。**試す番号は `BindAddr::loopback` で作られる**（`open_first` が渡す）。
+        let (listener, opened) = port_search::open_first(&config.port_search(), |addr| {
+            TcpListener::bind(addr.socket_addr())
+        })
+        .await
+        .map_err(|failure| match failure {
+            port_search::SearchFailure::Stopped(err) => ServerError::Bind(err),
+            port_search::SearchFailure::Exhausted(taken) => ServerError::PortsTaken(taken),
+        })?;
         let local_addr = listener.local_addr().map_err(ServerError::Bind)?;
+
+        // **ずらしたら、警告を1本**（ADR-0057 §決定4）——元の番号・実際の番号・出どころ・飛ばした番号。
+        // **`設定を読み込みました` の `bind=` は元の番号（出どころの番号）のまま**（`main`）。実際の番号はこの行と、
+        // 下の待ち受けの行の `addr=` が言う。見張り番は `tests/listening_port_cli.rs` の
+        // `a_taken_saved_port_shifts_past_a_face_port_and_the_log_and_the_api_say_so`。
+        if opened.shifted() {
+            tracing::warn!(
+                requested_port = opened.requested(),
+                port = local_addr.port(),
+                port_source = %opened.source().label(),
+                skipped_ports = ?opened.skipped(),
+                "{}",
+                port_search::shifted_message(
+                    opened.requested(),
+                    local_addr.port(),
+                    opened.requested_was_skipped()
+                )
+            );
+        }
 
         // **⚠ 上流を起こすのは、待ち受けを開いた「後」**（ADR-0042 §決定3）。
         //
@@ -1503,9 +1620,14 @@ impl App {
             // **この実行ファイルは両方の値を知っている**のだから、起こす前に両方を挙げて言える。
             //
             // **判定は純粋関数**（`launch::LaunchPlan::port_conflict`）で、
-            // **渡すのは `config.bind()`** ——`DEFAULT_PORT` を見に行かない
-            // （`-Port` を渡した起動でも同じ取り合いは起きる）。
-            if let Some(collision) = launching.plan.port_conflict(config.bind()) {
+            // **渡すのは実際に開いた番号**（`local_addr` / ADR-0057 §決定3 / 作業単位 F-11b）——
+            // `DEFAULT_PORT` も設定の番号（`config.bind()`）も見に行かない。ずらした起動では設定の番号と
+            // 違い、`PERSONACORE_PORT=0` では OS が選んだ番号になる。見張り番は `tests/upstream_launch.rs` の
+            // `the_conflict_check_sees_the_port_actually_opened_after_shifting`。
+            if let Some(collision) = launching
+                .plan
+                .port_conflict(BindAddr::loopback(local_addr.port()))
+            {
                 return Err(ServerError::Launch(launch::LaunchError::PortCollision(
                     collision,
                 )));
@@ -1736,8 +1858,8 @@ impl App {
             llm,
             listener,
             local_addr,
-            // **出どころは設定から**（実際の番号は `local_addr` / ADR-0057 §決定5）。
-            port_source: config.port_source(),
+            // **元の番号と出どころは探した結果から**（実際の番号は `local_addr` / ADR-0057 §決定4・5）。
+            opened,
             ui,
             refresh,
             upstream,
@@ -1988,7 +2110,7 @@ impl App {
         // **番号は実際に開いた番号**（`local_addr`。設定値ではない）。
         let listening = Arc::new(listening_port::Listening::new(
             self.local_addr.port(),
-            self.port_source,
+            self.opened,
             listening_port::memory_for(&self.profiles_file),
         ));
         let profile_editor = Arc::new(profile_editor::ProfileEditor::new(self.profiles_file));

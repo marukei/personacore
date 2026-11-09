@@ -1314,6 +1314,15 @@ export interface ServerView {
   /** **いま実際に待ち受けている番号**（`PERSONACORE_PORT=0` なら OS が選んだ番号）。 */
   listening_port: number;
   listening_port_source: string;
+  /**
+   * **元の番号**（出どころの番号。試したとは限らない。`PERSONACORE_PORT=0` なら `0`）。作業単位 F-11b / ADR-0057 §決定4。
+   * **型だけを写してある**（帯の表示は作業単位 F-11c）。
+   */
+  listening_port_requested: number;
+  /** **元の番号が使えず、別の番号で待ち受けたか。** `0`（OS に選ばせた）は `false`。 */
+  listening_port_shifted: boolean;
+  /** **探すときに飛ばした番号**（`upstreams.json` の llama の面が使う番号のうち、開けた番号より前のもの）。 */
+  listening_port_skipped: number[];
   /** 保存した番号。**無い・読めない・保存できない起動なら `null`**（3つは `saved_port_unreadable` と `editable` で見分ける）。 */
   saved_port: number | null;
   /** **保存のファイルが在るのに読めない。** 無い・空・保存できない起動なら `false`。 */

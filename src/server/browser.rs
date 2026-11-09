@@ -162,14 +162,21 @@ fn program_for_this_build(_default: &'static str) -> Option<std::ffi::OsString> 
 ///
 /// **起こしたコマンドの終わりは待たない**（別のタスクで待ち、失敗なら WARN）。
 /// `cmd /C start` も `open` もすぐ返るが、**待ち受けの開始を、他人のプロセスの都合で遅らせない。**
-pub(crate) fn open(url: &str) {
+///
+/// **戻り値は「開くコマンドを起こせたか」**（作業単位 F-11a）。**起こせなかった・起こさなかった
+/// （`testing` 付きのビルドで偽物が無い）なら `false`。** 2つ目の起動（ADR-0057 §決定2）は、
+/// `false` のときに、窓を閉じる前に Enter を待つ（`instance_lock` モジュール）。
+///
+/// **⚠ 起こしたコマンドが後で失敗したこと（終了コード）は、戻り値に入らない**——終わりを待つと、
+/// 環境によってはブラウザが閉じるまで返らない開き方（`xdg-open` の素朴な実装）で、2つ目が止まる。
+pub(crate) fn open(url: &str) -> bool {
     let (default_program, args) = opener(Platform::current(), url);
     let Some(program) = program_for_this_build(default_program) else {
         tracing::info!(
             url,
             "テスト用のビルドなので、ブラウザは開きません（{ENV_TEST_BROWSER} が未設定）"
         );
-        return;
+        return false;
     };
 
     match tokio::process::Command::new(&program)
@@ -197,12 +204,16 @@ pub(crate) fn open(url: &str) {
                     ),
                 }
             });
+            true
         }
-        Err(err) => tracing::warn!(
-            url,
-            error = %err,
-            "ブラウザを開けませんでした（url の画面を手で開いてください）"
-        ),
+        Err(err) => {
+            tracing::warn!(
+                url,
+                error = %err,
+                "ブラウザを開けませんでした（url の画面を手で開いてください）"
+            );
+            false
+        }
     }
 }
 

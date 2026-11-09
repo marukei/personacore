@@ -957,11 +957,42 @@ impl UpstreamProfiles {
             })
         })
     }
+
+    /// **全部のプロファイルの gguf の面が使う番号**（llama を起こす番号 / ADR-0057 §決定3 / 作業単位 F-11b）。
+    /// **純粋関数。**
+    ///
+    /// **選ばれているかを問わない**——覚えた名前で起きた起動（ADR-0055）は上流を後で画面から起こすので、
+    /// その起動の計画だけを見ると取り合いを見逃す。**外の上流の面（gguf の無い面）は入らない**
+    /// （そこに待ち受けを作るのは personacore ではない / `LaunchPlan::port_conflict` と同じ線）。
+    #[must_use]
+    pub fn launch_ports(&self) -> BTreeSet<u16> {
+        self.profiles
+            .values()
+            .flat_map(|profile| profile.launches.iter())
+            .map(|launch| launch.launch().serve_port())
+            .collect()
+    }
 }
 
 // ----------------------------------------------------------------------
 // 読み取り
 // ----------------------------------------------------------------------
+
+/// **待ち受けを探すときに飛ばす番号を、置き場所のファイルから読む**（ADR-0057 §決定3 / 作業単位 F-11b）。
+///
+/// **ファイルが無ければ空**（`Ok`。見本を書けなかった機・`PERSONACORE_UPSTREAMS` が無いファイルを指す起動）。
+/// **読めない・形が不正なら `Err`**——`main` は警告を1本出して、飛ばす番号を空にして進む
+/// （**上流を決めるのには使わない**。読んだ中身はここで番号だけになる）。
+///
+/// # Errors
+///
+/// 在るのに読めない、または JSON・形として読めないとき（[`load_profiles`] と同じ理由）。
+pub fn launch_ports_at(path: &Path) -> Result<BTreeSet<u16>, ProfileError> {
+    match std::fs::symlink_metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        _ => load_profiles(path).map(|profiles| profiles.launch_ports()),
+    }
+}
 
 /// **ファイルから読む。** 読めなければ置き場所を挙げて止まる。
 ///
@@ -1498,6 +1529,59 @@ pub(crate) const FACE_LABEL_SEPARATOR: &str = "+";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **飛ばす番号は、全部のプロファイルの gguf の面の番号**（ADR-0057 §決定3 / 作業単位 F-11b）。
+    ///
+    /// 3つのプロファイルに、本文の gguf（`a`）・抽出だけの gguf（`b`）・外の上流だけ（`c`）を置く。
+    /// **外の上流の番号（`c` と `b` の本文）は入らない。** 同じ番号を2つのプロファイルが使っても1つ。
+    #[test]
+    fn the_launch_ports_are_every_gguf_face_of_every_profile() {
+        let profiles = parse_profiles(
+            r#"{
+              "a": { "main": { "endpoint": "http://127.0.0.1:47101", "model": "m", "gguf": "/x/a.gguf" } },
+              "b": {
+                "main": { "endpoint": "http://127.0.0.1:47102", "model": "m" },
+                "sub":  { "endpoint": "http://localhost:47103", "model": "s", "gguf": "/x/b.gguf" }
+              },
+              "c": { "main": { "endpoint": "http://127.0.0.1:47104", "model": "m" } },
+              "d": { "main": { "endpoint": "http://127.0.0.1:47101", "model": "m", "gguf": "/x/d.gguf" } }
+            }"#,
+            None,
+        )
+        .expect("読めること");
+        assert_eq!(profiles.launch_ports(), BTreeSet::from([47101, 47103]));
+    }
+
+    /// **置き場所から読む**: 無ければ空、在れば番号、壊れていれば `Err`（`main` が警告にする）。
+    #[test]
+    fn the_launch_ports_at_a_path_are_empty_when_missing_and_an_error_when_broken() {
+        let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
+        let path = dir.path().join("upstreams.json");
+        assert_eq!(
+            launch_ports_at(&path).expect("無ければ空であること"),
+            BTreeSet::new()
+        );
+
+        std::fs::write(
+            &path,
+            r#"{ "a": { "main": { "endpoint": "http://127.0.0.1:47201", "model": "m", "gguf": "/x/a.gguf" } } }"#,
+        )
+        .expect("書けること");
+        assert_eq!(
+            launch_ports_at(&path).expect("読めること"),
+            BTreeSet::from([47201])
+        );
+
+        std::fs::write(&path, "{ not json").expect("書けること");
+        assert!(matches!(launch_ports_at(&path), Err(ProfileError::Json(_))));
+
+        std::fs::remove_file(&path).expect("消せること");
+        std::fs::create_dir(&path).expect("ディレクトリを置けること");
+        assert!(matches!(
+            launch_ports_at(&path),
+            Err(ProfileError::Unreadable(_))
+        ));
+    }
 
     /// **形が不正なら、どこで何が駄目だったかを定数で持つ**（作業単位 F-4b-3）。
     ///

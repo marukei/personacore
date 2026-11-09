@@ -41,8 +41,8 @@ use std::time::Duration;
 
 use common::install_global_log;
 use personacore::server::{
-    App, AppConfig, BindAddr, DEFAULT_LOG_FILTER, LaunchPlan, LaunchTiming, Startup,
-    UpstreamProfiles, overlay_profile, parse_profiles,
+    App, AppConfig, BindAddr, DEFAULT_LOG_FILTER, ENV_PORT, LaunchPlan, LaunchTiming, PortSource,
+    Startup, UpstreamProfiles, overlay_profile, parse_profiles,
 };
 use tokio::sync::oneshot;
 
@@ -169,11 +169,46 @@ fn serve(config: AppConfig, plan: LaunchPlan) -> Serving {
     }
 }
 
-/// **設定を組む。** プロファイルの4つを重ね、待ち受けと DB だけを差し替える。
+/// **設定を組む。** プロファイルの4つを重ね、待ち受けの番号を `PERSONACORE_PORT` で明示し、DB を差し替える。
 ///
-/// **環境変数は1つも読まない**（`|_| None`）——
+/// **プロセスの環境変数は1つも読まない**（参照関数が答えるのは `PERSONACORE_PORT` だけ）——
 /// **測定中の機に立っている `PERSONACORE_*` に結果を左右させない。**
+///
+/// # 番号は明示する（F-11b のレビュー是正）
+///
+/// **出どころが `default`（`with_bind`）だと、`port` を他の誰かが掴んでいたとき黙って次の番号へずれて起きる**
+/// （ADR-0057 §決定1）。そのとき腕は `port` の `/admin/upstream` を読み、**並んで走る別の腕のサーバに答えさせて
+/// 緑になりうる**（F-11b より前は `Bind` で赤だった）。明示なら今までどおり待ち受けに失敗する。
+/// 出どころが `default` である必要がある腕は [`default_config_of`] を使う。
 fn config_of(
+    profiles: &UpstreamProfiles,
+    name: &str,
+    dir: &Path,
+    port: u16,
+) -> (AppConfig, LaunchPlan) {
+    let profile = profiles.select(name).expect("プロファイルが在ること");
+    let settings = profile.settings();
+    let port_text = port.to_string();
+    let config = AppConfig::from_lookup_with_data_dir(
+        overlay_profile(&settings, move |key| {
+            (key == ENV_PORT).then(|| port_text.clone())
+        }),
+        Some(dir.to_path_buf()),
+    )
+    .expect("設定を組めること")
+    .with_database_path(dir.join("db").join("personacore.sqlite"));
+    assert_eq!(
+        config.port_source(),
+        PortSource::Environment,
+        "前提: 明示の番号であること"
+    );
+    (config, LaunchPlan::of(profile))
+}
+
+/// **出どころが `default` のままの設定**（`with_bind` で番号だけを差し替える）。**塞がっていれば次の空きへずれる。**
+///
+/// **ずれることそのものを使う腕だけが使う**（`the_conflict_check_sees_the_port_actually_opened_after_shifting`）。
+fn default_config_of(
     profiles: &UpstreamProfiles,
     name: &str,
     dir: &Path,
@@ -188,6 +223,11 @@ fn config_of(
     .expect("設定を組めること")
     .with_bind(BindAddr::loopback(port))
     .with_database_path(dir.join("db").join("personacore.sqlite"));
+    assert_eq!(
+        config.port_source(),
+        PortSource::Default,
+        "前提: ずらす出どころであること"
+    );
     (config, LaunchPlan::of(profile))
 }
 
@@ -844,6 +884,11 @@ async fn a_missing_gguf_starts_nothing_and_stops_the_startup() {
 /// **「起こす → 待ち受ける」の順にすると、この腕で子が残る** ——
 /// **起こした後に `bind` が失敗すると、止める人がもう居ない。**
 /// **偽の `llama` が一度も呼ばれないこと**が、順序そのものの観測である。
+///
+/// **番号は明示する**（[`config_of`] が `PERSONACORE_PORT` で渡す / 作業単位 F-11b）——明示していない番号は、
+/// 塞がっていれば次の空きへずれて起きる（ADR-0057 §決定1）ので、待ち受けに失敗しない。
+/// 範囲が全部塞がって止まる形は `tests/server_listening_port.rs` の
+/// `a_whole_range_taken_stops_and_names_the_range` が見る（そこでも `Store::connect` より前で止まる）。
 #[tokio::test]
 async fn a_failed_bind_leaves_no_child_behind() {
     let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
@@ -992,6 +1037,82 @@ async fn a_face_that_wants_the_servers_own_port_stops_before_anything_is_started
     );
     assert!(!marker.exists(), "止まったのに偽の llama が呼ばれている");
     assert!(!answers(port).await, "止まったのに待ち受けが残っている");
+}
+
+/// **取り合いの判定は、設定の番号ではなく実際に開いた番号で見る**（作業単位 F-11b / ADR-0057 §決定3
+/// 「`port_conflict` には実際に開いた番号を渡す」）。
+///
+/// 設定の番号 `P`（出どころ `default`）をこのテストが塞ぎ、起こす面の宛先を `P+1` にする。**飛ばす番号は
+/// 渡さない**ので、待ち受けは `P+1` へずれる —— そこは起こす面の番号なので、起こす前に止まる。
+/// **設定の番号（`P`）で見る実装は取り合いを見落とし、偽の `llama` を起こしに行く**（足跡が残って赤）。
+///
+/// # この形は `main` からは作れない
+///
+/// `main` は `upstreams.json` の全部の gguf の面の番号を飛ばす（`AppConfig::with_face_ports`）ので、ずれた先が
+/// 面の番号になることは無い。**`main` で実際に効くのは `PERSONACORE_PORT=0`**（OS が選んだ番号が面の番号と
+/// 一致する形 —— エフェメラル範囲を名指すプロファイルだけ）で、それはこのテストからは狙って作れない。
+/// だから飛ばす番号を渡さない入口で、渡す番号そのものを観測する。
+#[tokio::test]
+async fn the_conflict_check_sees_the_port_actually_opened_after_shifting() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
+    fake_llama_on_path();
+    let gguf = fake_gguf(dir.path(), "planted-shifted-into.gguf");
+    let marker = dir.path().join(TOUCH_MARKER);
+
+    // **設定の番号 `P` を塞ぎ、`P+1` が空いている形を作る**（掴めなければ別の番号で取り直す）。
+    //
+    // **OS が自分では配らない帯（20000〜28999）から選ぶ**——Windows は `127.0.0.1:0` の番号をプロセスを
+    // またいで順に配るので、OS に選ばせた `P` の次の `P+1` は、並んで走る他の腕（`free_port`）が次に
+    // 受け取る番号になりうる。取られると待ち受けは `P+2` へずれ、取り合いが起きない（作業単位 F-11b で実測した型）。
+    let seed = std::process::id().wrapping_mul(2_654_435_761);
+    let (blocker, blocked) = (0_u32..200)
+        .find_map(|call| {
+            let offset = seed.wrapping_add(call.wrapping_mul(7_919)) % 9_000;
+            let blocked = 20_000 + u16::try_from(offset).expect("9000 未満であること");
+            let blocker = std::net::TcpListener::bind(("127.0.0.1", blocked)).ok()?;
+            let probe = std::net::TcpListener::bind(("127.0.0.1", blocked + 1)).ok()?;
+            drop(probe);
+            Some((blocker, blocked))
+        })
+        .expect("前提: 塞いだ番号の次が空いている形を 200 回で作れること");
+    let shifted_to = blocked + 1;
+
+    let (profiles, _) = read(
+        &serde_json::json!({
+            "planted": {
+                "main": {
+                    // **宛先のホストは `localhost`**（上の腕と同じ理由——待ち受けの綴りと字面を重ねない）。
+                    "endpoint": format!("http://localhost:{shifted_to}"),
+                    "model": "planted-body-model-id",
+                    "gguf": gguf,
+                    "args": ["--pc-touch", marker],
+                }
+            }
+        })
+        .to_string(),
+    );
+    let (config, plan) = default_config_of(&profiles, "planted", dir.path(), blocked);
+
+    let err = App::run_with_upstreams(&config, plan, bounded_shutdown())
+        .await
+        .expect_err("ずれた先が起こす面の番号なら止まること");
+    let chain = rendered_chain(&err);
+    assert_eq!(
+        err.to_string(),
+        "名指しされた上流を起こせませんでした",
+        "取り合いで止まっていない: {chain}"
+    );
+    assert!(
+        chain.contains(&format!("127.0.0.1:{shifted_to}")),
+        "実際に開いた番号（{shifted_to}）を挙げていない: {chain}"
+    );
+    let logs = dir.path().join("db").join("upstream-logs");
+    assert!(
+        !logs.exists(),
+        "ずれた先と取り合う面を起こしに行っている: {logs:?}"
+    );
+    assert!(!marker.exists(), "止まったのに偽の llama が呼ばれている");
+    drop(blocker);
 }
 
 /// **gguf の無い面（外の上流）は、同じポートを名乗っても縛らない。**

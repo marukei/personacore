@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use personacore::domain::{DisplayName, Handle, Persona};
-use personacore::server::{App, AppConfig, BindAddr, ServerError, shutdown_signal};
+use personacore::server::{App, AppConfig, BindAddr, ENV_PORT, ServerError, shutdown_signal};
 use personacore::store::{Store, StoreError};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -33,6 +33,17 @@ fn config_for(db_path: &Path) -> AppConfig {
         .expect("既定値だけで設定を組み立てられること")
         // ポート 0 は OS に空きを選ばせる。**アドレスは指定できない**（常にループバック）。
         .with_bind(BindAddr::loopback(0))
+        .with_database_path(db_path)
+}
+
+/// **`PERSONACORE_PORT` で番号を明示した設定**（[`config_for`] と同じ既定で、出どころだけが `environment`）。
+///
+/// **待ち受けに失敗させる腕はこれを使う**（作業単位 F-11b）——[`config_for`] の `with_bind` は出どころが
+/// `default` のままなので、塞がった番号から次の空きへずれて起きる（ADR-0057 §決定1）。
+fn explicit_config_for(db_path: &Path, port: u16) -> AppConfig {
+    let port = port.to_string();
+    AppConfig::from_lookup(move |key| (key == ENV_PORT).then(|| port.clone()))
+        .expect("既定値と番号だけで設定を組み立てられること")
         .with_database_path(db_path)
 }
 
@@ -445,7 +456,8 @@ async fn bind_failure_never_opens_the_store() {
     let dir = tempfile::tempdir().expect("一時ディレクトリを作成できること");
     let db_path = dir.path().join("second.sqlite");
     // **別の DB ファイル**を使う（1台目のプールと混ざらないようにする）。
-    let config = config_for(&db_path).with_bind(BindAddr::loopback(occupied.addr.port()));
+    // **番号は明示する**（明示していない番号は、塞がっていれば次の空きへずれて起きる / 作業単位 F-11b）。
+    let config = explicit_config_for(&db_path, occupied.addr.port());
 
     let err = App::bind(&config)
         .await
@@ -505,7 +517,8 @@ async fn run_reports_bind_failure() {
 
     let dir = tempfile::tempdir().expect("一時ディレクトリを作成できること");
     let db_path = dir.path().join("run-conflict.sqlite");
-    let config = config_for(&db_path).with_bind(BindAddr::loopback(occupied.addr.port()));
+    // **番号は明示する**（`bind_failure_never_opens_the_store` と同じ理由 / 作業単位 F-11b）。
+    let config = explicit_config_for(&db_path, occupied.addr.port());
 
     let err = App::run(&config, std::future::ready(()))
         .await

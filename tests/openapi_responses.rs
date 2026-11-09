@@ -35,7 +35,8 @@ use personacore::llm::{
     ChatChunk, ChatRequest, ChatStream, Completion, FinishReason, LlmClient, LlmError, LlmFuture,
 };
 use personacore::server::{
-    App, AppConfig, BindAddr, ENV_LLM_ENDPOINT, LaunchPlan, ServerError, Startup, api_document,
+    App, AppConfig, BindAddr, ENV_LLM_ENDPOINT, ENV_PORT, LaunchPlan, ServerError, Startup,
+    api_document,
 };
 use personacore::store::Store;
 use reqwest::{Method, StatusCode};
@@ -1006,12 +1007,19 @@ impl EditableServer {
                 .and_then(|listener| listener.local_addr())
                 .expect("ポートを取れること")
                 .port();
+            // **番号は `PERSONACORE_PORT` で明示する**（作業単位 F-11b）——取られていたら待ち受けを開けずに返り、
+            // 下の起こし直しに入る。明示していない番号（`with_bind`）は、取られていれば次の空きへずれて起き、
+            // このポートには別の誰かが答える。
+            let port_text = port.to_string();
             let config = AppConfig::from_lookup_with_data_dir(
-                |key: &str| (key == ENV_LLM_ENDPOINT).then(|| "http://127.0.0.1:9".to_owned()),
+                move |key: &str| match key {
+                    ENV_LLM_ENDPOINT => Some("http://127.0.0.1:9".to_owned()),
+                    ENV_PORT => Some(port_text.clone()),
+                    _ => None,
+                },
                 Some(dir.to_path_buf()),
             )
             .expect("設定を組めること")
-            .with_bind(BindAddr::loopback(port))
             .with_database_path(dir.join("db").join("personacore.sqlite"));
             let startup =
                 Startup::new(LaunchPlan::none()).with_editable_profiles_file(profiles.clone());
