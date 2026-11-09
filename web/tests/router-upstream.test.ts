@@ -80,7 +80,8 @@ describe("ナビゲーション", () => {
    */
   it("`navScreens` に上流の画面がある", () => {
     const routes = navScreens().map((screen: Screen) => screen.route);
-    expect(routes).toEqual(["chat", "characters", "upstream"]);
+    // **作業単位 F-12b で「設定」が最後に並んだ**（`tests/router-settings.test.ts`）。
+    expect(routes).toEqual(["chat", "characters", "upstream", "settings"]);
   });
 });
 

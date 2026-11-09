@@ -1,6 +1,6 @@
 /**
  * **ハッシュによるルーティング**
- * （`#/chat` / `#/characters` / `#/upstream` / `#/memories/{識別子}` /
+ * （`#/chat` / `#/characters` / `#/upstream` / `#/settings` / `#/memories/{識別子}` /
  * `#/stats/{識別子}` / `#/attributes/{識別子}` / `#/agreements/{識別子}`）。
  *
  * # なぜハッシュか。なぜライブラリを足さないか
@@ -37,6 +37,10 @@ export type Screen =
   // 面（本文 / 裏方）は personacore の設定で決まっていて、
   // **どのキャラクターを開いていても同じ**なので、識別子を運ばない。
   | { readonly route: "upstream" }
+  // **personacore 自身の設定**（作業単位 F-12b / ADR-0057 §決定5。いまは待ち受けのポート）。
+  // **上流の画面には混ぜない**（推論サーバの話と、personacore 自身の待ち受けの話が混ざる）。
+  // キャラクターに紐づかないので、識別子を運ばない。
+  | { readonly route: "settings" }
   | { readonly route: "memories"; readonly handle: string }
   | { readonly route: "stats"; readonly handle: string }
   // **属性もキャラクターごと**（作業単位 D-12a / `GET .../attributes`）。
@@ -71,10 +75,11 @@ function isScoped(name: string): name is (typeof SCOPED)[number] {
  * **`SCOPED` と同じ理由でここに集める**（作業単位 D-9 で3つ目が増えた）——
  * 判定を `if` で書き足すと、**`hrefFor` との食い違いが静かに生まれる。**
  */
-const FLAT: readonly ["chat", "characters", "upstream"] = [
+const FLAT: readonly ["chat", "characters", "upstream", "settings"] = [
   "chat",
   "characters",
   "upstream",
+  "settings",
 ];
 
 /** 識別子を運ばない画面の名前か。 */
@@ -97,11 +102,13 @@ export const DEFAULT_SCREEN: Screen = { route: "chat" };
  *
  * **⚠ 上流の画面は並ぶ**（作業単位 D-9）。**識別子を1つも決め打たない**ので、
  * 上の理由がそもそも当たらない ——上に書いた条件の、ちょうど裏側である。
+ * **「設定」も同じ理由で並ぶ**（作業単位 F-12b / ADR-0057 §決定5「ナビに足す」）。最後に置く。
  */
 const NAV: readonly Screen[] = [
   { route: "chat" },
   { route: "characters" },
   { route: "upstream" },
+  { route: "settings" },
 ];
 
 /** その画面へのリンク先。**`<a href>` に直接書かない**（綴りの写しが増える）。 */
@@ -110,6 +117,7 @@ export function hrefFor(screen: Screen): string {
     case "chat":
     case "characters":
     case "upstream":
+    case "settings":
       return `#/${screen.route}`;
     case "memories":
     case "stats":
@@ -133,6 +141,8 @@ export function labelFor(screen: Screen): string {
       // 会話の画面の `送り先` はセッションの識別子であって、モデルではない
       // （作業単位 D-9 —— 両方が同じ語を使うと、誤読はそのまま残る）。
       return "上流モデル";
+    case "settings":
+      return "設定";
     case "memories":
       return `${screen.handle} の記憶`;
     case "stats":

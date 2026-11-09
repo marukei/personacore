@@ -140,6 +140,8 @@ describe("ナビゲーションには並ばない", () => {
       "chat",
       "characters",
       "upstream",
+      // **識別子を運ばない「設定」**（作業単位 F-12b）。
+      "settings",
     ]);
   });
 });

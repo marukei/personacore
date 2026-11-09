@@ -20,7 +20,7 @@
  * 別の条件から出ていると、片方だけが古びる**（CLAUDE.md の「写し」）。
  * **D-12b-1 では、印を `aria-[current=page]:` の変位で書いた** ——
  * **属性が付いた要素にだけ効く**ので、**条件はマークアップに1つしか無い。**
- * **3つのタブの `class` が一字一句同じであること**がその現れで、
+ * **全部のタブ（F-12b から4つ）の `class` が一字一句同じであること**がその現れで、
  * **いまいる画面だけに別のクラスを足す形に戻すと、ここが赤になる。**
  *
  * # ⚠ 守れていないこと
@@ -46,8 +46,15 @@ readerInZone("America/New_York");
 
 /** **真ん中のタブ**（選ぶ対象を端に置かない / CLAUDE.md「見張り番の書き方」）。 */
 const MIDDLE = { href: "#/characters", text: "キャラクター" };
-/** 端のタブ（移った先）。 */
-const LAST = { href: "#/upstream", text: "上流モデル" };
+/**
+ * 端のタブ（移った先）。
+ *
+ * **作業単位 F-12b で「設定」が最後に並んだ**ので、端は上流の画面から設定の画面へ移った。
+ */
+const LAST = { href: "#/settings", text: "設定" };
+
+/** **タブの数**（会話・キャラクター・上流モデル・設定）。並び順は `tests/app-routing-upstream.test.ts`。 */
+const TAB_COUNT = 4;
 
 /** 製品名（帯の左端）。 */
 const PRODUCT = "personacore";
@@ -121,7 +128,7 @@ it("いまいる画面だけが `aria-current` を持ち、移ると印も移る
   const view = mount(App, { target });
   try {
     await vi.waitFor(() => {
-      expect(tabs().length).toBe(3);
+      expect(tabs().length).toBe(TAB_COUNT);
     });
     expect(current()).toEqual([MIDDLE.text]);
 
@@ -145,7 +152,7 @@ it("いまいる画面の印は、`aria-current` そのものから引く", asyn
       expect(current()).toEqual([MIDDLE.text]);
     });
     const classes = tabs().map((tab) => tab.getAttribute("class") ?? "");
-    // **3つのタブの `class` が一字一句同じ** —— いまいる画面だけに別の印を足していない。
+    // **全部のタブの `class` が一字一句同じ** —— いまいる画面だけに別の印を足していない。
     expect(new Set(classes).size).toBe(1);
     const tokens = (classes[0] as string).split(/\s+/);
     // **太字と、下の read の線は、`aria-current="page"` が付いたときだけ効く綴り。**
@@ -170,7 +177,7 @@ it("タブの押せる高さは 44px 以上", async () => {
   const view = mount(App, { target });
   try {
     await vi.waitFor(() => {
-      expect(tabs().length).toBe(3);
+      expect(tabs().length).toBe(TAB_COUNT);
     });
     for (const tab of tabs()) {
       const tokens = (tab.getAttribute("class") ?? "").split(/\s+/);
@@ -192,7 +199,7 @@ it("製品名は帯に在り、`nav` にも `main` にも入っていない", as
   const view = mount(App, { target });
   try {
     await vi.waitFor(() => {
-      expect(tabs().length).toBe(3);
+      expect(tabs().length).toBe(TAB_COUNT);
     });
     const nav = target.querySelector("nav") as HTMLElement;
     const main = target.querySelector("main") as HTMLElement;
