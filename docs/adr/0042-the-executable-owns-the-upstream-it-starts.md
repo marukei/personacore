@@ -3,6 +3,7 @@
 - 状態: **採用**（2026-09-18 / 範囲の合意 —— 「層2（モデルの探索・DL・選択 GUI）は外に置く」「llama.cpp だけを対象にしてでも、上流を触る機能は要る」「2段とも入れる」—— のあと、`F-4a` を閉じた同日に利用者が「環境変数依存が強いと『使ってみる』の難易度が跳ね上がるので次を進めよう」と決めた）
 - 日付: 2026-09-18
 - **⚠ 2026-11-01: §決定1・3・4・9 を [ADR-0054](0054-context-length-in-the-upstream-profile.md) と [ADR-0055](0055-do-not-start-the-remembered-upstream-at-launch.md) が改めた。** 面に `context_tokens` を書ける（§決定1 の「それ以外の鍵は足さない」の例外。ADR-0054）。覚えた名前で起きたときは gguf の面を起こさず、状態 `not_started` で待ち、同じ名前の `POST /admin/upstream/profile` で起こす（ADR-0055）
+- **⚠ 2026-11-10: §決定1 を [ADR-0058](0058-sampling-values-in-the-upstream-profile.md) が改めた。** 面に `sampling`（まず `repeat_penalty` だけ）を書ける（§決定1 の「それ以外の鍵は足さない」の例外）。画面の保存は書いた値を消さない
 - 関連: [ADR-0041](0041-one-executable-per-os.md)（**配布物は exe 1本。この ADR はその §6「上流は当面、環境変数のまま」を引き取る**）/
   [ADR-0039](0039-two-upstreams-for-two-jobs.md)（本文と抽出の2上流。**差し替えは面ごと**）/
   [ADR-0038](0038-what-personacore-requires-of-an-upstream.md)（上流に要求すること。**この ADR は要求を増やさない**）/
