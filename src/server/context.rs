@@ -38,7 +38,7 @@ use super::upstream::{
 };
 use crate::llm::{
     ApiKey, ChatRequest, ChatStream, Completion, LlmClient, LlmError, LlmFuture, LmStudioClient,
-    ModelId, TokenCount,
+    ModelId, Sampling, TokenCount,
 };
 use crate::measured::ModelFace;
 use crate::prompt::TokenBudget;
@@ -1724,6 +1724,11 @@ impl FaceClient {
         self.current().config().key_over_plain_http_allowed()
     }
 
+    /// **いま送るサンプラの、面に書いた値**（ADR-0058 / 作業単位 A-16）。何も書いていなければ既定。
+    pub(in crate::server) fn sampling(&self) -> Sampling {
+        self.current().config().sampling()
+    }
+
     /// **いまのクライアントを、差し替え先の候補として持つ**（その面を変えないとき）。
     pub(in crate::server) fn as_candidate(&self) -> Candidate {
         Candidate(self.current())
@@ -1738,21 +1743,16 @@ impl FaceClient {
     ///
     /// **鍵は切り替え先の面のもの**（`api_key`。いまのクライアントから引き継がない /
     /// ADR-0056 §決定2 / `config::retarget_llm`）。**承認も切り替え先の面のもの**（ADR-0056 §決定5）。
+    ///
+    /// **サンプラの値も切り替え先の面のもの**（`face.sampling` / ADR-0058 §決定2）。
     pub(in crate::server) fn retargeted(
         &self,
         base_url: &str,
         model: &str,
-        api_key: Option<&ApiKey>,
-        allow_key_over_plain_http: bool,
+        face: super::config::FaceSettings<'_>,
     ) -> Result<Candidate, ClientBuildError> {
-        let config = super::config::retarget_llm(
-            self.current().config(),
-            base_url,
-            model,
-            api_key,
-            allow_key_over_plain_http,
-        )
-        .map_err(ClientBuildError::Config)?;
+        let config = super::config::retarget_llm(self.current().config(), base_url, model, face)
+            .map_err(ClientBuildError::Config)?;
         let client = LmStudioClient::new(config).map_err(ClientBuildError::Client)?;
         Ok(Candidate(Arc::new(client)))
     }
@@ -1853,6 +1853,11 @@ impl Candidate {
         self.0.config().key_over_plain_http_allowed()
     }
 
+    /// **この候補が送るサンプラの、面に書いた値**（ADR-0058 / 作業単位 A-16）。
+    pub(in crate::server) fn sampling(&self) -> Sampling {
+        self.0.config().sampling()
+    }
+
     /// **モデルだけを差し替えた複製**（接続プールを共有する / `LmStudioClient::with_model`）。
     ///
     /// **`sub` を書いていないプロファイルの抽出の面**が使う（ADR-0039 §決定1。
@@ -1917,6 +1922,35 @@ impl FaceClients {
         }
     }
 }
+
+/// **面ごとに、実際に送るサンプラの5つと、面の値で置き換えた欄を `info` で1行ずつ言う**
+/// （ADR-0058 §決定3 / 作業単位 A-16）。
+///
+/// **呼ぶのは起動（`App::bind`）と走ったままの切り替え（`super::switch`）の後。** どちらも、いまの差し替え口の
+/// クライアントから読む —— 送る本文と同じ設定（`LmStudioConfig::sampling`）を言う。
+///
+/// **小数は `Display` で出す**（`f32` の最短表記＝線の綴り / `llm::SentSamplers` の doc）。
+/// **言えるのは「送った値」まで**で、上流で効いた値ではない（効いた値の権威は上流の側の観測）。
+pub(in crate::server) fn report_samplers(clients: &FaceClients, occasion: &'static str) {
+    for face in [ModelFace::Main, ModelFace::Sub] {
+        let sampling = clients.face(face).sampling();
+        let sent = sampling.sent_samplers();
+        tracing::info!(
+            upstream_face = %face.label(),
+            occasion,
+            top_k = sent.top_k(),
+            top_p = %sent.top_p(),
+            min_p = %sent.min_p(),
+            repeat_penalty = %sent.repeat_penalty(),
+            presence_penalty = %sent.presence_penalty(),
+            overridden = ?sampling.overridden(),
+            "{SAMPLERS_LINE}"
+        );
+    }
+}
+
+/// **送るサンプラの行**（[`report_samplers`]）。テストがこの綴りで引く。
+pub(in crate::server) const SAMPLERS_LINE: &str = "上流へ送るサンプラの値（面ごと）";
 
 /// **その面の照会先へ1回聞く**（ADR-0042 §決定3 / 作業単位 F-4b-1）。
 ///

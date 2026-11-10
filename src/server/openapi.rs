@@ -144,7 +144,12 @@ const STABILITY_EXTENSION: &str = "x-personacore-stability";
 /// `listening_port_skipped`（飛ばした番号）。応答の欄の追加なので小さい側。**振る舞いも変わった**: 番号を
 /// 明示していない起動は、塞がっていれば止まらずに次の空きへずれる（`listening_port_source` は元の番号の
 /// 出どころ）。口・失敗の形は増減していない。
-pub const API_VERSION: &str = "1.6";
+///
+/// **`1.7`**（作業単位 A-16 / ADR-0058）: 上流プロファイルの面の鍵 `sampling` が入り、問題の `key`
+/// （`ProfileInvalidDetail.key` / `ProblemView.key`）に値 `sampling`、`reason` に値 `sampling_unusable` /
+/// `unknown_sampling_key` が増えた。応答の `enum` に値を足しただけなので小さい側。プロファイルの一覧と
+/// 保存の依頼の形は変えていない（依頼は `sampling` を受け付けず、保存はいまのファイルの値を残す）。
+pub const API_VERSION: &str = "1.7";
 
 /// **ルータに届いた要求への全部の応答に付ける、API の版のヘッダの名前**
 /// （HTTP では大文字小文字を区別しない。仕様書の `headers` の鍵もこの綴り）。
@@ -1729,7 +1734,7 @@ mod tests {
                 vec![json!("stop"), json!("length"), Value::Null],
             ),
             // **面の鍵**（作業単位 A-13a-2 で `context_tokens`、A-13b-1 で `api_key`、
-            // A-13b-2 で `allow_key_over_plain_http` が入った。
+            // A-13b-2 で `allow_key_over_plain_http`、A-16 で `sampling` が入った。
             // 画面は保存の 422 の `key` をこの綴りで欄に結びつける）。
             (
                 "ProfileInvalidDetail",
@@ -1743,6 +1748,7 @@ mod tests {
                     json!("context_tokens"),
                     json!("api_key"),
                     json!("allow_key_over_plain_http"),
+                    json!("sampling"),
                     Value::Null,
                 ],
             ),

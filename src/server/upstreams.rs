@@ -37,7 +37,8 @@
 //! | **同じポートに別の gguf** は止める | `llama serve` は 1 プロセス 1 モデル |
 //!
 //! **`start.ps1` の後に足した鍵は [`FACE_KEYS`] の `command`（ADR-0042 §決定1）・
-//! `context_tokens`（ADR-0054 §決定1）・`api_key`（ADR-0056 §決定1）の3つ。**
+//! `context_tokens`（ADR-0054 §決定1）・`api_key`（ADR-0056 §決定1）・`allow_key_over_plain_http`
+//! （ADR-0056 §決定5）・`sampling`（ADR-0058 §決定1）。**
 //! 「モデルの置き場所が変わる」のと同じ理由で、**実行ファイルの置き場所も変わる。**
 //!
 //! | 規則（`api_key` / 作業単位 A-13b-1） | なぜ |
@@ -64,6 +65,7 @@ use serde_json::Value as JsonValue;
 
 use super::config::{ENV_LLM_ENDPOINT, ENV_MAIN_MODEL, ENV_SUB_LLM_ENDPOINT, ENV_SUB_MODEL};
 use crate::llm::{ApiKey, endpoint_for_log, endpoint_has_userinfo};
+use crate::llm::{RepeatPenalty, Sampling};
 
 /// 上流プロファイルの既定のファイル名。**DB と同じディレクトリに置く**（ADR-0042 §決定1）。
 ///
@@ -103,7 +105,17 @@ pub const FACE_NAMES: [&str; 2] = ["main", "sub"];
 /// 依頼が送らなければ、保存は**いまのファイルの、同じ名前・同じ面の値を、`endpoint` が変わらないときだけ残す**
 /// （`profile_editor` の `FaceEdit::to_value`）ので、**手で書いた承認は、画面から別の欄を直しても消えない。**
 /// **宛先を変えた保存では落とす**（承認は宛先に付く —— 持ち越すと、承認していない宛先へ鍵が平文で出る）。
-pub const FACE_KEYS: [&str; 8] = [
+///
+/// # `sampling` も画面の欄より先に入った（作業単位 A-16 / ADR-0058 §決定6）
+///
+/// **上の「画面が追いつくまで足さない」の3つ目の例外。** 画面の編集（`WrittenFace` / `WrittenFaceRequest`）は
+/// この欄を持たない —— 一覧は値を返さず、依頼は送れない（依頼の型は知らない欄を拒む）。
+/// 保存は**いまのファイルの、同じ名前・同じ面の値を残す**（`profile_editor` の `FaceEdit::to_value`）ので、
+/// **手で書いた値は、画面から別の欄を直しても消えない。** `allow_key_over_plain_http` と違い、
+/// **`endpoint` や `model` を変えた保存でも落とさない**（知らせずに消えるほうが、知らせずに残るより見つけにくい。
+/// 残した値は起動と切り替えのログに出る —— ADR-0058 §決定3）。
+/// 画面の写し（`web/src/lib/upstreamProfiles.ts`）は `FACE_KEYS` に足し、`EDITABLE_FACE_KEYS` からは除く。
+pub const FACE_KEYS: [&str; 9] = [
     "endpoint",
     "model",
     "gguf",
@@ -112,7 +124,20 @@ pub const FACE_KEYS: [&str; 8] = [
     "context_tokens",
     "api_key",
     "allow_key_over_plain_http",
+    "sampling",
 ];
+
+/// **面に書けるサンプラの値の鍵**（ADR-0058 §決定1 / 作業単位 A-16。[`FACE_KEYS`] の9つ目）。値はオブジェクト。
+///
+/// **綴りを写さず、[`FACE_KEYS`] から取る**（[`CONTEXT_TOKENS_KEY`] と同じ）。
+pub const SAMPLING_KEY: &str = FACE_KEYS[8];
+
+/// **[`SAMPLING_KEY`] の中で書ける鍵**（ADR-0058 §決定1）。**これ以外は綴りを挙げて止める。**
+///
+/// **いまは `repeat_penalty` だけ。** サンプラの残りの4つ（`top_k` / `top_p` / `min_p` / `presence_penalty`）は、
+/// 外すと壊れることを測ってから ADR-0058 に追記して足す —— それまでは知らない鍵として止める
+/// （書いたのに効かない値を作らない）。
+pub const SAMPLING_KEYS: [&str; 1] = ["repeat_penalty"];
 
 /// **面に書ける上流への鍵の綴り**（ADR-0056 §決定1 / 作業単位 A-13b-1。[`FACE_KEYS`] の7つ目）。
 ///
@@ -363,11 +388,19 @@ pub enum ShapeReason {
     ApiKeyWithUserinfo,
     /// 真偽値であるべき値が真偽値でない（`allow_key_over_plain_http` / 作業単位 A-13b-2）。
     NotABoolean,
+    /// `sampling` が使えない（オブジェクトでない・`repeat_penalty` が数でないか範囲の外 / ADR-0058 §決定1）。
+    ///
+    /// **鍵（[`ProfileShape::key`]）は [`SAMPLING_KEY`]**（画面はこの欄を持たないので、理由は全体に出る）。
+    SamplingUnusable,
+    /// `sampling` に知らない鍵がある（書けるのは [`SAMPLING_KEYS`] だけ / ADR-0058 §決定1）。
+    ///
+    /// **まだ書けないサンプラの4つ（`top_k` 等）もここ。** 鍵は [`SAMPLING_KEY`]。
+    UnknownSamplingKey,
 }
 
 impl ShapeReason {
     /// **全部の値。** 見張り番が回すための一覧。
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 20] = [
         Self::TopLevelNotObject,
         Self::ProfileNotObject,
         Self::UnknownFace,
@@ -386,6 +419,8 @@ impl ShapeReason {
         Self::ApiKeyUnusable,
         Self::ApiKeyWithUserinfo,
         Self::NotABoolean,
+        Self::SamplingUnusable,
+        Self::UnknownSamplingKey,
     ];
 
     /// **機械が読む綴り**（画面が分岐に使う）。
@@ -410,6 +445,8 @@ impl ShapeReason {
             Self::ApiKeyUnusable => "api_key_unusable",
             Self::ApiKeyWithUserinfo => "api_key_with_userinfo",
             Self::NotABoolean => "not_a_boolean",
+            Self::SamplingUnusable => "sampling_unusable",
+            Self::UnknownSamplingKey => "unknown_sampling_key",
         }
     }
 
@@ -425,7 +462,7 @@ impl ShapeReason {
             Self::MissingMain => "main がありません（本文の上流は省けません）",
             Self::FaceNotObject => "面がオブジェクトではありません",
             Self::UnknownKey => {
-                "知らない鍵があります（使えるのは endpoint / model / gguf / args / command / context_tokens / api_key / allow_key_over_plain_http だけです）"
+                "知らない鍵があります（使えるのは endpoint / model / gguf / args / command / context_tokens / api_key / allow_key_over_plain_http / sampling だけです）"
             }
             Self::MissingKey => "要る鍵がありません",
             Self::NotAString => "文字列であるべき値が文字列ではありません",
@@ -453,6 +490,12 @@ impl ShapeReason {
                 "api_key を書いた面の endpoint にユーザー情報（user:pass@）は書けません（Authorization が2本送られるため）"
             }
             Self::NotABoolean => "真偽値であるべき値が真偽値ではありません",
+            Self::SamplingUnusable => {
+                "sampling が使えません（オブジェクトで書き、repeat_penalty は 0.5 以上 2 以下の数で書いてください）"
+            }
+            Self::UnknownSamplingKey => {
+                "sampling に知らない鍵があります（書けるのは repeat_penalty だけです）"
+            }
         }
     }
 }
@@ -623,9 +666,20 @@ pub struct ProfileFace {
     /// **鍵を平文の `http://` でローカルネットワークの外へ送る承認**（ADR-0056 §決定5 /
     /// [`ALLOW_KEY_OVER_PLAIN_HTTP_KEY`]）。書かなければ偽。
     allow_key_over_plain_http: bool,
+    /// **書いたサンプラの値**（ADR-0058 §決定1 / [`SAMPLING_KEY`]）。**検証済み**（`llm::RepeatPenalty::parse`）。
+    /// 書かなければ [`Sampling::default`]（何も置き換えない）。
+    sampling: Sampling,
 }
 
 impl ProfileFace {
+    /// **この面に書いたサンプラの値**（[`SAMPLING_KEY`] / ADR-0058 §決定1）。書いていなければ既定（何も置き換えない）。
+    ///
+    /// **`sub` 面を書いていないときに裏方が何を使うかは、ここではなく [`ProfileSettings::sub_sampling`] が言う。**
+    #[must_use]
+    pub const fn sampling(&self) -> Sampling {
+        self.sampling
+    }
+
     /// **この面に書いた承認**（[`ALLOW_KEY_OVER_PLAIN_HTTP_KEY`] / ADR-0056 §決定5）。書いていなければ偽。
     ///
     /// **効くのは、鍵を書いた `http://` の面で、宛先にローカルネットワークの外が混ざるときだけ**
@@ -751,7 +805,10 @@ impl UpstreamProfile {
         //
         // **承認は鍵と同じ規則**（ADR-0056 §決定5）——承認は鍵を送る宛先に付くので、
         // `sub` 面が無ければ写さない（抽出は本文のクライアントの複製を使い、同じ承認で送る）。
-        let (sub_endpoint, sub_model, sub_context_tokens, sub_api_key, sub_allow) =
+        //
+        // **サンプラの値は窓と同じ規則**（ADR-0058 §決定1）——`sub` 面が無ければ、裏方は本文と同じ宛先・
+        // 同じモデルへ行くので、**値も本文のもの**。**`sub` 面があって値が無ければ既定**（本文の値を写さない）。
+        let (sub_endpoint, sub_model, sub_context_tokens, sub_api_key, sub_allow, sub_sampling) =
             match self.sub.as_ref() {
                 Some(sub) => (
                     sub.endpoint.clone(),
@@ -759,6 +816,7 @@ impl UpstreamProfile {
                     sub.context_tokens,
                     sub.api_key.clone(),
                     sub.allow_key_over_plain_http,
+                    sub.sampling,
                 ),
                 None => (
                     String::new(),
@@ -766,6 +824,7 @@ impl UpstreamProfile {
                     self.main.context_tokens,
                     None,
                     false,
+                    self.main.sampling,
                 ),
             };
         ProfileSettings {
@@ -779,6 +838,8 @@ impl UpstreamProfile {
             sub_api_key,
             allow_key_over_plain_http: self.main.allow_key_over_plain_http,
             sub_allow_key_over_plain_http: sub_allow,
+            sampling: self.main.sampling,
+            sub_sampling,
         }
     }
 }
@@ -811,9 +872,33 @@ pub struct ProfileSettings {
     allow_key_over_plain_http: bool,
     /// **抽出の面の承認。** `sub` 面に書いたときだけ（本文の承認を貸さない —— 鍵と同じ規則）。
     sub_allow_key_over_plain_http: bool,
+    /// **本文の面のサンプラの値**（ADR-0058 §決定1）。**[`overlay_profile`] を通らない**（環境変数の口を作らない）。
+    sampling: Sampling,
+    /// **裏方の面のサンプラの値**（`sub` 面が無ければ本文の値 / [`Self::sub_sampling`]）。
+    sub_sampling: Sampling,
 }
 
 impl ProfileSettings {
+    /// **本文の面のサンプラの値**（`main` 面の [`SAMPLING_KEY`] / ADR-0058 §決定1）。
+    ///
+    /// 渡し方は `AppConfig::with_profile_sampling`（環境変数の側には口が無い / ADR-0058 §却下した選択肢）。
+    #[must_use]
+    pub const fn sampling(&self) -> Sampling {
+        self.sampling
+    }
+
+    /// **裏方の面のサンプラの値**（ADR-0058 §決定1）。
+    ///
+    /// | `sub` 面 | 値 |
+    /// |---|---|
+    /// | 書いていない | **`main` 面の値**（裏方は本文と同じ宛先・同じモデル） |
+    /// | 書いて、値を書いた | その値 |
+    /// | 書いて、値を書いていない | **既定**（本文の値を写さない —— 別の上流かもしれない） |
+    #[must_use]
+    pub const fn sub_sampling(&self) -> Sampling {
+        self.sub_sampling
+    }
+
     /// **本文の面の承認**（`main` 面の [`ALLOW_KEY_OVER_PLAIN_HTTP_KEY`] / ADR-0056 §決定5）。
     ///
     /// 渡し方は `AppConfig::with_profile_keys`（鍵と一緒に載せる）。
@@ -1192,6 +1277,8 @@ fn parse_face(
         }
     };
 
+    let sampling = parse_sampling(object, profile, label)?;
+
     let launch = match object.get("gguf") {
         None => None,
         Some(raw) => {
@@ -1284,7 +1371,76 @@ fn parse_face(
         context_tokens,
         api_key,
         allow_key_over_plain_http,
+        sampling,
     })
+}
+
+/// **面のサンプラの値を読む**（ADR-0058 §決定1 / 作業単位 A-16）。書いていなければ既定（何も置き換えない）。
+///
+/// | 止める | 理由 |
+/// |---|---|
+/// | オブジェクトでない | [`ShapeReason::SamplingUnusable`] |
+/// | 知らない鍵（[`SAMPLING_KEYS`] の外。まだ書けないサンプラの4つも） | [`ShapeReason::UnknownSamplingKey`]（**綴りを挙げる**） |
+/// | `repeat_penalty` が数でない・範囲の外（`llm::REPEAT_PENALTY_MIN` の表） | [`ShapeReason::SamplingUnusable`] |
+///
+/// **`{}` は通す**（何も書いていないのと同じ）。**gguf の有無に関わらず書ける**（値はエンジン・モデル・量子化の組に付く）。
+/// 範囲の規則は `llm::RepeatPenalty::parse` が持つ —— ここに写しを作らない。
+fn parse_sampling(
+    object: &serde_json::Map<String, JsonValue>,
+    profile: &str,
+    label: &'static str,
+) -> Result<Sampling, ProfileError> {
+    let Some(raw) = object.get(SAMPLING_KEY) else {
+        return Ok(Sampling::default());
+    };
+    let unusable = |detail: String| {
+        shape(
+            Fault::key(ShapeReason::SamplingUnusable, profile, label, SAMPLING_KEY),
+            format!("プロファイル '{profile}' の {label} の {SAMPLING_KEY} が使えません: {detail}"),
+        )
+    };
+    let JsonValue::Object(fields) = raw else {
+        return Err(unusable(format!("オブジェクトではありません: {raw}")));
+    };
+
+    // **知らない鍵を黙って捨てない**（面の鍵と同じ —— 綴りを誤った値は、書いたのに効かない）。
+    let unknown: Vec<&str> = fields
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !SAMPLING_KEYS.contains(key))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(shape(
+            Fault::key(
+                ShapeReason::UnknownSamplingKey,
+                profile,
+                label,
+                SAMPLING_KEY,
+            ),
+            format!(
+                "プロファイル '{profile}' の {label} の {SAMPLING_KEY} に知らない鍵があります: {}\
+                 （書けるのは {} だけです）",
+                unknown.join(", "),
+                SAMPLING_KEYS.join(" / ")
+            ),
+        ));
+    }
+
+    let [repeat_penalty_key] = SAMPLING_KEYS;
+    let repeat_penalty =
+        match fields.get(repeat_penalty_key) {
+            None => None,
+            Some(value) => Some(value.as_f64().and_then(RepeatPenalty::parse).ok_or_else(
+                || {
+                    unusable(format!(
+                        "{repeat_penalty_key} は {} 以上 {} 以下の数で書いてください: {value}",
+                        crate::llm::REPEAT_PENALTY_MIN,
+                        crate::llm::REPEAT_PENALTY_MAX
+                    ))
+                },
+            )?),
+        };
+    Ok(repeat_penalty.map_or_else(Sampling::default, Sampling::with_repeat_penalty))
 }
 
 /// **面の鍵を読む**（ADR-0056 §決定1・5 / 作業単位 A-13b-1・A-13b-2）。書いていなければ `None`。
@@ -1600,7 +1756,7 @@ mod tests {
             Option<&'static str>,
         );
         let ok = r#""a": { "main": { "endpoint": "http://127.0.0.1:1", "model": "m" } }"#;
-        let cases: [Case; 21] = [
+        let cases: [Case; 25] = [
             ("[1]", ShapeReason::TopLevelNotObject, None, None, None),
             (
                 r#""b": 1"#,
@@ -1749,6 +1905,36 @@ mod tests {
                 Some("b"),
                 Some("sub"),
                 Some("allow_key_over_plain_http"),
+            ),
+            // **サンプラの値**（ADR-0058 §決定1 / 作業単位 A-16）。**止まる側を `sub` にし、`main` には正しい値**
+            // ——面を取り違える実装と、`main` だけを検証する実装を、ここで赤にする。
+            (
+                r#""b": { "main": { "endpoint": "http://127.0.0.1:1", "model": "m", "sampling": { "repeat_penalty": 1.05 } }, "sub": { "endpoint": "http://127.0.0.1:2", "model": "s", "sampling": 1.05 } }"#,
+                ShapeReason::SamplingUnusable,
+                Some("b"),
+                Some("sub"),
+                Some("sampling"),
+            ),
+            (
+                r#""b": { "main": { "endpoint": "http://127.0.0.1:1", "model": "m", "sampling": { "repeat_penalty": 1.05 } }, "sub": { "endpoint": "http://127.0.0.1:2", "model": "s", "sampling": { "top_k": 20 } } }"#,
+                ShapeReason::UnknownSamplingKey,
+                Some("b"),
+                Some("sub"),
+                Some("sampling"),
+            ),
+            (
+                r#""b": { "main": { "endpoint": "http://127.0.0.1:1", "model": "m", "sampling": { "repeat_penalty": 1.05 } }, "sub": { "endpoint": "http://127.0.0.1:2", "model": "s", "sampling": { "repeat_penalty": "1.05" } } }"#,
+                ShapeReason::SamplingUnusable,
+                Some("b"),
+                Some("sub"),
+                Some("sampling"),
+            ),
+            (
+                r#""b": { "main": { "endpoint": "http://127.0.0.1:1", "model": "m", "sampling": { "repeat_penalty": 1.05 } }, "sub": { "endpoint": "http://127.0.0.1:2", "model": "s", "sampling": { "repeat_penalty": 0 } } }"#,
+                ShapeReason::SamplingUnusable,
+                Some("b"),
+                Some("sub"),
+                Some("sampling"),
             ),
         ];
 
@@ -2038,6 +2224,206 @@ mod tests {
         assert!(
             shown.contains("ApiKey(***)"),
             "前提: 鍵を持っていること: {shown}"
+        );
+    }
+
+    /// **サンプラの値は面ごとに読み、`sub` 面が無いときだけ本文の値を裏方にも使う**（ADR-0058 §決定1）。
+    ///
+    /// | プロファイル | 本文 | 裏方 |
+    /// |---|---|---|
+    /// | 両方に別の値 | 本文の値 | 裏方の値 |
+    /// | 本文だけに値・`sub` を書いた | 本文の値 | **既定**（本文の値を写さない） |
+    /// | 本文だけに値・`sub` を書かない | 本文の値 | **本文の値**（同じ宛先・同じモデル） |
+    /// | 裏方だけに値 | 既定 | 裏方の値 |
+    /// | どちらにも書かない | 既定 | 既定 |
+    ///
+    /// **値は既定の 1.1 とも互いとも違える**（同値だと取り違えが見えない）。
+    #[test]
+    fn each_face_reads_its_own_sampling_and_the_sub_side_borrows_only_without_a_sub_face() {
+        use crate::llm::{RepeatPenalty, Sampling};
+
+        let written = |value: f64| {
+            Sampling::with_repeat_penalty(RepeatPenalty::parse(value).expect("範囲の中"))
+        };
+        let face = |port: u16, model: &str, value: Option<f64>| {
+            let mut face = serde_json::json!({
+                "endpoint": format!("http://127.0.0.1:{port}"),
+                "model": model,
+            });
+            if let Some(value) = value {
+                face["sampling"] = serde_json::json!({ "repeat_penalty": value });
+            }
+            face
+        };
+        let source = serde_json::json!({
+            "both": { "main": face(1, "m", Some(1.05)), "sub": face(2, "s", Some(1.25)) },
+            "main-only": { "main": face(1, "m", Some(1.05)), "sub": face(2, "s", None) },
+            "no-sub": { "main": face(1, "m", Some(1.05)) },
+            "sub-only": { "main": face(1, "m", None), "sub": face(2, "s", Some(1.25)) },
+            "neither": { "main": face(1, "m", None) },
+        })
+        .to_string();
+        let profiles = parse_profiles(&source, None).expect("読めること");
+
+        for (name, main, sub) in [
+            ("both", written(1.05), written(1.25)),
+            ("main-only", written(1.05), Sampling::default()),
+            ("no-sub", written(1.05), written(1.05)),
+            ("sub-only", Sampling::default(), written(1.25)),
+            ("neither", Sampling::default(), Sampling::default()),
+        ] {
+            let profile = profiles.select(name).expect("在ること");
+            let settings = profile.settings();
+            assert_eq!(profile.main().sampling(), main, "{name} の本文の面");
+            assert_eq!(
+                (settings.sampling(), settings.sub_sampling()),
+                (main, sub),
+                "{name}"
+            );
+        }
+    }
+
+    /// **`sampling` の中の知らない鍵は、名前を挙げて止める**（ADR-0058 §決定1）。
+    ///
+    /// **まだ書けないサンプラの4つ（`top_k` / `top_p` / `min_p` / `presence_penalty`）も、綴りの誤りも、
+    /// サンプラでない欄（`temperature`）も同じく止める。** 文面に止めた鍵の綴りが出ること・
+    /// 書ける鍵（`repeat_penalty`）を案内することを見る。
+    #[test]
+    fn an_unknown_sampling_key_is_named_and_refused() {
+        for unknown in [
+            "top_k",
+            "top_p",
+            "min_p",
+            "presence_penalty",
+            "repetition_penalty",
+            "repeat-penalty",
+            "temperature",
+        ] {
+            let source = serde_json::json!({ "p": { "main": {
+                "endpoint": "http://127.0.0.1:1", "model": "m",
+                "sampling": { "repeat_penalty": 1.05, unknown: 1.0 } } } })
+            .to_string();
+            let err = parse_profiles(&source, None).expect_err(unknown);
+            let shape = err.shape().expect("形の不正であること");
+            assert_eq!(
+                (shape.reason(), shape.face(), shape.key()),
+                (
+                    ShapeReason::UnknownSamplingKey,
+                    Some("main"),
+                    Some("sampling")
+                ),
+                "{unknown}"
+            );
+            let message = shape.to_string();
+            assert!(message.contains(unknown), "止めた鍵を名指すこと: {message}");
+            assert!(
+                message.contains("repeat_penalty"),
+                "書ける鍵を案内すること: {message}"
+            );
+        }
+    }
+
+    /// **`repeat_penalty` の値は、読み込みで範囲を確かめる**（ADR-0058 §決定1 / 範囲は `llm::REPEAT_PENALTY_MIN` の表）。
+    ///
+    /// 端（0.5 / 2.0）と整数（`1`）は通し、外・0・負・数でないものは止める。`{}` は「何も書いていない」で通る。
+    /// **JSON は NaN・無限を書けない**（`1e400` は JSON として読めない —— 形の不正ではない）。
+    #[test]
+    fn a_repeat_penalty_out_of_range_is_refused_when_read() {
+        use crate::llm::{RepeatPenalty, Sampling};
+
+        let profile = |sampling: serde_json::Value| {
+            serde_json::json!({ "p": { "main": {
+                "endpoint": "http://127.0.0.1:1", "model": "m", "sampling": sampling } } })
+            .to_string()
+        };
+        for (value, expected) in [
+            (serde_json::json!(0.5), 0.5),
+            (serde_json::json!(1), 1.0),
+            (serde_json::json!(1.05), 1.05),
+            (serde_json::json!(2.0), 2.0),
+        ] {
+            let profiles = parse_profiles(
+                &profile(serde_json::json!({ "repeat_penalty": value })),
+                None,
+            )
+            .unwrap_or_else(|err| panic!("{value} は通ること: {err:?}"));
+            assert_eq!(
+                profiles.select("p").expect("在ること").main().sampling(),
+                Sampling::with_repeat_penalty(RepeatPenalty::parse(expected).expect("範囲の中")),
+                "{value}"
+            );
+        }
+        let empty = parse_profiles(&profile(serde_json::json!({})), None).expect("{} は通ること");
+        assert_eq!(
+            empty.select("p").expect("在ること").main().sampling(),
+            Sampling::default()
+        );
+
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(0.0),
+            serde_json::json!(-1.1),
+            serde_json::json!(0.49),
+            serde_json::json!(2.01),
+            serde_json::json!(11),
+            serde_json::json!("1.05"),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!([1.05]),
+        ] {
+            let err = parse_profiles(
+                &profile(serde_json::json!({ "repeat_penalty": value })),
+                None,
+            )
+            .expect_err(&value.to_string());
+            let shape = err.shape().expect("形の不正であること");
+            assert_eq!(
+                (shape.reason(), shape.key()),
+                (ShapeReason::SamplingUnusable, Some("sampling")),
+                "{value}"
+            );
+        }
+        for sampling in [
+            serde_json::json!(1.05),
+            serde_json::json!("repeat_penalty"),
+            serde_json::json!(null),
+            serde_json::json!([]),
+        ] {
+            let err =
+                parse_profiles(&profile(sampling.clone()), None).expect_err(&sampling.to_string());
+            assert_eq!(
+                err.shape().map(ProfileShape::reason),
+                Some(ShapeReason::SamplingUnusable),
+                "オブジェクトでない sampling: {sampling}"
+            );
+        }
+        // **NaN・無限は JSON の段で止まる**（形の不正ではなく、JSON として読めない）。
+        let infinite = r#"{ "p": { "main": { "endpoint": "http://127.0.0.1:1", "model": "m",
+                           "sampling": { "repeat_penalty": 1e400 } } } }"#;
+        assert!(matches!(
+            parse_profiles(infinite, None),
+            Err(ProfileError::Json(_))
+        ));
+    }
+
+    /// **画面に出す定数の文面が、実際に止める範囲と同じ数を言う**（`message` は定数なので範囲を手で書いている）。
+    #[test]
+    fn the_sampling_message_names_the_range_it_enforces() {
+        let message = ShapeReason::SamplingUnusable.message();
+        for bound in [
+            crate::llm::REPEAT_PENALTY_MIN,
+            crate::llm::REPEAT_PENALTY_MAX,
+        ] {
+            assert!(
+                message.contains(&format!("{bound} ")),
+                "文面が範囲の端（{bound}）を言っていない: {message}"
+            );
+        }
+        assert!(
+            ShapeReason::UnknownSamplingKey
+                .message()
+                .contains(&SAMPLING_KEYS.join(" / ")),
+            "書ける鍵を案内すること"
         );
     }
 

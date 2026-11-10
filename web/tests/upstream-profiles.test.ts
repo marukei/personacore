@@ -37,6 +37,7 @@ import {
 } from "../src/lib/api";
 import {
   DEFAULT_COMMAND,
+  EDITABLE_FACE_KEYS,
   FACE_KEYS,
   FACES,
   KIND_FIELDS,
@@ -1026,6 +1027,17 @@ describe("保存の失敗を読み分ける", () => {
 
   it("裏方を書いていない下書きで裏方の欄を言われたら、全体に出す（欄が画面に無い）", () => {
     expect(describeSaveFailure(invalid("sub", "model"), false).kind).toBe("form");
+  });
+
+  it("欄の無い鍵（`allow_key_over_plain_http` / `sampling`）を名指した 422 は、全体に出す（ADR-0058 §決定6）", () => {
+    for (const key of ["allow_key_over_plain_http", "sampling"] as const) {
+      // **前提: どちらも写し元の鍵ではある**（知らない鍵だから全体に出た、ではない）。
+      expect(FACE_KEYS as readonly string[]).toContain(key);
+      expect(EDITABLE_FACE_KEYS as readonly string[]).not.toContain(key);
+      for (const face of ["main", "sub"] as const) {
+        expect(describeSaveFailure(invalid(face, key), true).kind, `${face} / ${key}`).toBe("form");
+      }
+    }
   });
 
   it("409 `upstream_profiles_changed` は、上書きしていないことと、読み直すことを言う", () => {

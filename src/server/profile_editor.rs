@@ -355,6 +355,8 @@ fn written_face(value: &Value, face: &'static str) -> Result<WrittenFace, Unrepr
         });
     }
     // **承認（`allow_key_over_plain_http`）は書いた値を写す**（作業単位 A-13b-3。A-13b-2 の間は画面の形に欄が無く、写さなかった）。
+    // **サンプラの値（`sampling`）は写さない**（ADR-0058 §決定6 / 作業単位 A-16 —— 画面はこの欄を持たない。
+    // 形は読み込み（`parse_profiles`）が検証済み。保存は `FaceEdit::to_value` がいまのファイルから残す）。
     let [
         endpoint,
         model,
@@ -364,6 +366,7 @@ fn written_face(value: &Value, face: &'static str) -> Result<WrittenFace, Unrepr
         context_tokens,
         api_key,
         allow_key_over_plain_http,
+        _sampling,
     ] = FACE_KEYS;
     let required = |key: &'static str| {
         object
@@ -498,6 +501,7 @@ impl WrittenFace {
     /// （鍵を足さない / 見張り番は `a_face_without_context_tokens_is_written_byte_for_byte_as_before`）。
     /// **鍵（`api_key`）を書いていない面も、A-13b-1 の前と同じバイト列になる**（同じ理由で鍵を足さない）。
     /// **承認（`allow_key_over_plain_http`）はここでは書かない**（[`FaceEdit::to_value`] が依頼といまのファイルから決める）。
+    /// **サンプラの値（`sampling`）も書かない**（同じく [`FaceEdit::to_value`] がいまのファイルから残す / ADR-0058 §決定6）。
     fn to_value(&self) -> Value {
         let [
             endpoint,
@@ -508,6 +512,7 @@ impl WrittenFace {
             context_tokens,
             api_key,
             _allow_key_over_plain_http,
+            _sampling,
         ] = FACE_KEYS;
         let mut object = Map::new();
         object.insert(endpoint.to_owned(), Value::from(self.endpoint.as_str()));
@@ -559,6 +564,14 @@ impl FaceEdit {
     /// （ADR-0056 §決定5 は危険を示したうえで承認を取る）。いまの面に `endpoint` の文字列が無ければ落とす。
     /// **正規化しない**（末尾の `/` が違うだけでも落とす —— 落とす側は送らないだけで、鍵は出ない）。
     /// 見張り番は `tests/upstream_profile_editor.rs` の `a_hand_written_approval_survives_a_save_from_the_screen`。
+    ///
+    /// # サンプラの値（`sampling` / ADR-0058 §決定6 / 作業単位 A-16）
+    ///
+    /// **依頼はこの欄を持たない**（[`WrittenFaceRequest`] は知らない欄を拒む）ので、**いつも、いまのファイルの
+    /// 同じ名前・同じ面の値をそのまま残す。** 承認と違い、**`endpoint` や `model` が変わっても落とさない**
+    /// （値が合わなくなるかもしれないが、知らせずに消えるほうが、知らせずに残るより見つけにくい。残した値は
+    /// 起動と切り替えのログに出る）。**別の名前・別の面の値は見ない**（値はエンジン・モデル・量子化の組に付く）。
+    /// 見張り番は `tests/upstream_profile_editor.rs` の `a_hand_written_sampling_survives_a_save_from_the_screen`。
     fn to_value(&self, current: Option<&Map<String, Value>>) -> Value {
         let mut value = self.face.to_value();
         let key = match &self.key {
@@ -583,7 +596,13 @@ impl FaceEdit {
                 .and_then(|face| face.get(super::upstreams::ALLOW_KEY_OVER_PLAIN_HTTP_KEY))
                 .cloned(),
         };
+        let sampling = current
+            .and_then(|face| face.get(super::upstreams::SAMPLING_KEY))
+            .cloned();
         if let Value::Object(object) = &mut value {
+            if let Some(sampling) = sampling {
+                object.insert(super::upstreams::SAMPLING_KEY.to_owned(), sampling);
+            }
             if let Some(key) = key {
                 object.insert(super::upstreams::API_KEY_KEY.to_owned(), key);
             }
@@ -2140,6 +2159,135 @@ mod tests {
                 "    },\n",
                 "    \"sub\": {\n",
                 "      \"endpoint\": \"http://127.0.0.1:44002\",\n",
+                "      \"model\": \"only-sub\"\n",
+                "    }\n",
+                "  }\n",
+                "}\n",
+            )
+        );
+    }
+
+    /// サンプラの値の是正のテストで使うファイル（ADR-0058 §決定6 / 作業単位 A-16）。
+    ///
+    /// **値は面ごと・名前ごとに違え、どれも既定の 1.1 と違う**（帰属の取り違えを値で見分ける）。
+    /// **`plain` は値を書いていない**（書いていない面に値を生やさないことの対照）。
+    const SAMPLINGS: &str = r#"{
+        "tuned": {
+            "main": { "endpoint": "http://127.0.0.1:45001", "model": "tuned-main",
+                      "sampling": { "repeat_penalty": 1.05 } },
+            "sub":  { "endpoint": "http://127.0.0.1:45002", "model": "tuned-sub",
+                      "sampling": { "repeat_penalty": 1.25 } }
+        },
+        "other": {
+            "main": { "endpoint": "http://127.0.0.1:45003", "model": "other-main",
+                      "sampling": { "repeat_penalty": 0.95 } }
+        },
+        "plain": {
+            "main": { "endpoint": "http://127.0.0.1:45004", "model": "plain-main" },
+            "sub":  { "endpoint": "http://127.0.0.1:45005", "model": "plain-sub" }
+        }
+    }"#;
+
+    /// **画面の保存は、いまのファイルの同じ名前・同じ面のサンプラの値を残す。`endpoint` や `model` を変えても残す**
+    /// （ADR-0058 §決定6 / 作業単位 A-16）。
+    ///
+    /// | 名前・面 | 保存で変えたもの | サンプラの値 |
+    /// |---|---|---|
+    /// | `tuned` の本文 | `model` だけ | **1.05 のまま** |
+    /// | `tuned` の裏方 | `endpoint` と `model` | **1.25 のまま**（承認と違って落とさない） |
+    /// | `plain` の両面（値なし） | `model` | **書かれない**（生やさない） |
+    /// | `fresh`（新しい名前） | —— | **書かれない**（他の名前から拾わない） |
+    ///
+    /// 依頼の型はこの欄を持たない（[`WrittenFaceRequest`] は知らない欄を拒む）ので、ここは常に「送らない」の形。
+    #[test]
+    fn a_written_sampling_is_kept_from_the_same_name_and_face() {
+        let tuned = edit(
+            face("http://127.0.0.1:45001", "tuned-main-2"),
+            Some(face("http://127.0.0.1:46002", "tuned-sub-2")),
+        );
+        let written = apply_edit(Some(SAMPLINGS), "tuned", &tuned, None).expect("保存できること");
+        let after: Value = serde_json::from_str(&written).expect("JSON");
+        assert_eq!(
+            (
+                &after["tuned"]["main"]["model"],
+                &after["tuned"]["sub"]["endpoint"],
+            ),
+            (
+                &Value::from("tuned-main-2"),
+                &Value::from("http://127.0.0.1:46002")
+            ),
+            "前提: 依頼どおりに保存されたこと: {after}"
+        );
+        assert_eq!(
+            (
+                &after["tuned"]["main"]["sampling"],
+                &after["tuned"]["sub"]["sampling"],
+                &after["other"]["main"]["sampling"],
+            ),
+            (
+                &serde_json::json!({ "repeat_penalty": 1.05 }),
+                &serde_json::json!({ "repeat_penalty": 1.25 }),
+                &serde_json::json!({ "repeat_penalty": 0.95 }),
+            ),
+            "同じ名前・同じ面の値が消えた／面を取り違えた／他の名前が動いた: {after}"
+        );
+
+        let plain = edit(
+            face("http://127.0.0.1:45004", "plain-main-2"),
+            Some(face("http://127.0.0.1:45005", "plain-sub-2")),
+        );
+        let written = apply_edit(Some(SAMPLINGS), "plain", &plain, None).expect("保存できること");
+        let after: Value = serde_json::from_str(&written).expect("JSON");
+        assert_eq!(
+            (
+                after["plain"]["main"].get("sampling"),
+                after["plain"]["sub"].get("sampling"),
+            ),
+            (None, None),
+            "値を書いていない面に値が生えた: {after}"
+        );
+
+        let fresh = edit(face("http://127.0.0.1:45006", "fresh-main"), None);
+        let written = apply_edit(Some(SAMPLINGS), "fresh", &fresh, None).expect("保存できること");
+        let after: Value = serde_json::from_str(&written).expect("JSON");
+        assert_eq!(
+            after["fresh"]["main"].get("sampling"),
+            None,
+            "新しい名前に他の名前の値が写った: {after}"
+        );
+    }
+
+    /// **`sampling` を書いていない面は、A-16 の前と1バイトも違わない形で書く**（ADR-0058 §決定6 の対照）。
+    ///
+    /// [`a_face_without_context_tokens_is_written_byte_for_byte_as_before`] は無いファイルへ書く。**こちらは
+    /// いまのファイルが在る保存**（値を残す枝を通る）で、値の無い面に欄が生えないことをバイト列で見る。
+    /// **期待値は直書き**（検査対象の関数から作らない）。
+    #[test]
+    fn a_face_without_sampling_is_written_byte_for_byte_as_before() {
+        let current = r#"{ "only": {
+            "main": { "endpoint": "http://127.0.0.1:44001", "model": "only-main" },
+            "sub":  { "endpoint": "http://127.0.0.1:44002", "model": "only-sub" } } }"#;
+        let written = apply_edit(
+            Some(current),
+            "only",
+            &edit(
+                face("http://127.0.0.1:44001", "only-main-2"),
+                Some(face("http://127.0.0.1:44003", "only-sub")),
+            ),
+            None,
+        )
+        .expect("書けること");
+        assert_eq!(
+            written,
+            concat!(
+                "{\n",
+                "  \"only\": {\n",
+                "    \"main\": {\n",
+                "      \"endpoint\": \"http://127.0.0.1:44001\",\n",
+                "      \"model\": \"only-main-2\"\n",
+                "    },\n",
+                "    \"sub\": {\n",
+                "      \"endpoint\": \"http://127.0.0.1:44003\",\n",
                 "      \"model\": \"only-sub\"\n",
                 "    }\n",
                 "  }\n",

@@ -1233,6 +1233,105 @@ async fn a_hand_written_approval_survives_a_save_from_the_screen() {
     server.stop().await;
 }
 
+/// **手で書いたサンプラの値（`sampling`）は、画面から保存しても残る。`endpoint` や `model` を変えた面でも残る。
+/// 残すのはその名前・その面のものだけ**（[ADR-0058](../docs/adr/0058-sampling-values-in-the-upstream-profile.md)
+/// §決定6 / 作業単位 A-16）。
+///
+/// 前例 [`a_hand_written_approval_survives_a_save_from_the_screen`] と同じ形。**承認と違い、宛先を変えても落とさない**
+/// （知らせずに消えるほうが、知らせずに残るより見つけにくい）。
+///
+/// | 面 | 保存で変えたもの | 値 |
+/// |---|---|---|
+/// | `tuned` の本文（1.05） | `model` だけ | **残る** |
+/// | `tuned` の裏方（1.25） | `endpoint` と `model` | **残る** |
+/// | `fresh`（新しい名前） | —— | 書かれない（他の名前から拾わない） |
+///
+/// **値を面ごとに違える**（面を取り違えて写す実装を赤にする）。**一覧は値を書いたファイルでも読める**
+/// （`sampling` は [`FACE_KEYS`] の鍵 —— 画面の形に写せないと言わない）。**依頼が `sampling` を送ると 400**
+/// （依頼の型は知らない欄を拒む —— 画面がこの欄を持つまでは送れない / ADR-0058 §決定6）。
+///
+/// [`FACE_KEYS`]: personacore::server::FACE_KEYS
+#[tokio::test]
+async fn a_hand_written_sampling_survives_a_save_from_the_screen() {
+    const SAMPLING: &str = "sampling";
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let source = json!({
+        "tuned": {
+            "main": { "endpoint": "http://127.0.0.1:47931", "model": "tuned-main",
+                      SAMPLING: { "repeat_penalty": 1.05 } },
+            "sub": { "endpoint": "http://127.0.0.1:47932", "model": "tuned-sub",
+                     SAMPLING: { "repeat_penalty": 1.25 } }
+        }
+    });
+    let path = write_by_hand(dir.path(), &source);
+    let server = serve(dir.path(), |s| s.with_editable_profiles_file(path.clone())).await;
+    let listing = list(server.port).await;
+    assert_eq!(
+        profile_named(&listing, "tuned")["main"]["model"],
+        json!("tuned-main"),
+        "前提: 値を書いたファイルが一覧に載ること: {listing}"
+    );
+
+    // **依頼に `sampling` を載せると断る**（依頼の型は知らない欄を拒む）。ファイルは触らない。
+    let mut smuggled = face("http://127.0.0.1:47931", "tuned-main", None, None, None);
+    smuggled[SAMPLING] = json!({ "repeat_penalty": 1.9 });
+    let (status, refused) = save(
+        server.port,
+        "tuned",
+        &json!({ "revision": listing["revision"], "main": smuggled }),
+    )
+    .await;
+    assert_eq!(status, 400, "依頼の sampling を受け付けた: {refused}");
+
+    // **本文はモデルだけ、裏方は宛先とモデルを直す**（`sampling` は送らない）。新しい名前も足す。
+    let main = face("http://127.0.0.1:47931", "tuned-main-2", None, None, None);
+    let sub = face("http://127.0.0.1:47942", "tuned-sub-2", None, None, None);
+    let (status, first) = save(
+        server.port,
+        "tuned",
+        &json!({ "revision": listing["revision"], "main": main, "sub": sub }),
+    )
+    .await;
+    assert_eq!(status, 200, "{first}");
+    let (status, second) = save(
+        server.port,
+        "fresh",
+        &json!({ "revision": first["revision"], "main": main }),
+    )
+    .await;
+    assert_eq!(status, 200, "{second}");
+
+    let disk: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("読めること")).expect("JSON");
+    assert_eq!(
+        (
+            &disk["tuned"]["main"]["model"],
+            &disk["tuned"]["sub"]["endpoint"],
+            &disk["tuned"]["sub"]["model"],
+        ),
+        (
+            &json!("tuned-main-2"),
+            &json!("http://127.0.0.1:47942"),
+            &json!("tuned-sub-2")
+        ),
+        "前提: 依頼どおりに保存されたこと: {disk}"
+    );
+    assert_eq!(
+        (
+            &disk["tuned"]["main"][SAMPLING],
+            &disk["tuned"]["sub"][SAMPLING],
+            disk["fresh"]["main"].get(SAMPLING),
+        ),
+        (
+            &json!({ "repeat_penalty": 1.05 }),
+            &json!({ "repeat_penalty": 1.25 }),
+            None
+        ),
+        "同じ名前・同じ面の値が消えた／面を取り違えた／別の名前へ写った: {disk}"
+    );
+    server.stop().await;
+}
+
 /// **依頼の承認（`allow_key_over_plain_http`）は「送らない＝今の規則 / `true`＝承認する / `false`＝外す」**
 /// （作業単位 A-13b-3 / ADR-0056 §決定5）。**一覧はその面に書いた承認を返す。**
 ///

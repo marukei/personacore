@@ -30,8 +30,8 @@ use futures_util::{Stream, StreamExt, stream};
 use super::error::LlmError;
 use super::request::{
     ApiKey, ChatRequest, HostLookup, HostResolver, KeyDestination, KeyOverPlainHttp, ModelId,
-    WireRequest, endpoint_for_log, error_for_log, judge_addresses, key_destination, redact_key,
-    wire_request,
+    Sampling, WireRequest, endpoint_for_log, error_for_log, judge_addresses, key_destination,
+    redact_key, wire_request,
 };
 use super::response::{
     AnsweredBy, ChatChunk, Completion, is_done, parse_applied_template, parse_chunk,
@@ -256,6 +256,11 @@ pub struct LmStudioConfig {
     ///
     /// **使うのは鍵を付けた `http://` のホスト名の宛先だけ**（`LmStudioClient::new`）。
     host_resolver: Option<Arc<dyn HostResolver>>,
+    /// **この上流の面に書いたサンプラの値**（ADR-0058 §決定1 / 作業単位 A-16）。既定は「何も書いていない」。
+    ///
+    /// **[`LmStudioClient::with_model`] の複製にも写る** —— `sub` 面の無いプロファイルの裏方は本文の
+    /// クライアントの複製なので、本文の値で送る（ADR-0058 §決定1 の「`sub` 面が無ければ `main` の値」）。
+    sampling: Sampling,
 }
 
 impl LmStudioConfig {
@@ -296,7 +301,24 @@ impl LmStudioConfig {
             api_key: None,
             allow_key_over_plain_http: false,
             host_resolver: None,
+            sampling: Sampling::default(),
         })
+    }
+
+    /// **この上流の面に書いたサンプラの値を決める**（ADR-0058 §決定1 / 作業単位 A-16）。
+    ///
+    /// **書いた欄だけが送る1組を置き換える**（`request::wire_request`）。[`Sampling::default`] は
+    /// 「何も書いていない」で、送る本文は1バイトも変わらない。
+    #[must_use]
+    pub const fn with_sampling(mut self, sampling: Sampling) -> Self {
+        self.sampling = sampling;
+        self
+    }
+
+    /// **この上流の面に書いたサンプラの値。**
+    #[must_use]
+    pub const fn sampling(&self) -> Sampling {
+        self.sampling
     }
 
     /// **鍵を平文の `http://` でローカルネットワークの外へ送る承認を決める**（ADR-0056 §決定5 /
@@ -1597,7 +1619,7 @@ impl LmStudioClient {
     /// **チャットへ送る本文**。[`Self::post`] と [`Self::count_request`] の**両方がここを通る**
     /// （封の本文を別に組まない / ADR-0052 §推奨3）。
     fn chat_body<'a>(&'a self, request: &'a ChatRequest, streaming: bool) -> WireRequest<'a> {
-        wire_request(&self.config.model, request, streaming)
+        wire_request(&self.config.model, request, streaming, self.config.sampling)
     }
 
     /// **本文ごとに数える**（封 / ADR-0052 §推奨3 / 作業単位 B-60a）。
