@@ -10,7 +10,8 @@
 //! | [`arm2_without_a_sub_face_the_main_value_reaches_the_background_too`] | 2 | `sub` 面が無いとき、`main` 面の値が裏方の要求にも載る |
 //! | [`arm3_the_sub_faces_value_reaches_the_background_and_not_the_body`] | 3 | `sub` 面の値が裏方に載り、本文には載らない |
 //! | [`arm4_a_sub_face_without_sampling_uses_the_default_not_the_main_value`] | 4 | `sub` 面があって値が無いとき、裏方は既定で、`main` の値を写さない |
-//! | [`arm5_switching_follows_the_sampling_even_when_endpoint_and_model_stay`] | 5 | 切り替えの3通りの遷移が次の往復から効く。**宛先とモデルが同じ**プロファイルの間で |
+//! | [`arm5_switching_follows_the_sampling_even_when_endpoint_and_model_stay`] | 5 | 切り替えの3通りの遷移が次の往復から効く。**宛先とモデルが同じ**プロファイルの間で。`sub` 面を書いたプロファイルへの切り替えでは、裏方が裏方の面の値に追従する |
+//! | [`arm6_switching_again_to_the_same_profile_without_a_sub_face_touches_nothing`] | 6 | `sub` 面の無いプロファイルへ切り替え直しても、裏方の面を触らない（照会が増えない） |
 //!
 //! **腕2と腕3・4は、互いを隠す実装を赤にする対**（「`sub` は常に `main` の値」「`sub` は常に既定」）。
 //! **腕1〜4の値は既定の 1.1 とも互いとも違える**（0.95 / 1.45 / 1.05 / 1.25 / 1.3）。
@@ -44,7 +45,11 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
 
-use common::{fixture_scale, has_field, install_global_log};
+use common::{bracketed_field, fixture_scale, has_field, install_global_log};
+
+/// **切り替える腕を1本ずつ走らせる**（腕5・腕6）。ログはバイナリで1つなので、腕6の切り替えの行が
+/// 腕5の「出た順の列」に混ざらないように。
+static SWITCHING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 本文に指定するモデル。
 const MAIN_MODEL: &str = "sampling-main-model";
@@ -464,13 +469,22 @@ async fn arm4_a_sub_face_without_sampling_uses_the_default_not_the_main_value() 
 /// | 2 | `tuned-b`（1.2） | 値あり → 値あり | 1.2 |
 /// | 3 | `plain`（なし） | 値あり → 値なし | **1.1（既定へ戻る。持ち越さない）** |
 /// | 4 | `tuned-a`（1.05） | 値なし → 値あり | 1.05 |
+/// | 5 | `split`（本文 0.95・裏方 1.45） | `sub` 面を書いたプロファイルへ | 本文 0.95・**裏方 1.45** |
+/// | 6 | `split-bare`（本文 0.95・裏方なし） | **裏方の面だけ**、値あり → 値なし | 本文 0.95・**裏方 1.1（本文の値を写さない）** |
 ///
-/// **3つのプロファイルは宛先もモデルも同じ綴り**（`sub` 面も書かない）—— 綴りが違うと、`sampling` を
+/// **1〜4 の3つのプロファイルは宛先もモデルも同じ綴り**（`sub` 面も書かない）—— 綴りが違うと、`sampling` を
 /// 比べない実装でも切り替えが起きて緑になる。`sub` 面が無いので、裏方も本文の値に追従する。
 ///
-/// **切り替えの後のログ**（ADR-0058 §決定3）も、同じ行の中で値を見る（値はこの腕にしか無い綴りの 1.2）。
+/// **5・6 は `sub` 面を書いた切り替え**（作業単位 A-16 の引き継ぎで足した）。1〜4 は `sub` 面を書かないので、
+/// 切り替えが裏方の候補を**裏方の面の値**で組むこと（`switch::prepare` の `face_settings(sub)`）を見ていなかった。
+/// `split` と `split-bare` は**本文の面が1バイトも同じで、裏方の面も宛先とモデルが同じ**（違うのは裏方の
+/// `sampling` だけ）—— 6 は裏方の面で、腕5の「`sampling` だけが違う」を見る。
+///
+/// **切り替えの後のログ**（ADR-0058 §決定3）は、面ごとに `repeat_penalty` と `overridden` を**出た順の列**で
+/// 見る（同じ行の中で読む）。言う位置を差し替えの前へ動かすと、列が1回ずつ前の値へずれて赤になる。
 #[tokio::test]
 async fn arm5_switching_follows_the_sampling_even_when_endpoint_and_model_stay() {
+    let _serial = SWITCHING.lock().await;
     let log = install_global_log("personacore=info");
     let mark = log.mark();
     let dir = tempfile::tempdir().expect("一時ディレクトリ");
@@ -480,6 +494,14 @@ async fn arm5_switching_follows_the_sampling_even_when_endpoint_and_model_stay()
         "tuned-a": { "main": face(&uri, MAIN_MODEL, Some(1.05)) },
         "tuned-b": { "main": face(&uri, MAIN_MODEL, Some(1.2)) },
         "plain": { "main": face(&uri, MAIN_MODEL, None) },
+        "split": {
+            "main": face(&uri, MAIN_MODEL, Some(0.95)),
+            "sub": face(&uri, SUB_MODEL, Some(1.45)),
+        },
+        "split-bare": {
+            "main": face(&uri, MAIN_MODEL, Some(0.95)),
+            "sub": face(&uri, SUB_MODEL, None),
+        },
     });
     let path = dir.path().join("upstreams.json");
     std::fs::write(&path, source.to_string()).expect("プロファイルを置けること");
@@ -490,11 +512,18 @@ async fn arm5_switching_follows_the_sampling_even_when_endpoint_and_model_stay()
     .await;
 
     let mut before = 0;
-    for (turn, switch, expected) in [
-        (1, None, json!(1.05)),
-        (2, Some("tuned-b"), json!(1.2)),
-        (3, Some("plain"), json!(DEFAULT_PENALTY)),
-        (4, Some("tuned-a"), json!(1.05)),
+    for (turn, switch, body, background_expected) in [
+        (1, None, json!(1.05), json!(1.05)),
+        (2, Some("tuned-b"), json!(1.2), json!(1.2)),
+        (
+            3,
+            Some("plain"),
+            json!(DEFAULT_PENALTY),
+            json!(DEFAULT_PENALTY),
+        ),
+        (4, Some("tuned-a"), json!(1.05), json!(1.05)),
+        (5, Some("split"), json!(0.95), json!(1.45)),
+        (6, Some("split-bare"), json!(0.95), json!(DEFAULT_PENALTY)),
     ] {
         if let Some(name) = switch {
             running.switch_to(name).await;
@@ -505,7 +534,7 @@ async fn arm5_switching_follows_the_sampling_even_when_endpoint_and_model_stay()
         before = seen.len();
         assert_eq!(
             values_of(this_turn, Kind::Body),
-            vec![expected.clone()],
+            vec![body.clone()],
             "{turn} 回目（{switch:?}）の本文が切り替え先の値でない: {this_turn:?}"
         );
         let background = values_of(this_turn, Kind::Background);
@@ -514,25 +543,142 @@ async fn arm5_switching_follows_the_sampling_even_when_endpoint_and_model_stay()
             "前提: {turn} 回目の裏方が届いた: {this_turn:?}"
         );
         assert!(
-            background.iter().all(|value| *value == expected),
+            background.iter().all(|value| *value == background_expected),
             "{turn} 回目（{switch:?}）の裏方が切り替え先の値でない: {this_turn:?}"
         );
     }
 
-    // **切り替えの後に、送る値を面ごとに言う**（ADR-0058 §決定3）。1.2 はこの腕の `tuned-b` にしか無い。
+    // **切り替えの後に、送る値を面ごとに言う**（ADR-0058 §決定3）。**出た順の列で見る** —— 「どこかに在る」
+    // だけだと、言う位置を差し替えの前へ動かして**切り替え前の値**を `occasion="switch"` で言う実装が緑になる
+    // （どの値も別の回の切り替えで正しく出るので、列の中のどこかには必ず在る）。値と `overridden` は同じ行から読む。
     let output = log.contents_since(mark);
-    for face in ["main", "sub"] {
-        assert!(
-            output.lines().any(|line| {
+    let r = r#"["repeat_penalty"]"#;
+    for (face, expected) in [
+        (
+            "main",
+            [
+                ("1.2", r),
+                ("1.1", "[]"),
+                ("1.05", r),
+                ("0.95", r),
+                ("0.95", r),
+            ],
+        ),
+        (
+            "sub",
+            [
+                ("1.2", r),
+                ("1.1", "[]"),
+                ("1.05", r),
+                ("1.45", r),
+                ("1.1", "[]"),
+            ],
+        ),
+    ] {
+        let said: Vec<(Option<&str>, Option<&str>)> = output
+            .lines()
+            .filter(|line| {
                 line.contains(SAMPLERS_LINE)
                     && has_field(line, &format!("upstream_face={face}"))
                     && has_field(line, "occasion=\"switch\"")
-                    && has_field(line, "repeat_penalty=1.2")
-                    && has_field(line, r#"overridden=["repeat_penalty"]"#)
-            }),
-            "切り替えの後に {face} の面の送る値（1.2）を言っていない"
+            })
+            .map(|line| {
+                (
+                    token_value(line, "repeat_penalty"),
+                    bracketed_field(line, "overridden"),
+                )
+            })
+            .collect();
+        let expected: Vec<(Option<&str>, Option<&str>)> = expected
+            .iter()
+            .map(|(value, overridden)| (Some(*value), Some(*overridden)))
+            .collect();
+        assert_eq!(
+            said, expected,
+            "切り替えの後に {face} の面の送る値を、切り替え先の値で順に言っていない"
         );
     }
+
+    running.stop().await;
+}
+
+/// **その名前の欄の値**（`キー=値` のトークンの `値`。最初の1つ）。
+fn token_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let key = format!("{key}=");
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix(key.as_str()))
+}
+
+/// その上流へ届いた `GET`（モデルの一覧の照会）の件数。**面を触ると、切り替えがその場で照会する**
+/// （`switch::execute` の 4.）。
+async fn probe_count(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.method.as_str() == "GET")
+        .count()
+}
+
+/// **腕6: `sub` 面の無いプロファイルで、同じ名前へ切り替え直しても、裏方の面を触らない**（ADR-0058 §決定2）。
+///
+/// `sub` 面が無いと、裏方は本文の候補の複製で、**サンプラの値も本文のもの**（`switch::prepare` の `next_sub`）。
+/// 比べる側（`next_sub`）がそれを本文の値で組まないと、**`sampling` を書いたプロファイルへ切り替え直すたびに
+/// 裏方の面が作り直される**（測った事実が捨てられ、照会し直す）。**同じ名前への切り替え直しでは送る値は
+/// 正しいまま**なので、値ではなく**「照会が増えないこと」**で見る（同じ変異は、値の無いプロファイルから値のある
+/// プロファイルへの切り替えでは値も壊す —— そちらは腕5の回4が見る）。
+///
+/// **対照**: 別の名前（値が違う）への切り替えでは照会が増える —— 増えない形が「触っても観測できない」でないこと。
+///
+/// **⚠ 件数で見るこの検査の前提は2つ**: 触った面の照会は切り替えの中（`switch::execute`）で待ち終わること、
+/// フィクスチャに `context_tokens` を書かない（起動直後の照会が裏で走らない）こと。`context_tokens` を足すと、
+/// 起動直後の GET が数えた後に届いて偽の赤になりうる（コードからの推論。測っていない）。
+#[tokio::test]
+async fn arm6_switching_again_to_the_same_profile_without_a_sub_face_touches_nothing() {
+    let _serial = SWITCHING.lock().await;
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let shared = upstream().await;
+    let uri = shared.uri();
+    let source = json!({
+        "first": { "main": face(&uri, MAIN_MODEL, Some(1.35)) },
+        "again": { "main": face(&uri, MAIN_MODEL, Some(0.85)) },
+    });
+    let path = dir.path().join("upstreams.json");
+    std::fs::write(&path, source.to_string()).expect("プロファイルを置けること");
+    let running = Running::start(
+        &config_of(&source, "first", &dir.path().join("arm6.sqlite")),
+        Some(path),
+    )
+    .await;
+
+    // **対照**: 値の違うプロファイルへ切り替えると、触った面をその場で照会する。
+    let before = probe_count(&shared).await;
+    running.switch_to("again").await;
+    let after_switch = probe_count(&shared).await;
+    assert!(
+        after_switch > before,
+        "前提: 面を触る切り替えで照会が増える（{before} → {after_switch}）"
+    );
+
+    // **同じ名前へ切り替え直す。** 本文も裏方も何も変わらないので、どの面も触らない。
+    running.switch_to("again").await;
+    let after_again = probe_count(&shared).await;
+    assert_eq!(
+        after_again, after_switch,
+        "同じプロファイルへ切り替え直しただけで、面を触って照会し直した"
+    );
+
+    // **送る値は正しいまま**（本文も裏方も 0.85）。
+    running.turn(&[&shared], 1).await;
+    let seen = penalties(&shared).await;
+    assert_eq!(values_of(&seen, Kind::Body), vec![json!(0.85)], "{seen:?}");
+    let background = values_of(&seen, Kind::Background);
+    assert!(!background.is_empty(), "前提: 裏方が届いた: {seen:?}");
+    assert!(
+        background.iter().all(|value| *value == json!(0.85)),
+        "{seen:?}"
+    );
 
     running.stop().await;
 }

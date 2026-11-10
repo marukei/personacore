@@ -77,7 +77,8 @@ pub const FACE_NAMES: [&str; 2] = ["main", "sub"];
 
 /// 面の中で使える鍵。**これ以外は綴りを挙げて止める。**
 ///
-/// **`command` は ADR-0042 §決定1、`context_tokens` は ADR-0054 §決定1 で足した**（それ以外は `F-9` のまま）。
+/// **`command` は ADR-0042 §決定1、`context_tokens` は ADR-0054 §決定1、`api_key` と
+/// `allow_key_over_plain_http` は ADR-0056、`sampling` は ADR-0058 で足した**（それ以外は `F-9` のまま）。
 ///
 /// # ⚠ この一覧は3つの権威を兼ねる
 ///

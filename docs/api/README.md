@@ -855,11 +855,15 @@ segment (such as `v1`) into the paths under `/admin`.
   this way.
 
 Changes in `1.7` (from `1.6`): a new key `sampling` on each side of an upstream profile
-(see [Upstream inference servers](#upstream-inference-servers)), so profile problems and
-422 `upstream_profile_invalid` can name the `key` value `sampling` and the `reason` values
-`sampling_unusable` and `unknown_sampling_key`. The profile list and the save request did
-not change: the list does not show the value, a save request that sends `sampling` is
-refused with 400, and a save keeps the value already written for that profile and side.
+(see [Upstream inference servers](#upstream-inference-servers)). A problem in the profile
+list (`ProblemView`) can name the `key` value `sampling` and the `reason` values
+`sampling_unusable` and `unknown_sampling_key`. The specification adds these values to the
+`enum` of both `ProblemView` and `ProfileInvalidDetail`, but a save does not report them:
+a save copies the value already written in the file, and a file whose `sampling` is not
+valid is refused with 422 `upstream_profiles_unreadable`, not `upstream_profile_invalid`.
+The profile list and the save request did not change: the list does not show the value,
+a save request that sends `sampling` is refused with 400, and a save keeps the value
+already written for that profile and side.
 
 Changes in `1.6` (from `1.5`): in `GET /admin/server` and the save response of
 `PUT /admin/server/port`, the fields `listening_port_requested`, `listening_port_shifted`

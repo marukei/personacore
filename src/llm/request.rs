@@ -1002,7 +1002,8 @@ impl Sampling {
 
 /// **実際に送るサンプラの5つ**（[`Sampling::sent_samplers`] / ADR-0058 §決定3）。ログに出すための読み口。
 ///
-/// **小数は `Display`（`f32` の最短表記）で出すこと** —— 線に乗る綴りと同じになる。`f64` へ広げて記録すると
+/// **小数は `Display`（`f32` の最短表記）で出すこと** —— 小数の部分は線に乗る綴りと同じ最短表記になる
+/// （**整数の値には `.0` が付かない**。`f32` の `Display` は `1` と出し、線は `1.0` と綴る）。`f64` へ広げて記録すると
 /// `0.949999988079071` のような、線に無い綴りがログに出る（`RequestPolicy` の doc の申し送り3）。
 #[derive(Debug, Clone, Copy)]
 pub struct SentSamplers(RequestPolicy);
@@ -1039,7 +1040,7 @@ impl SentSamplers {
     }
 }
 
-/// **線と同じ綴りで5つを並べる**（`top_k=40 top_p=0.95 …`）。
+/// **5つを並べる**（`top_k=40 top_p=0.95 …`）。小数の部分は線と同じ最短表記（**整数の値には `.0` が付かない**）。
 impl std::fmt::Display for SentSamplers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

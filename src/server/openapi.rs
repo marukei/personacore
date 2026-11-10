@@ -145,9 +145,11 @@ const STABILITY_EXTENSION: &str = "x-personacore-stability";
 /// 明示していない起動は、塞がっていれば止まらずに次の空きへずれる（`listening_port_source` は元の番号の
 /// 出どころ）。口・失敗の形は増減していない。
 ///
-/// **`1.7`**（作業単位 A-16 / ADR-0058）: 上流プロファイルの面の鍵 `sampling` が入り、問題の `key`
-/// （`ProfileInvalidDetail.key` / `ProblemView.key`）に値 `sampling`、`reason` に値 `sampling_unusable` /
-/// `unknown_sampling_key` が増えた。応答の `enum` に値を足しただけなので小さい側。プロファイルの一覧と
+/// **`1.7`**（作業単位 A-16 / ADR-0058）: 上流プロファイルの面の鍵 `sampling` が入り、仕様書の `key` の `enum`
+/// （`ProfileInvalidDetail.key` / `ProblemView.key`）に値 `sampling`、`reason` の `enum` に値 `sampling_unusable` /
+/// `unknown_sampling_key` が増えた。**これらを名指すのはプロファイルの一覧の `ProblemView` だけ** —— 保存は
+/// ファイルに書いてある値を写すだけなので、保存の 422 `upstream_profile_invalid` には出ない（ファイルの
+/// `sampling` が不正なら 422 `upstream_profiles_unreadable`）。応答の `enum` に値を足しただけなので小さい側。プロファイルの一覧と
 /// 保存の依頼の形は変えていない（依頼は `sampling` を受け付けず、保存はいまのファイルの値を残す）。
 pub const API_VERSION: &str = "1.7";
 
