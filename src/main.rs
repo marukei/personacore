@@ -492,6 +492,9 @@ struct Chosen {
 /// **面に書いた鍵（ADR-0056 §決定1）も別の入口で載せる**（`with_profile_keys`）——環境変数には
 /// 鍵の口を作らない。**`warn_on_conflicts` の組にも鍵を混ぜない**（値を平文で並べる行なので）。
 ///
+/// **面に書いたサンプラの値（ADR-0058 §決定1）も別の入口で載せる**（`with_profile_sampling`）——環境変数には
+/// 口を作らない。見張り番は `tests/upstream_cli.rs` の `a_sampling_written_in_the_profile_reaches_the_executable`。
+///
 /// **画面で保存した待ち受けのポート（ADR-0057 §決定5）も、環境変数の既定の経路と同じ入口で渡す**
 /// （`AppConfig::from_lookup_with_saved_port`。プロファイルは待ち受けのポートを持たない）。
 fn config_for(
@@ -503,7 +506,8 @@ fn config_for(
         saved_port,
     )?
     .with_profile_context(settings)?
-    .with_profile_keys(settings))
+    .with_profile_keys(settings)
+    .with_profile_sampling(settings))
 }
 
 /// **画面で保存した待ち受けのポートを読む**（ADR-0057 §決定5 / 作業単位 F-12a）。

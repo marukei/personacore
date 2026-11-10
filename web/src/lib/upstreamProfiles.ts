@@ -54,6 +54,9 @@ export type Face = (typeof FACES)[number];
  *
  * **`allow_key_over_plain_http` は作業単位 A-13b-2 で足した**（ADR-0056 §決定5）。**欄にはしない**
  * （真偽値を打たせない）。承認は保存の前の確認で取る（作業単位 A-13b-3 / [`nextKeyQuestion`]）。
+ *
+ * **`sampling` は作業単位 A-16 で足した**（ADR-0058 §決定6）。**欄にはしない**（画面で値を見せる・直す作業は
+ * 別の作業単位）。画面は値を受け取らず送りもしない —— 保存はサーバが、いまのファイルの同じ名前・同じ面の値を残す。
  */
 export const FACE_KEYS = [
   "endpoint",
@@ -64,13 +67,14 @@ export const FACE_KEYS = [
   "context_tokens",
   "api_key",
   "allow_key_over_plain_http",
+  "sampling",
 ] as const;
 
 /** 面の中の鍵。 */
 export type FaceKey = (typeof FACE_KEYS)[number];
 
 /**
- * **画面が欄を持つ鍵**（[`FACE_KEYS`] から `allow_key_over_plain_http` を除いたもの。並びは同じ）。
+ * **画面が欄を持つ鍵**（[`FACE_KEYS`] から `allow_key_over_plain_http` と `sampling` を除いたもの。並びは同じ）。
  *
  * **`api_key` の欄は、値を出さない**（応答は鍵の値を返さない —— `api_key_set` / `api_key_hint` だけ / ADR-0056 §決定3）。
  * 下書きの `api_key` は**新しい鍵**の入力で、空なら置き換えない（[`FaceDraft`]）。作業単位 A-13b-3 で欄にした
@@ -78,13 +82,17 @@ export type FaceKey = (typeof FACE_KEYS)[number];
  *
  * **`allow_key_over_plain_http` を除く理由**: 真偽値を欄で打たせない。承認は保存の前の確認で取り、
  * 鍵の欄の隣で状態を言う（[`keySendingState`]）。
+ *
+ * **`sampling` を除く理由**（ADR-0058 §決定6）: 画面はまだこの欄を持たない（`EditableFaceKey` は下書き・欄の型を決めるので、
+ * 除かないと存在しない欄が型に現れる）。仕様書の `enum` には `sampling` があるが、いまの保存の 422 は名指さない。
+ * 名指す形が生じたときに、存在しない欄へ結びつけて理由を画面から消さないための予防でもある（[`isEditableFaceKey`]）。
  */
 export const EDITABLE_FACE_KEYS = FACE_KEYS.filter(
-  (key): key is EditableFaceKey => key !== "allow_key_over_plain_http",
+  (key): key is EditableFaceKey => key !== "allow_key_over_plain_http" && key !== "sampling",
 );
 
 /** 画面が欄を持つ鍵。 */
-export type EditableFaceKey = Exclude<FaceKey, "allow_key_over_plain_http">;
+export type EditableFaceKey = Exclude<FaceKey, "allow_key_over_plain_http" | "sampling">;
 
 /**
  * **`command` を書かなかった面で起こす実行ファイルの名前**（`upstreams.rs` の `DEFAULT_COMMAND` の写し）。
@@ -1116,7 +1124,7 @@ function isFace(value: string | null | undefined): value is Face {
  * **画面に欄がある鍵か**（[`EDITABLE_FACE_KEYS`]）。
  *
  * **`api_key` を名指した理由は、その面の鍵の欄に出す**（作業単位 A-13b-3。A-13b-1・A-13b-2 の間は欄が無く、全体に出した）。
- * **`allow_key_over_plain_http` を名指した理由は全体に出す**（欄の無い鍵に結びつけると、理由が画面から消える）。
+ * **`allow_key_over_plain_http` と `sampling` を名指した理由は全体に出す**（欄の無い鍵に結びつけると、理由が画面から消える）。
  */
 function isEditableFaceKey(value: string | null | undefined): value is EditableFaceKey {
   return EDITABLE_FACE_KEYS.some((key) => key === value);

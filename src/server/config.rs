@@ -63,7 +63,7 @@ use crate::domain::{
 };
 use crate::llm::{
     ApiKey, DEFAULT_ENDPOINT, DEFAULT_MAIN_MODEL, DEFAULT_SUB_MODEL, EndpointError, LmStudioConfig,
-    ModelId, ModelIdError,
+    ModelId, ModelIdError, Sampling,
 };
 use crate::prompt::TokenBudget;
 
@@ -1147,12 +1147,16 @@ pub fn database_path_from_env() -> Result<PathBuf, ConfigError> {
 ///
 /// **`allow_key_over_plain_http` は鍵と同じく `like` から引き継がない**（承認は宛先に付く）。
 /// **名前解決の口は `like` から写す**（待ち時間と同じ「どう繋ぐか」の設定。本番では OS の名前解決）。
+///
+/// # サンプラの値も切り替え先の面のもの（ADR-0058 §決定2 / 作業単位 A-16）
+///
+/// **`sampling` は `like` から引き継がない。** 値はエンジン・モデル・量子化の組（＝プロファイル）に付く。
+/// 引き継ぐと、値を書いていないプロファイルへ切り替えても前の値を送り続ける（§決定2 の「持ち越さない」）。
 pub(in crate::server) fn retarget_llm(
     like: &LmStudioConfig,
     base_url: &str,
     model: &str,
-    api_key: Option<&ApiKey>,
-    allow_key_over_plain_http: bool,
+    face: FaceSettings<'_>,
 ) -> Result<LmStudioConfig, ConfigError> {
     let model = ModelId::parse(model).map_err(ConfigError::Model)?;
     Ok(LmStudioConfig::new(base_url, model)
@@ -1162,8 +1166,23 @@ pub(in crate::server) fn retarget_llm(
         .with_idle_timeout(like.idle_timeout())
         .with_context_timeout(like.context_timeout())
         .with_host_resolver_of(like)
-        .with_api_key(api_key.cloned())
-        .with_key_over_plain_http_allowed(allow_key_over_plain_http))
+        .with_api_key(face.api_key.cloned())
+        .with_key_over_plain_http_allowed(face.allow_key_over_plain_http)
+        .with_sampling(face.sampling))
+}
+
+/// **切り替え先の面から写す、宛先とモデル以外の値**（[`retarget_llm`] の引数 / 作業単位 A-16 で束ねた）。
+///
+/// **どれも `like`（いまのクライアント）から引き継がない**（鍵と承認は宛先に、サンプラの値はプロファイルに付く）。
+/// 引数を並べたままだと、真偽値と `Option` が増えるたびに呼び出しで順番を取り違えても型が通る。
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::server) struct FaceSettings<'a> {
+    /// その面の鍵（ADR-0056 §決定2）。
+    pub(in crate::server) api_key: Option<&'a ApiKey>,
+    /// その面の承認（ADR-0056 §決定5）。
+    pub(in crate::server) allow_key_over_plain_http: bool,
+    /// その面のサンプラの値（ADR-0058 §決定2）。
+    pub(in crate::server) sampling: Sampling,
 }
 
 impl AppConfig {
@@ -1462,6 +1481,28 @@ impl AppConfig {
             sub.with_api_key(settings.sub_api_key().cloned())
                 .with_key_over_plain_http_allowed(settings.sub_allow_key_over_plain_http())
         });
+        self
+    }
+
+    /// **選んだ上流プロファイルの面に書いたサンプラの値を載せる**（ADR-0058 §決定1 / 作業単位 A-16）。
+    ///
+    /// `main` は `--upstream`（と覚えた名前）で選んだプロファイルの [`ProfileSettings`] をここへ渡す
+    /// （**環境変数には口を作らない** —— ADR-0058 §却下した選択肢。だから [`super::upstreams::overlay_profile`]
+    /// を通らない）。
+    ///
+    /// | 面 | 載せる値 |
+    /// |---|---|
+    /// | 本文 | `main` 面の値 |
+    /// | 抽出（`sub` 面を書いた＝2つ目の上流がある） | **`sub` 面の値**（無ければ既定。本文の値を写さない） |
+    /// | 抽出（`sub` 面を書いていない） | 何もしない —— 裏方は本文のクライアントの複製（`with_model`）を使うので、本文の値で送る |
+    ///
+    /// **書いていない面は何も変わらない**（[`Sampling::default`] を載せるだけ —— 送る本文は1バイトも変わらない）。
+    #[must_use]
+    pub fn with_profile_sampling(mut self, settings: &ProfileSettings) -> Self {
+        self.llm = self.llm.with_sampling(settings.sampling());
+        self.sub_llm = self
+            .sub_llm
+            .map(|sub| sub.with_sampling(settings.sub_sampling()));
         self
     }
 

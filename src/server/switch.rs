@@ -19,6 +19,7 @@
 //! **面ごとに新旧を比べる**（[`plan_switch`]）。比べるのは
 //! **宛先（正規化した綴り）・依頼するモデルの綴り・その面を担う子の記述**の3つで、
 //! **3つとも同じなら、クライアントも観測も子も1バイトも触らない。**
+//! （のちに明示のコンテキスト長・鍵・承認・サンプラの値も比べる対象に足した —— [`Target`] の doc。）
 //!
 //! # 同じ名前で、起こすのを待っている面を起こす（ADR-0055 §決定3 / 作業単位 F-10a）
 //!
@@ -65,13 +66,13 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 
 use super::AppState;
-use super::config::{BindAddr, ProfileContext};
+use super::config::{BindAddr, FaceSettings, ProfileContext};
 use super::context::{Candidate, FaceClient};
 use super::error::{ApiError, ErrorBody};
 use super::launch::{Armed, FaceState, LaunchPlan, Supervisor};
 use super::upstream::UpstreamReport;
-use super::upstreams::{ProfileLaunch, UpstreamProfile, load_profiles};
-use crate::llm::ApiKey;
+use super::upstreams::{ProfileFace, ProfileLaunch, UpstreamProfile, load_profiles};
+use crate::llm::{ApiKey, Sampling};
 use crate::measured::ModelFace;
 
 /// ログに出す入口の名前（`ApiError::from_json_rejection`）。
@@ -116,6 +117,9 @@ pub(in crate::server) struct Switcher {
     /// 差し替えの最中（子の終了を待つ間）に読みを待たせない。`await` を跨いで持たない。
     selected: Mutex<Option<String>>,
 }
+
+/// **送るサンプラの行の `occasion`**（切り替えの後 / `context::report_samplers`）。
+const SWITCH_OCCASION: &str = "switch";
 
 /// **終了処理に入ったので差し替えを断った行**（テストがこの綴りで引く）。
 const SWITCH_CLOSED_LINE: &str = "終了処理に入ったので、この上流の差し替えは断りました";
@@ -276,6 +280,12 @@ impl Switcher {
 ///
 /// **宛先・綴り・鍵が同じで承認だけが違うプロファイルへ切り替えても、承認は切り替え先に追従する。**
 /// 比べなければ「触らない」になり、**前の承認のまま送り続ける**（承認を足したのに止まり続ける・外したのに送り続ける）。
+///
+/// # サンプラの値も比べる（ADR-0058 §決定2 / 作業単位 A-16）
+///
+/// **宛先・綴りが同じで `sampling` だけが違うプロファイルへ切り替えても、値は切り替え先に追従する。**
+/// 比べなければ「触らない」になり、**前の値のまま送り続ける**（同じ量子化で値だけを変えて比べる使い方で、
+/// 比べたつもりの2つの腕が同じ値で走る）。見張り番は `tests/server_profile_sampling.rs` の腕5。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
     endpoint: String,
@@ -283,6 +293,7 @@ struct Target {
     context_tokens: Option<u32>,
     api_key: Option<ApiKey>,
     allow_key_over_plain_http: bool,
+    sampling: Sampling,
 }
 
 impl Target {
@@ -293,6 +304,7 @@ impl Target {
             context_tokens,
             api_key: client.api_key(),
             allow_key_over_plain_http: client.key_over_plain_http_allowed(),
+            sampling: client.sampling(),
         }
     }
 
@@ -303,6 +315,7 @@ impl Target {
             context_tokens,
             api_key: candidate.api_key().cloned(),
             allow_key_over_plain_http: candidate.key_over_plain_http_allowed(),
+            sampling: candidate.sampling(),
         }
     }
 }
@@ -416,6 +429,15 @@ struct Prepared {
     profile_context: ProfileContext,
 }
 
+/// **切り替え先の面から写す、宛先とモデル以外の値**（鍵・承認・サンプラの値 / `config::retarget_llm`）。
+fn face_settings(face: &ProfileFace) -> FaceSettings<'_> {
+    FaceSettings {
+        api_key: face.api_key(),
+        allow_key_over_plain_http: face.allow_key_over_plain_http(),
+        sampling: face.sampling(),
+    }
+}
+
 /// **候補を全部組み、起こすものを全部確かめる。** 失敗したら何にも触らずに断る。
 ///
 /// | 確かめること | 断るとき |
@@ -446,28 +468,24 @@ fn prepare(
 
     let main_face = profile.main();
     // **鍵は切り替え先の面のもの**（ADR-0056 §決定2 / `config::retarget_llm`）。**承認も**（§決定5）。
+    // **サンプラの値も**（ADR-0058 §決定2 —— 切り替え先に値が無ければ既定へ戻る。持ち越さない）。
     let main = clients
         .face(ModelFace::Main)
         .retargeted(
             main_face.endpoint(),
             main_face.model(),
-            main_face.api_key(),
-            main_face.allow_key_over_plain_http(),
+            face_settings(main_face),
         )
         .map_err(unusable(ModelFace::Main))?;
     // **`sub` を書いていなければ、抽出も本文と同じ上流**（ADR-0039 §決定1）。
     // **比べる綴りは、本文の候補の宛先と、本文と同じモデル**（`UpstreamProfile::settings`）。
     // **鍵も本文の候補のもの**（同じ宛先・本文のクライアントの複製 —— 下の `with_model`）。
+    // **サンプラの値も本文の候補のもの**（ADR-0058 §決定1 —— `with_model` の複製に写る）。
     let sub_written = match profile.sub() {
         Some(sub) => Some(
             clients
                 .face(ModelFace::Sub)
-                .retargeted(
-                    sub.endpoint(),
-                    sub.model(),
-                    sub.api_key(),
-                    sub.allow_key_over_plain_http(),
-                )
+                .retargeted(sub.endpoint(), sub.model(), face_settings(sub))
                 .map_err(unusable(ModelFace::Sub))?,
         ),
         None => None,
@@ -491,6 +509,7 @@ fn prepare(
             context_tokens: next_context(ModelFace::Sub),
             api_key: main.api_key().cloned(),
             allow_key_over_plain_http: main.key_over_plain_http_allowed(),
+            sampling: main.sampling(),
         },
         |candidate| Target::of_candidate(candidate, next_context(ModelFace::Sub)),
     );
@@ -590,6 +609,10 @@ async fn execute(supervisor: &mut Supervisor, armed: &Armed, prepared: Prepared)
             supervisor.states().set(face, FaceState::External);
         }
     }
+
+    // **送るサンプラの値を面ごとに言う**（ADR-0058 §決定3）。触らなかった面も言う —— 切り替えの後に
+    // 何で送るかを、ログの1か所で読めるように。
+    super::context::report_samplers(&armed.clients, SWITCH_OCCASION);
 
     // 3. **起こす。** 載るのは背景で待つ（番人は起こした場で付く）。
     supervisor.start_more(&plan.start);
@@ -753,6 +776,50 @@ mod tests {
             context_tokens: None,
             api_key: None,
             allow_key_over_plain_http: false,
+            sampling: Sampling::default(),
+        }
+    }
+
+    /// **宛先・綴りが同じで、サンプラの値だけが変わった面は触る**（ADR-0058 §決定2 / 作業単位 A-16）。
+    ///
+    /// **3通り**（なし→あり・あり→別の値・あり→なし）を、**本文の面だけ**変えて見る ——裏方の面は同じまま
+    /// 触らない。**対照**: 同じ値なら触らない。値は既定の 1.1 と違える。
+    #[test]
+    fn a_face_whose_sampling_alone_changes_is_touched() {
+        use crate::llm::RepeatPenalty;
+        let tuned = |value: Option<f64>| Target {
+            sampling: value.map_or_else(Sampling::default, |value| {
+                Sampling::with_repeat_penalty(RepeatPenalty::parse(value).expect("範囲の中"))
+            }),
+            ..target("http://127.0.0.1:1/v1/chat/completions", "main")
+        };
+        let sub = target("http://127.0.0.1:2/v1/chat/completions", "sub");
+        for (before, after, touched) in [
+            (None, Some(1.05), true),
+            (Some(1.05), Some(1.2), true),
+            (Some(1.05), None, true),
+            (Some(1.05), Some(1.05), false),
+            (None, None, false),
+        ] {
+            let plan = plan_switch(
+                &[],
+                &[],
+                &[tuned(before), sub.clone()],
+                &[tuned(after), sub.clone()],
+                [false, false],
+            );
+            assert_eq!(
+                plan.touch,
+                [
+                    if touched {
+                        Touch::External
+                    } else {
+                        Touch::Untouched
+                    },
+                    Touch::Untouched,
+                ],
+                "{before:?} → {after:?}"
+            );
         }
     }
 

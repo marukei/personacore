@@ -851,6 +851,13 @@ impl RequestPolicy {
     ///
     /// **⚠ 経路ごとに変えないこと。** 変えるなら、先に
     /// 「経路と値の取り違えを見る見張り番」が要る（この型の doc）。
+    ///
+    /// # 面に書いた値は、この1組の上に重なる（ADR-0058 / 作業単位 A-16）
+    ///
+    /// **上流プロファイルの面に書いた欄（いまは `repeat_penalty` だけ）は、その面のクライアントが
+    /// [`Self::overridden_by`] で置き換えて送る。** 値が付くのは経路ではなく面（上流）で、`sub` 面を書いた
+    /// プロファイルでは本文と裏方が違う値を送りうる。**その帰属の見張り番は `tests/server_profile_sampling.rs`**
+    /// （本文と裏方に違う値を書き、どちらの要求にどちらが載るかを見る）。**何も書いていない面は、この1組のまま。**
     pub(super) const PERSONACORE: Self = Self {
         reasoning_effort: "none",
         top_k: 40,
@@ -859,6 +866,193 @@ impl RequestPolicy {
         repeat_penalty: 1.1,
         presence_penalty: 0.0,
     };
+
+    /// **面に書いた値で置き換えた1組**（ADR-0058 §決定1 / 作業単位 A-16）。
+    ///
+    /// **書いた欄だけを置き換える。** 何も書いていなければ（[`Sampling::default`]）、
+    /// [`Self::PERSONACORE`] と1ビットも違わない —— 書かない面の要求のバイト列は変わらない
+    /// （見張り番は `tests::the_wire_bytes_spell_the_request_exactly` が既定のまま通ること）。
+    #[must_use]
+    const fn overridden_by(self, sampling: Sampling) -> Self {
+        let repeat_penalty = match sampling.repeat_penalty {
+            Some(written) => written.0,
+            None => self.repeat_penalty,
+        };
+        Self {
+            repeat_penalty,
+            ..self
+        }
+    }
+}
+
+/// **[`RepeatPenalty`] の下限**（含む / ADR-0058 §決定1 の「範囲は実装で決める」）。
+///
+/// # 範囲を「中立の 1.0 から2倍以内」にした理由
+///
+/// llama.cpp 系の繰り返しの罰は、既に出たトークンの logit を**この値で割る（正）・掛ける（負）**。
+/// **1.0 が中立**で、1.0 より大きいと繰り返しを抑え、小さいと繰り返しを促す。
+///
+/// | 値 | 何が起きるか | 扱い |
+/// |---|---|---|
+/// | NaN・無限 | 送る本文に書けない（JSON は数として表せない） | **止める** |
+/// | 0 | logit を 0 で割る | **止める** |
+/// | 負 | 罰の向きが裏返る（正の logit を負にする） | **止める** |
+/// | 0.5 未満 | 繰り返しを2倍より強く促す。会話がループに落ちる側の値で、測る理由が見当たらない | **止める** |
+/// | 0.5〜2.0 | 測る意味のある範囲（モデルカードや上流の既定は 1.0〜1.3 程度。ADR-0058 の実測は 1.0 と 1.1） | 通す |
+/// | 2.0 超 | 既に出た語を全部2倍より強く罰する。`1.1` を `11` と打ち損じた値もここに落ちる | **止める** |
+///
+/// **⚠ この範囲は測って決めたものではない**（ADR-0036 §決定3 の「根拠が無い」値の、壊れた値を作らせないための柵）。
+/// 範囲の外に正当な値があると分かったら、ここを広げる。
+pub const REPEAT_PENALTY_MIN: f64 = 0.5;
+
+/// **[`RepeatPenalty`] の上限**（含む）。理由は [`REPEAT_PENALTY_MIN`] の doc。
+pub const REPEAT_PENALTY_MAX: f64 = 2.0;
+
+/// **面に書いた繰り返しの罰**（ADR-0058 §決定1 / 作業単位 A-16）。
+///
+/// **[`Self::parse`] が唯一のコンストラクタ**（`ModelId` と同じ発想）。範囲は [`REPEAT_PENALTY_MIN`] の表。
+///
+/// # `Eq` を手で書く
+///
+/// 中身は `f32` だが、**NaN を作れない**（[`Self::parse`] が止める）ので、ビット列の比較が値の比較になる
+/// （`+0` と `-0` も作れない —— 下限が正）。**`Eq` が要るのは、面の比較（走ったままの切り替えの
+/// 「変わらない面は触らない」）と、プロファイルの型がそれを derive しているから**である。
+#[derive(Debug, Clone, Copy)]
+pub struct RepeatPenalty(f32);
+
+impl PartialEq for RepeatPenalty {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for RepeatPenalty {}
+
+impl RepeatPenalty {
+    /// 唯一のコンストラクタ。**範囲の外は `None`**（[`REPEAT_PENALTY_MIN`] の表）。
+    ///
+    /// **判定は受け取った `f64` のまま行い、通った値だけを `f32` へ落とす**
+    /// （送る本文の欄は `f32` —— [`RequestPolicy`]）。範囲の端は `f32` でも正確に表せる。
+    #[must_use]
+    pub fn parse(value: f64) -> Option<Self> {
+        if !value.is_finite() || !(REPEAT_PENALTY_MIN..=REPEAT_PENALTY_MAX).contains(&value) {
+            return None;
+        }
+        // **範囲の中の `f64` は `f32` に収まる**（落ちるのは精度だけ。送るのは `f32` の最短表記）。
+        let narrowed = value as f32;
+        Some(Self(narrowed))
+    }
+
+    /// 送る値。
+    #[must_use]
+    pub const fn get(self) -> f32 {
+        self.0
+    }
+}
+
+/// **面に書いたサンプラの値**（ADR-0058 §決定1 / 作業単位 A-16）。**書いた欄だけが `Some`。**
+///
+/// **既定（[`Self::default`]）は「何も書いていない」** —— 送る1組は [`RequestPolicy::PERSONACORE`] のまま。
+/// **値を持つのは `LmStudioConfig`（1つの上流クライアントの設定）**で、本文と裏方のクライアントが
+/// それぞれ自分の面の値を持つ（`sub` 面が無ければ、裏方は本文のクライアントの複製なので本文の値を持つ）。
+///
+/// # いま書けるのは `repeat_penalty` だけ
+///
+/// ADR-0036 §決定3 の3条件を実測で示せているのが、サンプラの5つのうちこの1つだけだから
+/// （ADR-0058 §決定1・§決定4）。ほかの4つを足すときは、この型に欄を足し、ADR に追記する。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sampling {
+    repeat_penalty: Option<RepeatPenalty>,
+}
+
+impl Sampling {
+    /// **繰り返しの罰を置き換える1組。**
+    #[must_use]
+    pub const fn with_repeat_penalty(repeat_penalty: RepeatPenalty) -> Self {
+        Self {
+            repeat_penalty: Some(repeat_penalty),
+        }
+    }
+
+    /// 書いた繰り返しの罰。書いていなければ `None`。
+    #[must_use]
+    pub const fn repeat_penalty(&self) -> Option<RepeatPenalty> {
+        self.repeat_penalty
+    }
+
+    /// **実際に送るサンプラの5つ**（ログに出す値 / ADR-0058 §決定3）。
+    ///
+    /// **送る本文と同じ関数（[`RequestPolicy::overridden_by`]）から作る** —— ログと線が食い違わない。
+    /// **言えるのは「送った値」まで**で、上流で効いた値ではない（効いた値の権威は上流の側の観測）。
+    #[must_use]
+    pub const fn sent_samplers(self) -> SentSamplers {
+        SentSamplers(RequestPolicy::PERSONACORE.overridden_by(self))
+    }
+
+    /// **面の値で置き換えた欄の名前**（送る本文の綴り。何も置き換えていなければ空）。
+    #[must_use]
+    pub fn overridden(self) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        if self.repeat_penalty.is_some() {
+            keys.push("repeat_penalty");
+        }
+        keys
+    }
+}
+
+/// **実際に送るサンプラの5つ**（[`Sampling::sent_samplers`] / ADR-0058 §決定3）。ログに出すための読み口。
+///
+/// **小数は `Display`（`f32` の最短表記）で出すこと** —— 小数の部分は線に乗る綴りと同じ最短表記になる
+/// （**整数の値には `.0` が付かない**。`f32` の `Display` は `1` と出し、線は `1.0` と綴る）。`f64` へ広げて記録すると
+/// `0.949999988079071` のような、線に無い綴りがログに出る（`RequestPolicy` の doc の申し送り3）。
+#[derive(Debug, Clone, Copy)]
+pub struct SentSamplers(RequestPolicy);
+
+impl SentSamplers {
+    /// `top_k`。
+    #[must_use]
+    pub const fn top_k(&self) -> u32 {
+        self.0.top_k
+    }
+
+    /// `top_p`。
+    #[must_use]
+    pub const fn top_p(&self) -> f32 {
+        self.0.top_p
+    }
+
+    /// `min_p`。
+    #[must_use]
+    pub const fn min_p(&self) -> f32 {
+        self.0.min_p
+    }
+
+    /// `repeat_penalty`。
+    #[must_use]
+    pub const fn repeat_penalty(&self) -> f32 {
+        self.0.repeat_penalty
+    }
+
+    /// `presence_penalty`。
+    #[must_use]
+    pub const fn presence_penalty(&self) -> f32 {
+        self.0.presence_penalty
+    }
+}
+
+/// **5つを並べる**（`top_k=40 top_p=0.95 …`）。小数の部分は線と同じ最短表記（**整数の値には `.0` が付かない**）。
+impl std::fmt::Display for SentSamplers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "top_k={} top_p={} min_p={} repeat_penalty={} presence_penalty={}",
+            self.top_k(),
+            self.top_p(),
+            self.min_p(),
+            self.repeat_penalty(),
+            self.presence_penalty()
+        )
+    }
 }
 
 /// 送信本文。`stream` は呼び出し方（補完か中継か）で決まるので引数で受ける。
@@ -933,10 +1127,16 @@ struct WireMessage<'a> {
 ///
 /// **非ストリーミングでは送らない。** `usage` は本文と一緒に返るので不要で、
 /// 未知の項目を拒否する上流がありうる。
+///
+/// # 面に書いたサンプラの値（ADR-0058 §決定1 / 作業単位 A-16）
+///
+/// **`sampling` は、そのクライアントの面に書いた値**（`LmStudioConfig` が持つ）。書いた欄だけが
+/// [`RequestPolicy::PERSONACORE`] を置き換える。**何も書いていなければ、本文は1バイトも変わらない。**
 pub(super) fn wire_request<'a>(
     model: &'a ModelId,
     request: &'a ChatRequest,
     stream: bool,
+    sampling: Sampling,
 ) -> WireRequest<'a> {
     WireRequest {
         model: model.as_str(),
@@ -951,7 +1151,8 @@ pub(super) fn wire_request<'a>(
         stream,
         // **条件を付けない。** 本文・抽出・変容の3経路はどれもここを通るので、
         // ここに書けば1経路だけ欠けることが起こらない（A-7b の狙い）。
-        policy: RequestPolicy::PERSONACORE,
+        // **面に書いた値は、ここで置き換える**（ADR-0058 / 経路ではなくクライアントの面に付く値）。
+        policy: RequestPolicy::PERSONACORE.overridden_by(sampling),
         stream_options: stream.then_some(StreamOptions {
             include_usage: true,
         }),
@@ -1452,7 +1653,7 @@ mod tests {
     }
 
     fn to_value(request: &ChatRequest, stream: bool) -> Value {
-        serde_json::to_value(wire_request(&model(), request, stream))
+        serde_json::to_value(wire_request(&model(), request, stream, Sampling::default()))
             .expect("送信本文は JSON にできること")
     }
 
@@ -1465,8 +1666,112 @@ mod tests {
     /// （C-13 が実測 / `RequestPolicy` の doc の申し送り2）。
     /// **その形は `to_value` を通す検査からは原理的に見えない。**
     fn to_wire(request: &ChatRequest, stream: bool) -> String {
-        serde_json::to_string(&wire_request(&model(), request, stream))
+        to_wire_with(request, stream, Sampling::default())
+    }
+
+    /// **面に書いた値を持つクライアントが線に載せるバイト列**（ADR-0058 / 作業単位 A-16）。
+    fn to_wire_with(request: &ChatRequest, stream: bool, sampling: Sampling) -> String {
+        serde_json::to_string(&wire_request(&model(), request, stream, sampling))
             .expect("送信本文は JSON にできること")
+    }
+
+    fn penalty(value: f64) -> RepeatPenalty {
+        RepeatPenalty::parse(value).unwrap_or_else(|| panic!("{value} は範囲の中であること"))
+    }
+
+    /// **書いた `repeat_penalty` だけが線の上で置き換わる**（ADR-0058 §決定1 / 作業単位 A-16）。
+    ///
+    /// **期待値は手で書いたバイト列**（[`the_wire_bytes_spell_the_request_exactly`] と同じ形）。
+    /// 既定の `1.1` と違う値（`1.05`）にし、**`f32` で割り切れない値**にしてある —— `to_value` を経由する
+    /// 実装に変わると `1.0499999523162842` になって赤くなる。
+    ///
+    /// 対照: 何も書いていない [`Sampling::default`] は既定の綴りのまま（[`the_wire_bytes_spell_the_request_exactly`]
+    /// が同じ依頼で見ている。ここでも同じ依頼で並べ、置き換わったのがその1欄だけであることを見る）。
+    #[test]
+    fn a_written_repeat_penalty_replaces_only_that_field_on_the_wire() {
+        let request = ChatRequest {
+            messages: vec![ChatMessage::user("こんにちは")],
+            temperature: Some(0.5),
+            max_tokens: None,
+        };
+        let written = to_wire_with(
+            &request,
+            false,
+            Sampling::with_repeat_penalty(penalty(1.05)),
+        );
+        assert_eq!(
+            written,
+            concat!(
+                r#"{"model":"ministral-3-14b-instruct-2512","#,
+                r#""messages":[{"role":"user","content":"こんにちは"}],"#,
+                r#""stream":false,"reasoning_effort":"none","#,
+                r#""top_k":40,"top_p":0.95,"min_p":0.05,"repeat_penalty":1.05,"#,
+                r#""presence_penalty":0.0,"temperature":0.5}"#,
+            )
+        );
+        // **対照**: 書いていなければ既定の 1.1 —— 違うのはその1欄だけ。
+        assert_eq!(
+            to_wire_with(&request, false, Sampling::default()),
+            written.replace(r#""repeat_penalty":1.05"#, r#""repeat_penalty":1.1"#)
+        );
+    }
+
+    /// **範囲**（[`REPEAT_PENALTY_MIN`] の表）。端は通し、外は止める。NaN・無限・0・負も止める。
+    ///
+    /// **期待値は定数から作らない**（`0.5` / `2.0` を手で書く）。
+    #[test]
+    fn a_repeat_penalty_admits_exactly_the_documented_range() {
+        for value in [0.5, 0.9, 1.0, 1.05, 1.1, 1.3, 2.0] {
+            let parsed =
+                RepeatPenalty::parse(value).unwrap_or_else(|| panic!("{value} は通ること"));
+            // 送るのは `f32` に落とした値（端は正確に表せる）。
+            assert_eq!(f64::from(parsed.get()), f64::from(value as f32), "{value}");
+        }
+        for value in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -0.0,
+            -1.1,
+            f64::from_bits(1),
+            0.499_999_999,
+            2.000_000_001,
+            11.0,
+            f64::MAX,
+        ] {
+            assert_eq!(RepeatPenalty::parse(value), None, "{value} は止めること");
+        }
+    }
+
+    /// **送るサンプラの5つと、置き換えた欄の名前**（ログの形 / ADR-0058 §決定3）。
+    ///
+    /// 書いていなければ既定の5つで置き換えた欄は無く、書いたら `repeat_penalty` だけが変わる。
+    #[test]
+    fn the_sent_samplers_name_the_values_on_the_wire() {
+        assert_eq!(
+            Sampling::default().sent_samplers().to_string(),
+            "top_k=40 top_p=0.95 min_p=0.05 repeat_penalty=1.1 presence_penalty=0"
+        );
+        assert!(Sampling::default().overridden().is_empty());
+        let written = Sampling::with_repeat_penalty(penalty(1.05));
+        assert_eq!(
+            written.sent_samplers().to_string(),
+            "top_k=40 top_p=0.95 min_p=0.05 repeat_penalty=1.05 presence_penalty=0"
+        );
+        assert_eq!(written.overridden(), vec!["repeat_penalty"]);
+    }
+
+    /// **同じ値なら等しく、違う値なら等しくない**（手で書いた `Eq` / 切り替えの比較が使う）。
+    #[test]
+    fn repeat_penalties_compare_by_value() {
+        assert_eq!(penalty(1.05), penalty(1.05));
+        assert_ne!(penalty(1.05), penalty(1.0));
+        assert_ne!(
+            Sampling::with_repeat_penalty(penalty(1.1)),
+            Sampling::default(),
+            "既定と同じ値を書いた面も「書いた」面である"
+        );
     }
 
     /// **線に乗ったバイト列を読み直した値。**

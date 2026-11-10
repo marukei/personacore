@@ -201,7 +201,7 @@ itself. It is served with `--no-ui` too, because it is part of the API, not of t
 carries the API version:
 
 ```
-x-personacore-api-version: 1.6
+x-personacore-api-version: 1.7
 ```
 
 That includes errors, 404 and 405 responses, the event stream and `/openapi.json`.
@@ -263,7 +263,8 @@ Everything else (`top_p`, `stop`, `presence_penalty`, `n`, `tools`,
 `max_completion_tokens`, ...) is accepted and ignored; unknown fields do not cause an
 error. In particular `max_completion_tokens` has **no effect**; only `max_tokens` is
 read. personacore sends its own fixed sampling settings upstream so that results are
-reproducible.
+reproducible (an upstream profile can replace the repetition penalty; see
+[Upstream inference servers](#upstream-inference-servers)).
 
 If there is no `user` message the request is rejected with 400. If the last `user`
 message has non-string content (for example the multi-part array used for images), the
@@ -563,6 +564,18 @@ in 32 bits, is refused with 422 `upstream_profile_invalid`, reason `context_toke
 before anything is written. A value that is not a non-negative integer, or is larger than
 2^64−1, cannot be read as a request and is refused with 400.
 
+A profile can also change the repetition penalty personacore sends to an upstream
+(`"sampling": { "repeat_penalty": 1.0 }` on a side in `upstreams.json`). Only the value
+written replaces personacore's default (1.1); a side without `sampling` sends exactly what
+it sent before. `repeat_penalty` is the only key accepted (the other samplers, such as
+`top_k`, are refused by name, reason `unknown_sampling_key`), and it must be a number from
+0.5 to 2 (otherwise reason `sampling_unusable`); both are checked when the profiles are
+read. If a profile has no background side (`sub`), the chat side's value is used for
+background work too; a background side without `sampling` uses the default. The value
+follows the profile when you switch. The profile API does not carry this field: it is not
+listed, a save request that sends it is refused with 400, and a save keeps the value already
+written for that profile and side, even when the endpoint or model changes.
+
 A profile can also carry a key for each upstream (`api_key` in `upstreams.json`) for
 upstreams that require one. personacore then sends `Authorization: Bearer <key>` with
 every request to that upstream (model list, chat, and token counting). The key belongs
@@ -804,7 +817,7 @@ header.
 
 ## Versioning and compatibility
 
-The current API version is `1.6`.
+The current API version is `1.7`.
 
 The API version is kept separately from the application version and is stated in the
 OpenAPI document (`info.version`) and in the `X-Personacore-Api-Version` header. The
@@ -840,6 +853,17 @@ segment (such as `v1`) into the paths under `/admin`.
   working; requests that reached personacore some other way (for example through another
   host name) may start to be refused within `1.x`. The `Host` / `Origin` checks were added
   this way.
+
+Changes in `1.7` (from `1.6`): a new key `sampling` on each side of an upstream profile
+(see [Upstream inference servers](#upstream-inference-servers)). A problem in the profile
+list (`ProblemView`) can name the `key` value `sampling` and the `reason` values
+`sampling_unusable` and `unknown_sampling_key`. The specification adds these values to the
+`enum` of both `ProblemView` and `ProfileInvalidDetail`, but a save does not report them:
+a save copies the value already written in the file, and a file whose `sampling` is not
+valid is refused with 422 `upstream_profiles_unreadable`, not `upstream_profile_invalid`.
+The profile list and the save request did not change: the list does not show the value,
+a save request that sends `sampling` is refused with 400, and a save keeps the value
+already written for that profile and side.
 
 Changes in `1.6` (from `1.5`): in `GET /admin/server` and the save response of
 `PUT /admin/server/port`, the fields `listening_port_requested`, `listening_port_shifted`

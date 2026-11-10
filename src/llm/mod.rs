@@ -66,8 +66,8 @@ pub use lmstudio::{
 };
 pub use request::{
     API_KEY_MAX_BYTES, ApiKey, ApiKeyError, ChatRequest, HostLookup, HostResolver,
-    KeyOverPlainHttp, ModelId, ModelIdError, SUB_LLM_TEMPERATURE, endpoint_for_log,
-    endpoint_has_userinfo,
+    KeyOverPlainHttp, ModelId, ModelIdError, REPEAT_PENALTY_MAX, REPEAT_PENALTY_MIN, RepeatPenalty,
+    SUB_LLM_TEMPERATURE, Sampling, SentSamplers, endpoint_for_log, endpoint_has_userinfo,
 };
 
 // メッセージの値型は `domain` に置いてある（`prompt` が reqwest を引き込まないため。

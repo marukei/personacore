@@ -1250,6 +1250,9 @@ impl App {
         // 走ったまま差し替えたとき、全員が次の往復から新しい上流へ行く。
         // **2つ作ると「本文は新しい上流、引き直しは古い上流」が書ける。**
         let faces = context::FaceClients::new(Arc::clone(&llm), Arc::clone(&sub_client));
+        // **送るサンプラの値を面ごとに言う**（ADR-0058 §決定3 / 作業単位 A-16）。差し替え口から読むので、
+        // 本文と裏方がそれぞれ実際に送る値になる（`sub` 面が無ければ裏方は本文の複製 —— 同じ値）。
+        context::report_samplers(&faces, "startup");
         let main_face = faces.face(crate::measured::ModelFace::Main).clone();
         let sub_face = faces.face(crate::measured::ModelFace::Sub).clone();
         let sub: Arc<dyn LlmClient> = Arc::new(sub_face.clone());

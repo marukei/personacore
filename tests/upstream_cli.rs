@@ -745,6 +745,72 @@ fn a_context_length_written_in_the_profile_reaches_the_executable() {
     );
 }
 
+/// **送るサンプラの行**（`server::context::SAMPLERS_LINE` の写し。綴りを変えるなら、そちらも）。
+const SAMPLERS_LINE: &str = "上流へ送るサンプラの値（面ごと）";
+
+/// **上流プロファイルの面に書いた `sampling` が実行ファイルへ届き、起動のログに面ごとの値として出る**
+/// （[ADR-0058](../docs/adr/0058-sampling-values-in-the-upstream-profile.md) §決定1・3 / 作業単位 A-16）。
+///
+/// # 何を守るか
+///
+/// **`main.rs` の `config_for` が `AppConfig::with_profile_sampling` を呼ぶこと** —— bin なので、
+/// 実行ファイルを起こさない限り観測できない（`tests/server_profile_sampling.rs` は `main` と同じ段を
+/// 自分で組むので、ここが外れても緑のまま）。
+///
+/// # 見るもの（どれも**同じ行の中**で）
+///
+/// | 面 | 書いた値 | 行の `repeat_penalty=` | 行の `overridden=` |
+/// |---|---|---|---|
+/// | 本文 | 1.05 | `1.05` | `["repeat_penalty"]` |
+/// | 裏方 | 1.25 | `1.25` | `["repeat_penalty"]` |
+///
+/// **値は既定の 1.1 とも互いとも違える。** 残りの4つ（`top_k=40` 等）が既定のままであることも、同じ行で見る。
+#[test]
+fn a_sampling_written_in_the_profile_reaches_the_executable() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
+    let bin_dir = fake_llama_dir(dir.path());
+    let profile = write_profile(
+        dir.path(),
+        &serde_json::json!({
+            "tuned": {
+                "main": { "endpoint": "http://127.0.0.1:47601", "model": "cli-tuned-main",
+                          "sampling": { "repeat_penalty": 1.05 } },
+                "sub": { "endpoint": "http://127.0.0.1:47602", "model": "cli-tuned-sub",
+                         "sampling": { "repeat_penalty": 1.25 } },
+            }
+        })
+        .to_string(),
+    );
+    let mut started = spawn(dir.path(), &bin_dir, Some(&profile), "0", "tuned");
+    let (_, lines) = started.listening_port_keeping_lines();
+    let lines: Vec<String> = lines.iter().map(|line| strip_ansi(line)).collect();
+
+    for (face, value) in [("main", "1.05"), ("sub", "1.25")] {
+        let line = lines
+            .iter()
+            .find(|line| {
+                line.contains(SAMPLERS_LINE) && has_field(line, &format!("upstream_face={face}"))
+            })
+            .unwrap_or_else(|| {
+                panic!("{face} の面の送るサンプラの行が無い:\n{}", lines.join("\n"))
+            });
+        for field in [
+            format!("repeat_penalty={value}"),
+            "top_k=40".to_owned(),
+            "top_p=0.95".to_owned(),
+            "min_p=0.05".to_owned(),
+            "presence_penalty=0".to_owned(),
+            r#"overridden=["repeat_penalty"]"#.to_owned(),
+            "occasion=\"startup\"".to_owned(),
+        ] {
+            assert!(
+                has_field(line, &field),
+                "{face} の面の行に {field} が無い（main の config_for が載せていない？）: {line}"
+            );
+        }
+    }
+}
+
 /// 本文の面の鍵（囮 / 作業単位 A-13b-1）。
 const CLI_MAIN_KEY: &str = "pc-cli-main-KEY-31a4c5e9";
 /// 裏方の面の鍵（囮）。**本文の鍵と別の綴り・別の末尾4文字。**
