@@ -49,15 +49,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use futures_util::future::Either;
+
 use personacore::domain::{DisplayName, Handle, Persona};
 use personacore::llm::{DEFAULT_ENDPOINT, DEFAULT_MAIN_MODEL, DEFAULT_SUB_MODEL};
 use personacore::server::{
-    App, AppConfig, BindAddr, ENV_LLM_ENDPOINT, ENV_MAIN_MODEL, ENV_SUB_LLM_ENDPOINT, ENV_SUB_MODEL,
+    App, AppConfig, BackgroundProbe, BindAddr, ENV_LLM_ENDPOINT, ENV_MAIN_MODEL,
+    ENV_SUB_LLM_ENDPOINT, ENV_SUB_MODEL,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Notify};
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
 
 mod common;
@@ -466,6 +469,11 @@ const SECOND_DISPLAY_NAME: &str = "翠";
 /// **同時に投げる本文の依頼の本数。**
 ///
 /// **上流はこの数がそろうまで、どちらの本文にも答えない**（[`CountingUpstream`]）。
+/// そろったら**1本目にだけ答え、2本目はテストが [`CountingUpstream::release_held_body`] を
+/// 呼ぶまで待たせる**（1本目の裏方が終わるのを待つため /
+/// `the_unset_extraction_client_shares_the_body_clients_connection_pool` の doc）。
+/// **待たせる側が1本だけなのは、この値が 2 だから**——増やすなら、待たせた本文どうしが
+/// また同時に返り、同じ取り合いに戻る。
 /// **時計で待たないこと**——`sleep` で重なりを作ると、機が重い回に重ならず、
 /// **「重なっていないから接続が増えない」を「共有できている」と読む**形になる
 /// （CLAUDE.md「緑のまま何も測らない形にしない」）。
@@ -505,7 +513,9 @@ struct Seen {
 ///
 /// * `GET /api/v0/models` — 与えられた綴りを並べて即答する。
 /// * `POST /v1/chat/completions` — **本文の依頼なら
-///   [`OVERLAPPING_BODY_TURNS`] 本そろうまで待ってから**答える（抽出は待たずに答える）。
+///   [`OVERLAPPING_BODY_TURNS`] 本そろうまで待ち、そろったら1本目にだけ答える。**
+///   **2本目は [`CountingUpstream::release_held_body`] まで待たせる**（どちらも上限つき）。
+///   抽出と提案は待たずに答える。
 /// * `POST /apply-template` — 404 で断る（封のための組み上げの口 / 作業単位 B-60b。数えない）。
 /// * `POST /tokenize` — 404 で断る（部品を数える口 / 作業単位 B-60d-1。最初の部品が1回来る。数えない）。
 /// * それ以外 — 404 を返して [`Seen::unexpected`] を数える。
@@ -516,6 +526,8 @@ struct Seen {
 struct CountingUpstream {
     addr: SocketAddr,
     seen: Arc<Seen>,
+    /// **待たせている2本目の本文を放す合図**（[`CountingUpstream::release_held_body`]）。
+    release: Arc<Notify>,
     accepting: tokio::task::JoinHandle<()>,
 }
 
@@ -529,8 +541,10 @@ impl CountingUpstream {
         let seen = Arc::new(Seen::default());
         let catalogue = models_wire(models);
         let barrier = Arc::new(Barrier::new(OVERLAPPING_BODY_TURNS));
+        let release = Arc::new(Notify::new());
         let accepting = tokio::spawn({
             let seen = Arc::clone(&seen);
+            let release = Arc::clone(&release);
             async move {
                 loop {
                     let Ok((socket, _)) = listener.accept().await else {
@@ -543,6 +557,7 @@ impl CountingUpstream {
                         Arc::clone(&seen),
                         catalogue.clone(),
                         Arc::clone(&barrier),
+                        Arc::clone(&release),
                     ));
                 }
             }
@@ -550,8 +565,17 @@ impl CountingUpstream {
         Self {
             addr,
             seen,
+            release,
             accepting,
         }
+    }
+
+    /// **待たせている2本目の本文に答えさせる。**
+    ///
+    /// `Notify::notify_one` は待ち手がまだいなくても許可を1つ残すので、
+    /// 2本目が待ちに入る前に呼んでも取りこぼさない。
+    fn release_held_body(&self) {
+        self.release.notify_one();
     }
 
     /// 設定に渡すベース URL。
@@ -605,6 +629,7 @@ async fn serve_connection(
     seen: Arc<Seen>,
     catalogue: String,
     barrier: Arc<Barrier>,
+    release: Arc<Notify>,
 ) {
     let mut buffered: Vec<u8> = Vec::new();
     let mut chunk = [0_u8; 4096];
@@ -653,8 +678,17 @@ async fn serve_connection(
                 seen.peak_body_in_flight.fetch_max(now, Ordering::SeqCst);
                 // **待つ側に上限を置く**（CLAUDE.md / 作業単位 G-4）。
                 // そろわなかったら答えてしまい、**赤は `peak_body_in_flight` で出す。**
-                let _ = tokio::time::timeout(WAIT_LIMIT, barrier.wait()).await;
+                let answer_now = tokio::time::timeout(WAIT_LIMIT, barrier.wait())
+                    .await
+                    .map_or(true, |waited| waited.is_leader());
                 seen.body_in_flight.fetch_sub(1, Ordering::SeqCst);
+                // **そろった後は1本目にだけ答え、2本目はテストの合図まで待たせる**
+                // （1本目の裏方を終わらせてから2本目を保存させる / marukei/personacore#42）。
+                // **ここにも上限を置く。** 合図が来なければ答えてしまい、
+                // 赤は待つ側（`wait_for_background`）が「時間切れ」で出す。
+                if !answer_now {
+                    let _ = tokio::time::timeout(WAIT_LIMIT, release.notified()).await;
+                }
             }
             ("200 OK", UPSTREAM_BODY.replace("PLACEHOLDER", &model))
         } else if request_line.contains(" /apply-template ") {
@@ -679,6 +713,54 @@ async fn serve_connection(
         if socket.write_all(wire.as_bytes()).await.is_err() || socket.flush().await.is_err() {
             return;
         }
+    }
+}
+
+/// **裏方が終わるまで待ち、その時点で届いた本数を判定する**（marukei/personacore#42）。
+///
+/// **呼ぶのは、その往復の HTTP 応答を読み切った後だけ。** 非ストリーミングの経路は
+/// 保存（＝裏方を走らせるか捨てるかの決定）を済ませてから応答を返すので、
+/// 読み切った時点で決定は済んでいる。**読み切る前に呼ぶと、裏方がまだ始まっていないのを
+/// 「空いている」と読む。**
+///
+/// 返す言い分は2つに分かれる:
+///
+/// | 言い分 | 状態 |
+/// |---|---|
+/// | **時間切れ** | [`WAIT_LIMIT`] まで待っても裏方が終わらなかった |
+/// | **届かなかった** | 裏方は終わったのに本数が足りない（送られなかった） |
+///
+/// **本数だけを時間で待つ形にしないこと。** それだと、送られない要求を
+/// 上限まで待ってから「本数が違う」とだけ言い、遅れと欠落の区別が付かない（以前の形）。
+async fn wait_for_background(
+    seen: &Seen,
+    background: &BackgroundProbe,
+    want: usize,
+    what: &str,
+) -> Result<(), String> {
+    let limit = Instant::now() + WAIT_LIMIT;
+    loop {
+        // **枠を先に見て、本数を後に読む。** 本数は上流が要求を受けた時点で数えるので、
+        // 空いていたのを見た後に読んだ本数は、その裏方が送った分を全部含む。
+        let idle = background.is_idle();
+        let arrived = seen.completions.load(Ordering::SeqCst);
+        if idle {
+            return if arrived >= want {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{what}: 届かなかった —— 裏方は終わったのに、届いた本数が足りない\
+                     （{arrived} / {want}。走っている間に来た往復の裏方は捨てられる / ADR-0021 §7）"
+                ))
+            };
+        }
+        if Instant::now() >= limit {
+            return Err(format!(
+                "{what}: 時間切れ —— {WAIT_LIMIT:?} 待っても裏方が終わらなかった\
+                 （届いた本数 {arrived} / {want}）"
+            ));
+        }
+        tokio::time::sleep(POLL_STEP).await;
     }
 }
 
@@ -715,6 +797,23 @@ async fn serve_connection(
 ///
 /// 同じ相手へ2本重ねると**セッションへの書き込みが取り合いになる**ので、
 /// 測っているものが接続の話でなくなる。**別々のキャラクターなら別々のセッション。**
+///
+/// # ⚠ 2本目の本文は、1本目の裏方が終わるまで返させない（marukei/personacore#42）
+///
+/// **裏方の枠は全キャラクターで1本だけで、走っている間に来た往復の裏方は捨てられる**
+/// （ADR-0021 §7 / `server::extract` の `MemoryExtractor::spawn`。提案の段にいれば横取りする）。
+/// 以前は2本の本文を同時に返していたので、**2本目の保存が1本目の抽出の最中に当たると、
+/// 2本目の抽出は `skipped=busy` で送られない**——本番の設計どおりの振る舞いで、
+/// 「本文2本と抽出2本が届く」はタイミングに頼った前提だった。
+/// 実測: 上流が抽出に答えるのを 1 ミリ秒遅らせるだけで、毎回 3 本で止まり、
+/// `skipped=busy` の行が1本出た（CI では同じことが機の遅さで起きていた）。
+///
+/// だから上流は**重なりを作った後、1本目にだけ答え**、テストは
+/// **1本目の抽出が届き、裏方が空いた**のを見てから2本目を放す（[`wait_for_background`]）。
+/// **重なり（`peak_body_in_flight`）も、接続の本数の主張も変わらない**——
+/// 重なっている間は本文側の2本の接続が両方塞がる（プールを分けた枝では、ここで3本目が開く）。
+/// 2本目を待たせている間に塞がっているのは1本で、1本目の抽出は空いた1本
+/// （分けた枝なら抽出側の起動時の1本）を使う。
 #[tokio::test]
 async fn the_unset_extraction_client_shares_the_body_clients_connection_pool() {
     let upstream = CountingUpstream::start(&[MAIN_MODEL, SUB_MODEL]).await;
@@ -740,6 +839,8 @@ async fn the_unset_extraction_client_shares_the_body_clients_connection_pool() {
     // **`bind_with_clients` ではない。** 未設定の枝を通る本番の入口はここだけ。
     let app = App::bind(&config).await.expect("待ち受けを開始できること");
     let addr = app.local_addr();
+    // **裏方の枠が空いたかを見る口**（`wait_for_background`）。`serve` が `app` を食う前に取る。
+    let background = app.background_probe();
 
     // ---- 起動時。**ここだけでは割れない**（1周目が「割れない」と書いた理由）。 ----
     assert_eq!(
@@ -774,32 +875,77 @@ async fn the_unset_extraction_client_shares_the_body_clients_connection_pool() {
         .await
     });
 
-    // ---- **本文を2本、同時に。** 上流は2本そろうまでどちらにも答えない。 ----
+    // ---- **本文を2本、同時に。** 上流は2本そろうまでどちらにも答えず、そろったら1本目にだけ答える。 ----
     let client = reqwest::Client::new();
     let endpoint = format!("http://{addr}/v1/chat/completions");
-    let (first, second) = tokio::join!(
-        client
+    let turn = |handle: &str| {
+        let request = client
             .post(&endpoint)
-            .json(&non_streaming_body(HANDLE, USER_MESSAGE))
-            .send(),
-        client
-            .post(&endpoint)
-            .json(&non_streaming_body(SECOND_HANDLE, USER_MESSAGE))
-            .send(),
+            .json(&non_streaming_body(handle, USER_MESSAGE));
+        tokio::spawn(async move {
+            let response = request.send().await.expect("サーバへ接続できること");
+            let status = response.status();
+            let _ = response.text().await.expect("本文を読めること");
+            status
+        })
+    };
+    let (first, second) = (turn(HANDLE), turn(SECOND_HANDLE));
+
+    // **先に返った1本（＝上流が答えた方）を読み切る。** これでその往復の裏方の決定は済んでいる
+    // （`wait_for_background` の doc）。**上限は `WAIT_LIMIT` の2倍**——重ならなかった回は、
+    // 上流がそろうのを `WAIT_LIMIT` まで待ってから答えるので、それより先に諦めない
+    // （赤はすぐ下の `peak_body_in_flight` で出す）。
+    let (answered, held) =
+        match tokio::time::timeout(WAIT_LIMIT * 2, futures_util::future::select(first, second))
+            .await
+            .expect("時間切れ —— 1本目の本文の応答が返らなかった")
+        {
+            Either::Left((status, held)) | Either::Right((status, held)) => (status, held),
+        };
+    let answered = answered.expect("往復のタスクが panic しないこと");
+    assert!(answered.is_success(), "{answered:?}");
+    // **重なったかは、ここで確かめる。** 上流が1本目に答えた時点で2本はそろっているので、
+    // 重なった回はもう 2 に確定している。重ならなかった回をここで止めないと、下の
+    // `wait_for_background` が「届かなかった（裏方が捨てた）」と、原因と別のことを言う。
+    assert_eq!(
+        upstream.seen.peak_body_in_flight.load(Ordering::SeqCst),
+        OVERLAPPING_BODY_TURNS,
+        "本文の2本が上流で重ならなかった（重ならないと、プールの共有と分割を割れない）"
     );
-    for response in [first, second] {
-        let response = response.expect("サーバへ接続できること");
-        assert!(response.status().is_success(), "{:?}", response.status());
-        let _ = response.text().await.expect("本文を読めること");
+
+    // **1本目の抽出が届き、1本目の裏方が終わるまで待つ**（本文2本＋抽出1本）。
+    // ここで2本目を放すと、2本目の保存が1本目の抽出の最中に当たり、2本目の抽出が捨てられうる
+    // （このテストの doc / marukei/personacore#42）。
+    if let Err(why) = wait_for_background(
+        &upstream.seen,
+        &background,
+        OVERLAPPING_BODY_TURNS + 1,
+        "1本目の往復の抽出",
+    )
+    .await
+    {
+        panic!("{why}");
     }
 
-    // **抽出まで届き切るのを待つ**（本文2本＋抽出2本）。**待つ側に上限を置く。**
+    // ---- **2本目の本文を放す。** 裏方の枠は空いているので、2本目の抽出は捨てられない。 ----
+    upstream.release_held_body();
+    let held = tokio::time::timeout(WAIT_LIMIT * 2, held)
+        .await
+        .expect("時間切れ —— 2本目の本文の応答が返らなかった")
+        .expect("往復のタスクが panic しないこと");
+    assert!(held.is_success(), "{held:?}");
+
+    // **抽出まで届き切り、裏方が終わるのを待つ**（本文2本＋抽出2本）。**待つ側に上限を置く。**
     let want_completions = OVERLAPPING_BODY_TURNS * 2;
-    let limit = Instant::now() + WAIT_LIMIT;
-    while upstream.seen.completions.load(Ordering::SeqCst) < want_completions
-        && Instant::now() < limit
+    if let Err(why) = wait_for_background(
+        &upstream.seen,
+        &background,
+        want_completions,
+        "2本目の往復の抽出",
+    )
+    .await
     {
-        tokio::time::sleep(POLL_STEP).await;
+        panic!("{why}");
     }
     // **「これ以上は開かない」と言い切る前の猶予**（`SETTLE` の doc）。
     tokio::time::sleep(SETTLE).await;
