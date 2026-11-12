@@ -161,7 +161,15 @@ const STABILITY_EXTENSION: &str = "x-personacore-stability";
 /// 応答の `enum` に値を足しただけなので小さい側（`1.7` と同じ扱い）。プロファイルの一覧と保存の依頼の形は変えていない。
 /// **振る舞いも変わった**: 本文の面にこの値を書いたプロファイルでは、本文の要求の `max_tokens` の天井（クライアントの
 /// `max_tokens` を切り下げる値）が 1024 から面の値になる。書かない面は今までどおり。
-pub const API_VERSION: &str = "1.8";
+///
+/// **`1.9`**（作業単位 D-21 / ADR-0060 §決定5）: 上流プロファイルの一覧の面（と保存の応答）に欄 `sampling`（書いた鍵だけの
+/// オブジェクトか `null`）と `response_tokens`（整数か `null`）が入り、保存の依頼の面に同じ名前の**任意の欄**が入った
+/// （省けば残す・`null` で消す・値で置き換える。`sampling` は丸ごと置き換え、`{}` は `null` と同じ）。**`1.7` / `1.8` の注記の
+/// 「保存の 422 には出ない」はここで変わった** —— 依頼が値を送れるので、保存の 422 `upstream_profile_invalid` が `key` に
+/// `sampling` / `response_tokens`、`reason` に `sampling_unusable` / `unknown_sampling_key` / `response_tokens_unusable` /
+/// `main_face_only` を返しうる（どの値も `1.7` / `1.8` で `enum` に入っている）。応答の欄の追加と、要求の任意の欄の
+/// 追加だけなので小さい側。**省いた依頼の意味（残す）は変えていない**（API `1.8` までの使い手の保存は、手で書いた値を消さない）。
+pub const API_VERSION: &str = "1.9";
 
 /// **ルータに届いた要求への全部の応答に付ける、API の版のヘッダの名前**
 /// （HTTP では大文字小文字を区別しない。仕様書の `headers` の鍵もこの綴り）。
@@ -2135,6 +2143,37 @@ mod tests {
         assert!(
             !required(request).contains(&"allow_key_over_plain_http"),
             "要求の allow_key_over_plain_http は省けること: {request}"
+        );
+        // **サンプラの値と返答の上限**（作業単位 D-21 / ADR-0060 §決定1・2）——応答は必ず載せて `null` になりうる。
+        // 要求は省けて（省略は「残す」）、`null` も送れる（「消す」）。`sampling` は書ける鍵だけのオブジェクト。
+        for field in ["sampling", "response_tokens"] {
+            assert!(
+                required(response).contains(&field),
+                "応答の {field}: {response}"
+            );
+            assert!(
+                admits_null(&response["properties"][field]),
+                "応答の {field} は null を許すこと（書いていない）: {response}"
+            );
+            assert!(
+                !required(request).contains(&field),
+                "要求の {field} は省けること: {request}"
+            );
+            assert!(
+                admits_null(&request["properties"][field]),
+                "要求の {field} は null を許すこと（消す）: {request}"
+            );
+        }
+        let sampling = &response["properties"]["sampling"];
+        assert_eq!(
+            (
+                sampling["additionalProperties"].clone(),
+                sampling["properties"]["repeat_penalty"]["minimum"].as_f64(),
+                sampling["properties"]["repeat_penalty"]["maximum"].as_f64(),
+                sampling["properties"]["reasoning_effort"]["enum"].clone(),
+            ),
+            (json!(false), Some(0.5), Some(2.0), json!(["none", "low"])),
+            "{sampling}"
         );
         assert_eq!(
             document["components"]["schemas"]["SaveRequest"]["properties"]["main"]["$ref"],

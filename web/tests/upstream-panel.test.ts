@@ -547,6 +547,8 @@ describe("上流プロファイルの見本（作業単位 F-4c）", () => {
             api_key_set: false,
             api_key_hint: null,
             allow_key_over_plain_http: false,
+            sampling: null,
+            response_tokens: null,
           },
           sub: null,
         },

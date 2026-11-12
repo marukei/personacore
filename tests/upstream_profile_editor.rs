@@ -29,6 +29,12 @@
 //! | `a_saved_key_is_kept_cleared_or_replaced_as_the_request_says` | 送らなかった鍵が消える・`null` で消えない・置き換わらない・応答に鍵が載る（A-13b-1） |
 //! | `keeping_a_key_never_borrows_another_profiles_or_faces_key` | 残す鍵を別の面・別の名前へ写す（A-13b-1） |
 //! | `an_unusable_key_is_refused_without_echoing_it` | 使えない鍵・平文で外へ流れる鍵が書かれる・理由が返らない・応答に鍵が載る（A-13b-1） |
+//! | `the_listing_carries_the_written_sampling_and_response_room_only_where_written` | 一覧の面が `sampling` / `response_tokens` を載せない・既定値で埋める・`{}` を `null` にしない・別の名前や面に出る（D-21 / ADR-0060 の腕6） |
+//! | `omitting_the_fields_keeps_what_was_written_including_an_empty_object` | 依頼が欄を省くと手で書いた値（と `{}`）が消える（D-21 / ADR-0060 の腕1） |
+//! | `null_removes_each_field_and_leaves_the_face_as_if_never_written` | `null` で消えない・消した面が書いていない面とバイト列で違う・片方の `null` がもう片方を消す（D-21 / ADR-0060 の腕2） |
+//! | `a_sampling_in_the_request_replaces_the_whole_object` | `sampling` を鍵ごとに合成する・面を取り違える・他の名前が動く（D-21 / ADR-0060 の腕3） |
+//! | `an_empty_sampling_object_removes_it_like_null` | `{}` をそのまま書く（D-21 / ADR-0060 の腕4） |
+//! | `each_unusable_value_is_refused_with_the_loaders_key_and_reason` | 使えない値が書かれる・400 になる・`key` / `reason` が読み込みと違う（窓との境界は `context_tokens`）（D-21 / ADR-0060 の腕5） |
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -306,10 +312,14 @@ fn windowed(mut face: Value, tokens: u64) -> Value {
 /// ADR-0056 §決定3）。**期待値の末尾4文字は、ここで鍵の綴りから切る**（実装の `hint` を使わない）。
 ///
 /// **承認（`allow_key_over_plain_http`）は書いていなければ `false` で載る**（作業単位 A-13b-3）。
+///
+/// **`sampling` と `response_tokens` は書いていなければ `null` で載る**（作業単位 D-21 / ADR-0060 §決定1）。
+/// **鍵を1つも持たない `sampling: {}` も `null`**（書いていない面と送る値が同じなので、見え方も揃える）。
 fn as_listed(written: &Value) -> Value {
     let mut listed = json!({
         "gguf": null, "args": null, "command": null, "context_tokens": null,
         "api_key_set": false, "api_key_hint": null, "allow_key_over_plain_http": false,
+        "sampling": null, "response_tokens": null,
     });
     for (key, value) in written.as_object().expect("面はオブジェクト") {
         if key == "api_key" {
@@ -317,6 +327,10 @@ fn as_listed(written: &Value) -> Value {
                 listed["api_key_set"] = json!(true);
                 listed["api_key_hint"] = json!(&raw[raw.len() - 4..]);
             }
+            continue;
+        }
+        if key == "sampling" && value.as_object().is_some_and(serde_json::Map::is_empty) {
+            listed[key] = Value::Null;
             continue;
         }
         listed[key] = value.clone();
@@ -1247,8 +1261,12 @@ async fn a_hand_written_approval_survives_a_save_from_the_screen() {
 /// | `fresh`（新しい名前） | —— | 書かれない（他の名前から拾わない） |
 ///
 /// **値を面ごとに違える**（面を取り違えて写す実装を赤にする）。**一覧は値を書いたファイルでも読める**
-/// （`sampling` は [`FACE_KEYS`] の鍵 —— 画面の形に写せないと言わない）。**依頼が `sampling` を送ると 400**
-/// （依頼の型は知らない欄を拒む —— 画面がこの欄を持つまでは送れない / ADR-0058 §決定6）。
+/// （`sampling` は [`FACE_KEYS`] の鍵 —— 画面の形に写せないと言わない）。
+///
+/// > **A-16 の間は「依頼が `sampling` を送ると 400」も見ていた**（依頼の型が欄を持たなかった）。
+/// > **作業単位 D-21（ADR-0060 §決定6）で依頼が欄を持ったので、その腕は ADR-0060 の腕3・腕5
+/// > （[`a_sampling_in_the_request_replaces_the_whole_object`] / [`each_unusable_value_is_refused_with_the_loaders_key_and_reason`]）
+/// > に置き換えた。** ここは「省いたら残す」（ADR-0060 の腕1）だけを、意味を変えずに見る（司令塔の決定）。
 ///
 /// [`FACE_KEYS`]: personacore::server::FACE_KEYS
 #[tokio::test]
@@ -1271,17 +1289,6 @@ async fn a_hand_written_sampling_survives_a_save_from_the_screen() {
         json!("tuned-main"),
         "前提: 値を書いたファイルが一覧に載ること: {listing}"
     );
-
-    // **依頼に `sampling` を載せると断る**（依頼の型は知らない欄を拒む）。ファイルは触らない。
-    let mut smuggled = face("http://127.0.0.1:47931", "tuned-main", None, None, None);
-    smuggled[SAMPLING] = json!({ "repeat_penalty": 1.9 });
-    let (status, refused) = save(
-        server.port,
-        "tuned",
-        &json!({ "revision": listing["revision"], "main": smuggled }),
-    )
-    .await;
-    assert_eq!(status, 400, "依頼の sampling を受け付けた: {refused}");
 
     // **本文はモデルだけ、裏方は宛先とモデルを直す**（`sampling` は送らない）。新しい名前も足す。
     let main = face("http://127.0.0.1:47931", "tuned-main-2", None, None, None);
@@ -1339,11 +1346,14 @@ async fn a_hand_written_sampling_survives_a_save_from_the_screen() {
 ///
 /// | 回 | 依頼 | 結果 |
 /// |---|---|---|
-/// | 1 | `response_tokens` を載せる | **400**（依頼の型は知らない欄を拒む）。ファイルは触らない |
 /// | 2 | 窓（`context_tokens`）を上限（3000）以下の 2048 にする | **422 `context_tokens_unusable`・鍵 `context_tokens`**（窓の検証が面の上限に追従する）。ファイルは触らない |
 /// | 3 | 宛先とモデルを直す（窓は 8192） | 200。**上限 3000 と `sampling.reasoning_effort` が残る** |
 ///
 /// **一覧は値を書いたファイルでも読める**（`response_tokens` は [`FACE_KEYS`] の鍵）。
+///
+/// > **A-18a の間は1回目に「`response_tokens` を載せると 400」も見ていた**（依頼の型が欄を持たなかった）。
+/// > **作業単位 D-21（ADR-0060 §決定6）でその腕は ADR-0060 の腕3・腕5 に置き換えた**（番号は元のまま残す）。
+/// > 「省いたら残す」（ADR-0060 の腕1）は意味を変えずに残す（司令塔の決定）。
 ///
 /// [`FACE_KEYS`]: personacore::server::FACE_KEYS
 #[tokio::test]
@@ -1363,20 +1373,6 @@ async fn a_hand_written_response_room_survives_a_save_from_the_screen() {
         profile_named(&listing, "thinking")["main"]["model"],
         json!("thinking-main"),
         "前提: 値を書いたファイルが一覧に載ること: {listing}"
-    );
-
-    // **1. 依頼に `response_tokens` を載せると断る。**
-    let mut smuggled = face("http://127.0.0.1:47951", "thinking-main", None, None, None);
-    smuggled["response_tokens"] = json!(4096);
-    let (status, refused) = save(
-        server.port,
-        "thinking",
-        &json!({ "revision": listing["revision"], "main": smuggled }),
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "依頼の response_tokens を受け付けた: {refused}"
     );
 
     // **2. 窓を上限以下へ縮める保存は、窓の欄で断る。**
@@ -1452,6 +1448,650 @@ async fn a_hand_written_response_room_survives_a_save_from_the_screen() {
         ),
         (&json!(3000), &json!({ "reasoning_effort": "low" })),
         "手で書いた上限か思考の量が消えた: {disk}"
+    );
+    server.stop().await;
+}
+
+// ----------------------------------------------------------------------
+// 依頼の `sampling` / `response_tokens`（作業単位 D-21 / ADR-0060 §決定1・2・§決定6 の腕1〜6）
+// ----------------------------------------------------------------------
+
+/// **D-21 の腕のフィクスチャ**（ADR-0060 §決定6）。**3件で、値は真ん中（`mid`）にだけ書く**（腕6 —— 端に置かない）。
+///
+/// **値は既定（1.1・1024・`"none"`）と違え、本文と裏方でも違える。** `omega` の本文は鍵を1つも持たない `{}`。
+/// `mid` の本文の窓は 8192（腕5 の `response_tokens` の境界が使う）。
+fn d21_profiles() -> Value {
+    json!({
+        "alpha": {
+            "main": { "endpoint": "http://127.0.0.1:47971", "model": "alpha-main" },
+            "sub":  { "endpoint": "http://127.0.0.1:47972", "model": "alpha-sub" }
+        },
+        "mid": {
+            "main": { "endpoint": "http://127.0.0.1:47973", "model": "mid-main", "context_tokens": 8192,
+                      "sampling": { "repeat_penalty": 1.05, "reasoning_effort": "low" },
+                      "response_tokens": 2000 },
+            "sub":  { "endpoint": "http://127.0.0.1:47974", "model": "mid-sub",
+                      "sampling": { "repeat_penalty": 1.25 } }
+        },
+        "omega": {
+            "main": { "endpoint": "http://127.0.0.1:47975", "model": "omega-main", "sampling": {} }
+        }
+    })
+}
+
+/// **`mid` の本文の依頼の面**（窓は書いてある 8192 のまま。`sampling` / `response_tokens` は省く＝残す）。
+fn mid_main() -> Value {
+    windowed(
+        face("http://127.0.0.1:47973", "mid-main", None, None, None),
+        8192,
+    )
+}
+
+/// **`mid` の裏方の依頼の面**（`sampling` は省く＝残す）。
+fn mid_sub() -> Value {
+    face("http://127.0.0.1:47974", "mid-sub", None, None, None)
+}
+
+/// **その面の依頼に欄を足す**（`extra` の鍵をそのまま載せる。`null` も載せる）。
+fn with_fields(mut face: Value, extra: &Value) -> Value {
+    for (key, value) in extra.as_object().expect("足す欄はオブジェクト") {
+        face[key] = value.clone();
+    }
+    face
+}
+
+/// **ファイルを JSON として読む。**
+fn disk_of(path: &Path) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(path).expect("読めること")).expect("JSON")
+}
+
+/// **その形のファイルを置いたサーバに1回だけ保存させ、保存の後のファイルのバイト列を返す**（腕2・腕4 の比べる側）。
+async fn bytes_after_one_save(
+    source: &Value,
+    name: &str,
+    main: &Value,
+    sub: Option<&Value>,
+) -> Vec<u8> {
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let path = write_by_hand(dir.path(), source);
+    let server = serve(dir.path(), |s| s.with_editable_profiles_file(path.clone())).await;
+    let listing = list(server.port).await;
+    let (status, saved) = save(
+        server.port,
+        name,
+        &json!({ "revision": listing["revision"], "main": main, "sub": sub }),
+    )
+    .await;
+    assert_eq!(status, 200, "{saved}");
+    let bytes = std::fs::read(&path).expect("読めること");
+    server.stop().await;
+    bytes
+}
+
+/// **腕6: 一覧の面は `sampling` と `response_tokens` を必ず載せ、書いた値を返す。書いていない面と `{}` の面は `null`**
+/// （ADR-0060 §決定1 / §決定6 の腕6）。
+///
+/// **3件のうち真ん中の1件だけに値を書く**（端に置かない）。**既定値で埋めない**（書いていない面は `null` で、
+/// 1.1 や 1024 を返さない）。欄が無い（省かれた）のと `null` は別のことなので、鍵が在ることも見る。
+#[tokio::test]
+async fn the_listing_carries_the_written_sampling_and_response_room_only_where_written() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let path = write_by_hand(dir.path(), &d21_profiles());
+    let server = serve(dir.path(), |s| s.with_editable_profiles_file(path.clone())).await;
+    let listing = list(server.port).await;
+    assert_eq!(listing["state"], "ok", "{listing}");
+
+    let faces = [
+        ("alpha", "main"),
+        ("alpha", "sub"),
+        ("mid", "main"),
+        ("mid", "sub"),
+        ("omega", "main"),
+    ];
+    for (name, face_label) in faces {
+        let listed = &profile_named(&listing, name)[face_label];
+        for key in ["sampling", "response_tokens"] {
+            assert!(
+                listed
+                    .as_object()
+                    .is_some_and(|face| face.contains_key(key)),
+                "{name} の {face_label} に {key} の欄が無い（null でも載せる）: {listing}"
+            );
+        }
+    }
+    let seen: Vec<(Value, Value)> = faces
+        .iter()
+        .map(|(name, face_label)| {
+            let listed = &profile_named(&listing, name)[face_label];
+            (
+                listed["sampling"].clone(),
+                listed["response_tokens"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (Value::Null, Value::Null),
+            (Value::Null, Value::Null),
+            (
+                json!({ "repeat_penalty": 1.05, "reasoning_effort": "low" }),
+                json!(2000)
+            ),
+            (json!({ "repeat_penalty": 1.25 }), Value::Null),
+            (Value::Null, Value::Null),
+        ],
+        "書いた値が書いた面にだけ出ない／既定値で埋めた／{{}} を null にしていない: {listing}"
+    );
+    // **面の全部の欄も、書いたファイルから組んだ形と一致する**（帰属を丸ごと）。
+    assert_eq!(
+        profile_named(&listing, "mid")["main"],
+        as_listed(&d21_profiles()["mid"]["main"]),
+        "{listing}"
+    );
+    server.stop().await;
+}
+
+/// **腕1: 依頼が欄を省くと、手で書いた `sampling` / `response_tokens` と `{}` が残る**（ADR-0060 §決定2 の表の1行目）。
+///
+/// **API 1.8 までの使い手のための規則**（欄を知らない使い手が保存しても、手で書いた値が知らせずに消えない）。
+/// 宛先とモデルを直した保存で見る（`endpoint` / `model` が変わっても落とさない —— ADR-0058 §決定6 のまま）。
+/// **`omega` の `{}` も残る**（省いたら書いてあるものをそのまま残す。`null` に直さない）。
+#[tokio::test]
+async fn omitting_the_fields_keeps_what_was_written_including_an_empty_object() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let path = write_by_hand(dir.path(), &d21_profiles());
+    let server = serve(dir.path(), |s| s.with_editable_profiles_file(path.clone())).await;
+    let listing = list(server.port).await;
+
+    let main = windowed(
+        face("http://127.0.0.1:47983", "mid-main-2", None, None, None),
+        8192,
+    );
+    let sub = face("http://127.0.0.1:47984", "mid-sub-2", None, None, None);
+    let (status, first) = save(
+        server.port,
+        "mid",
+        &json!({ "revision": listing["revision"], "main": main, "sub": sub }),
+    )
+    .await;
+    assert_eq!(status, 200, "{first}");
+    let omega = face("http://127.0.0.1:47985", "omega-main-2", None, None, None);
+    let (status, second) = save(
+        server.port,
+        "omega",
+        &json!({ "revision": first["revision"], "main": omega }),
+    )
+    .await;
+    assert_eq!(status, 200, "{second}");
+
+    let disk = disk_of(&path);
+    assert_eq!(
+        (
+            &disk["mid"]["main"]["model"],
+            &disk["mid"]["sub"]["endpoint"],
+            &disk["omega"]["main"]["model"],
+        ),
+        (
+            &json!("mid-main-2"),
+            &json!("http://127.0.0.1:47984"),
+            &json!("omega-main-2")
+        ),
+        "前提: 依頼どおりに保存されたこと: {disk}"
+    );
+    assert_eq!(
+        (
+            &disk["mid"]["main"]["sampling"],
+            &disk["mid"]["main"]["response_tokens"],
+            &disk["mid"]["sub"]["sampling"],
+            &disk["omega"]["main"]["sampling"],
+        ),
+        (
+            &json!({ "repeat_penalty": 1.05, "reasoning_effort": "low" }),
+            &json!(2000),
+            &json!({ "repeat_penalty": 1.25 }),
+            &json!({}),
+        ),
+        "省いた欄の値が消えた／面を取り違えた／{{}} を残していない: {disk}"
+    );
+    assert_eq!(
+        (
+            profile_named(&second, "mid")["main"]["response_tokens"].clone(),
+            profile_named(&second, "omega")["main"]["sampling"].clone(),
+        ),
+        (json!(2000), Value::Null),
+        "保存の応答が、残した値を返していない: {second}"
+    );
+    server.stop().await;
+}
+
+/// **腕2: `null` で消え、消した面は書いていない面と1バイトも違わない。片方だけ `null` にすると、もう片方が残る**
+/// （ADR-0060 §決定2 の表の2行目 / §決定6 の腕2）。
+///
+/// | 段 | いまのファイル | 依頼 | 見ること |
+/// |---|---|---|---|
+/// | 1 | `mid` に値あり（A）／値なし（B） | 両面とも `sampling: null`・本文の `response_tokens: null` | **A と B の保存の後のバイト列が一致する** |
+/// | 2 | `mid` に値あり | 本文の `sampling: null` だけ（`response_tokens` は省く） | **`response_tokens` 2000 が残る** |
+/// | 3 | `mid` に値あり | 本文の `response_tokens: null` だけ（`sampling` は省く） | **`sampling` が残る** |
+#[tokio::test]
+async fn null_removes_each_field_and_leaves_the_face_as_if_never_written() {
+    let cleared_main = with_fields(
+        mid_main(),
+        &json!({ "sampling": null, "response_tokens": null }),
+    );
+    let cleared_sub = with_fields(mid_sub(), &json!({ "sampling": null }));
+    let mut blank = d21_profiles();
+    for (face_label, key) in [
+        ("main", "sampling"),
+        ("main", "response_tokens"),
+        ("sub", "sampling"),
+    ] {
+        blank["mid"][face_label]
+            .as_object_mut()
+            .expect("面はオブジェクト")
+            .remove(key);
+    }
+    let written =
+        bytes_after_one_save(&d21_profiles(), "mid", &cleared_main, Some(&cleared_sub)).await;
+    let never = bytes_after_one_save(&blank, "mid", &cleared_main, Some(&cleared_sub)).await;
+    assert_eq!(
+        String::from_utf8_lossy(&written),
+        String::from_utf8_lossy(&never),
+        "null で消した面が、書いていない面と違うバイト列になった"
+    );
+    let written: Value = serde_json::from_slice(&written).expect("JSON");
+    assert_eq!(
+        (
+            written["mid"]["main"].get("sampling"),
+            written["mid"]["main"].get("response_tokens"),
+            written["mid"]["sub"].get("sampling"),
+        ),
+        (None, None, None),
+        "null で消えていない: {written}"
+    );
+
+    // **片方だけ `null`。もう片方は省く（残す）。**
+    for (extra, gone, kept, kept_value) in [
+        (
+            json!({ "sampling": null }),
+            "sampling",
+            "response_tokens",
+            json!(2000),
+        ),
+        (
+            json!({ "response_tokens": null }),
+            "response_tokens",
+            "sampling",
+            json!({ "repeat_penalty": 1.05, "reasoning_effort": "low" }),
+        ),
+    ] {
+        let bytes = bytes_after_one_save(
+            &d21_profiles(),
+            "mid",
+            &with_fields(mid_main(), &extra),
+            Some(&mid_sub()),
+        )
+        .await;
+        let disk: Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(
+            (disk["mid"]["main"].get(gone), disk["mid"]["main"].get(kept)),
+            (None, Some(&kept_value)),
+            "{extra}: null の欄が消えない／省いた欄が消えた: {disk}"
+        );
+        assert_eq!(
+            disk["mid"]["sub"]["sampling"],
+            json!({ "repeat_penalty": 1.25 }),
+            "{extra}: 裏方の値が動いた: {disk}"
+        );
+    }
+}
+
+/// **腕3: 値で丸ごと置き換わる**（ADR-0060 §決定2 の表の3行目 / §決定6 の腕3）。
+///
+/// **いまのファイル `{ repeat_penalty, reasoning_effort }` に依頼 `{ repeat_penalty }` を送ると、`reasoning_effort` が残らない**
+/// （鍵ごとに合成しない）。`response_tokens` も置き換わり、裏方の値は裏方の依頼の値になる。**他の名前は動かない。**
+/// 保存の応答（読み直した一覧）も、置き換えた値を返す。
+#[tokio::test]
+async fn a_sampling_in_the_request_replaces_the_whole_object() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let path = write_by_hand(dir.path(), &d21_profiles());
+    let before = disk_of(&path);
+    let server = serve(dir.path(), |s| s.with_editable_profiles_file(path.clone())).await;
+    let listing = list(server.port).await;
+    let main = with_fields(
+        mid_main(),
+        &json!({ "sampling": { "repeat_penalty": 0.9 }, "response_tokens": 3000 }),
+    );
+    let sub = with_fields(mid_sub(), &json!({ "sampling": { "repeat_penalty": 1.4 } }));
+    let (status, saved) = save(
+        server.port,
+        "mid",
+        &json!({ "revision": listing["revision"], "main": main, "sub": sub }),
+    )
+    .await;
+    assert_eq!(status, 200, "{saved}");
+
+    let disk = disk_of(&path);
+    assert_eq!(
+        (
+            &disk["mid"]["main"]["sampling"],
+            &disk["mid"]["main"]["response_tokens"],
+            &disk["mid"]["sub"]["sampling"],
+        ),
+        (
+            &json!({ "repeat_penalty": 0.9 }),
+            &json!(3000),
+            &json!({ "repeat_penalty": 1.4 }),
+        ),
+        "丸ごと置き換わっていない（鍵ごとに合成した／面を取り違えた）: {disk}"
+    );
+    assert_eq!(
+        (&disk["alpha"], &disk["omega"]),
+        (&before["alpha"], &before["omega"]),
+        "他の名前が動いた: {disk}"
+    );
+    assert_eq!(
+        profile_named(&saved, "mid")["main"],
+        as_listed(&main),
+        "{saved}"
+    );
+    assert_eq!(
+        profile_named(&saved, "mid")["sub"],
+        as_listed(&sub),
+        "{saved}"
+    );
+    server.stop().await;
+}
+
+/// **腕4: `sampling` を書いてある面に `{}` を送ると消え、`null` を送ったときとバイト列が一致する**
+/// （ADR-0060 §決定2 —— ファイルに `"sampling": {}` を書かない / §決定6 の腕4）。両面で見る。
+#[tokio::test]
+async fn an_empty_sampling_object_removes_it_like_null() {
+    let send = |value: Value| {
+        (
+            with_fields(mid_main(), &json!({ "sampling": value.clone() })),
+            with_fields(mid_sub(), &json!({ "sampling": value })),
+        )
+    };
+    let (empty_main, empty_sub) = send(json!({}));
+    let (null_main, null_sub) = send(Value::Null);
+    let empty = bytes_after_one_save(&d21_profiles(), "mid", &empty_main, Some(&empty_sub)).await;
+    let null = bytes_after_one_save(&d21_profiles(), "mid", &null_main, Some(&null_sub)).await;
+    assert_eq!(
+        String::from_utf8_lossy(&empty),
+        String::from_utf8_lossy(&null),
+        "{{}} と null の保存の後のバイト列が違う"
+    );
+    let disk: Value = serde_json::from_slice(&empty).expect("JSON");
+    assert_eq!(
+        (
+            disk["mid"]["main"].get("sampling"),
+            disk["mid"]["sub"].get("sampling"),
+            &disk["mid"]["main"]["response_tokens"],
+        ),
+        (None, None, &json!(2000)),
+        "{{}} で消えていない（か、省いた response_tokens が消えた）: {disk}"
+    );
+}
+
+/// **生の本文で保存を頼む**（JSON として読めない本文の腕）。
+async fn save_raw(port: u16, name: &str, body: &str) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .put(format!(
+            "http://127.0.0.1:{port}/admin/upstream/profiles/{name}"
+        ))
+        .header("content-type", "application/json")
+        .body(body.to_owned())
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+        .expect("管理 API へ繋がること");
+    let status = response.status().as_u16();
+    let text = response.text().await.expect("本文を読めること");
+    let json = serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("JSON として読めること: {err} / {text}"));
+    (status, json)
+}
+
+/// **腕5: 使えない値は、保存されずに（ファイルが1バイトも変わらずに）422 になり、`key` と `reason` は読み込みと同じ**
+/// （ADR-0060 §決定2 の表の6行 / §決定6 の腕5）。
+///
+/// **中身は型の付かない JSON で受けて、判定を読み込みに委ねる** —— 負の数・文字列・小数も 400 ではなく 422 で、
+/// どの欄の何が悪いかが返る。**`response_tokens` が同じ面の窓（8192）と等しい境界**も、窓の欄（`context_tokens`）で止まる。
+/// **対照**: 窓より1小さい 8191 は通る（境界を1つ内側へずらす実装を赤にする）。
+/// **400 のまま**なのは、本文が JSON として読めないときと、ほかの欄の形が違うとき（`context_tokens` の文字列）だけ。
+#[tokio::test]
+async fn each_unusable_value_is_refused_with_the_loaders_key_and_reason() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let path = write_by_hand(dir.path(), &d21_profiles());
+    let before = std::fs::read(&path).expect("読めること");
+    let server = serve(dir.path(), |s| s.with_editable_profiles_file(path.clone())).await;
+    let listing = list(server.port).await;
+
+    // （何を, 本文の面に足す欄, 裏方の面に足す欄, 面, key, reason）
+    let rows: [(&str, Value, Value, &str, &str, &str); 15] = [
+        (
+            "sampling が数",
+            json!({ "sampling": 5 }),
+            json!({}),
+            "main",
+            "sampling",
+            "sampling_unusable",
+        ),
+        (
+            "sampling が文字列",
+            json!({ "sampling": "low" }),
+            json!({}),
+            "main",
+            "sampling",
+            "sampling_unusable",
+        ),
+        (
+            "repeat_penalty が範囲の外",
+            json!({ "sampling": { "repeat_penalty": 2.5 } }),
+            json!({}),
+            "main",
+            "sampling",
+            "sampling_unusable",
+        ),
+        (
+            "repeat_penalty が文字列",
+            json!({ "sampling": { "repeat_penalty": "1.0" } }),
+            json!({}),
+            "main",
+            "sampling",
+            "sampling_unusable",
+        ),
+        (
+            "reasoning_effort の知らない値",
+            json!({ "sampling": { "reasoning_effort": "high" } }),
+            json!({}),
+            "main",
+            "sampling",
+            "sampling_unusable",
+        ),
+        (
+            "sampling の知らない鍵",
+            json!({ "sampling": { "top_k": 40 } }),
+            json!({}),
+            "main",
+            "sampling",
+            "unknown_sampling_key",
+        ),
+        (
+            "裏方の reasoning_effort",
+            json!({}),
+            json!({ "sampling": { "reasoning_effort": "low" } }),
+            "sub",
+            "sampling",
+            "main_face_only",
+        ),
+        (
+            "裏方の response_tokens",
+            json!({}),
+            json!({ "response_tokens": 1500 }),
+            "sub",
+            "response_tokens",
+            "main_face_only",
+        ),
+        (
+            "response_tokens が 0",
+            json!({ "response_tokens": 0 }),
+            json!({}),
+            "main",
+            "response_tokens",
+            "response_tokens_unusable",
+        ),
+        (
+            "response_tokens が小数",
+            json!({ "response_tokens": 1.5 }),
+            json!({}),
+            "main",
+            "response_tokens",
+            "response_tokens_unusable",
+        ),
+        (
+            "response_tokens が負",
+            json!({ "response_tokens": -1 }),
+            json!({}),
+            "main",
+            "response_tokens",
+            "response_tokens_unusable",
+        ),
+        (
+            "response_tokens が文字列",
+            json!({ "response_tokens": "2000" }),
+            json!({}),
+            "main",
+            "response_tokens",
+            "response_tokens_unusable",
+        ),
+        (
+            "response_tokens が 32 ビットの外",
+            json!({ "response_tokens": 4_294_967_296_u64 }),
+            json!({}),
+            "main",
+            "response_tokens",
+            "response_tokens_unusable",
+        ),
+        (
+            "response_tokens が窓と等しい",
+            json!({ "response_tokens": 8192 }),
+            json!({}),
+            "main",
+            "context_tokens",
+            "context_tokens_unusable",
+        ),
+        (
+            "response_tokens が窓より大きい",
+            json!({ "response_tokens": 9000 }),
+            json!({}),
+            "main",
+            "context_tokens",
+            "context_tokens_unusable",
+        ),
+    ];
+    for (what, main_extra, sub_extra, face_label, key, reason) in rows {
+        let body = json!({
+            "revision": listing["revision"],
+            "main": with_fields(mid_main(), &main_extra),
+            "sub": with_fields(mid_sub(), &sub_extra),
+        });
+        let (status, refused) = save(server.port, "mid", &body).await;
+        assert_eq!(status, 422, "{what}: 422 でない: {refused}");
+        assert_eq!(
+            (
+                &refused["error"]["code"],
+                &refused["error"]["face"],
+                &refused["error"]["key"],
+                &refused["error"]["reason"],
+            ),
+            (
+                &json!("upstream_profile_invalid"),
+                &json!(face_label),
+                &json!(key),
+                &json!(reason),
+            ),
+            "{what}: {refused}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("読めること"),
+            before,
+            "{what}: 断った保存でファイルが変わった"
+        );
+    }
+
+    // **400 のままの2つ**（本文が JSON として読めない・ほかの欄の形が違う）。ファイルは触らない。
+    let (status, refused) = save_raw(server.port, "mid", "{ not json").await;
+    assert_eq!(
+        (status, &refused["error"]["code"]),
+        (400, &json!("invalid_body")),
+        "{refused}"
+    );
+    let (status, refused) = save(
+        server.port,
+        "mid",
+        &json!({
+            "revision": listing["revision"],
+            "main": with_fields(mid_main(), &json!({ "context_tokens": "8192" })),
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, &refused["error"]["code"]),
+        (400, &json!("invalid_body")),
+        "{refused}"
+    );
+    assert_eq!(std::fs::read(&path).expect("読めること"), before);
+
+    // **対照**: 窓より1小さい上限は通る。
+    let (status, saved) = save(
+        server.port,
+        "mid",
+        &json!({
+            "revision": listing["revision"],
+            "main": with_fields(mid_main(), &json!({ "response_tokens": 8191 })),
+            "sub": mid_sub(),
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "窓より小さい上限を断った: {saved}");
+    assert_eq!(
+        disk_of(&path)["mid"]["main"]["response_tokens"],
+        json!(8191)
+    );
+    server.stop().await;
+}
+
+/// **桁の多い繰り返しの罰（17 桁以上の小数）を送っても、保存は書き換えた後に 500 にならない**（D-21 のレビュー F1）。
+///
+/// この依存の `serde_json` は `float_roundtrip` を有効にしていないので、数の読みは最も近い倍精度から 1 ULP ずれうる。
+/// **実測**（2026-11-13 / `<measurements>\d21-2026-11-13\PROGRESS.md`）: `1.8893261662489246058` を読むと
+/// `1.8893261662489247` と書かれ、それを読み直すと `1.889326166248925` になる —— 依頼の値と読み直した値が
+/// `Value` として違い、保存の後の読み直しの確認（`is_reflected_in`）が `upstream_profiles_verify_failed` で落ちていた。
+/// **画面は最短の綴りで送る**（JS の `JSON.stringify`）ので、この形を作るのは API の使い手。
+/// 照合は**意味で比べる**（数は 4 ULP 以内を同じとみなす）。
+#[tokio::test]
+async fn a_long_decimal_repeat_penalty_is_saved_without_a_verify_failure() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let path = write_by_hand(dir.path(), &d21_profiles());
+    let server = serve(dir.path(), |s| s.with_editable_profiles_file(path.clone())).await;
+    let listing = list(server.port).await;
+    let body = format!(
+        r#"{{ "revision": {}, "main": {{ "endpoint": "http://127.0.0.1:47973", "model": "mid-main",
+              "context_tokens": 8192, "sampling": {{ "repeat_penalty": 1.8893261662489246058 }} }},
+              "sub": {} }}"#,
+        listing["revision"],
+        mid_sub()
+    );
+    let (status, saved) = save_raw(server.port, "mid", &body).await;
+    assert_eq!(status, 200, "桁の多い繰り返しの罰の保存が通らない: {saved}");
+    let written = disk_of(&path)["mid"]["main"]["sampling"]["repeat_penalty"]
+        .as_f64()
+        .expect("数で書かれていること");
+    assert!(
+        (written - 1.889_326_166_248_924_6).abs() < 1e-14,
+        "書いた値が送った値から離れている: {written}"
     );
     server.stop().await;
 }

@@ -38,6 +38,8 @@ function connect(endpoint: string, model: string, key: { hint: string | null; ap
     api_key_set: key !== null,
     api_key_hint: key?.hint ?? null,
     allow_key_over_plain_http: key?.approved ?? false,
+    sampling: null,
+    response_tokens: null,
   };
 }
 

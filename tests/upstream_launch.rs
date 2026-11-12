@@ -1480,6 +1480,156 @@ async fn switching_restarts_only_the_face_whose_gguf_changed() {
     wait_until_gone(sub_port, "抽出の子").await;
 }
 
+/// **画面から書ける置き場所で、差し替えられる起動**（本番の `main` が既定の置き場所を渡すのと同じ）。
+fn serve_editable(config: AppConfig, plan: LaunchPlan, profiles: PathBuf) -> Serving {
+    let (shutdown, wait) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        App::run_with_upstreams(
+            &config,
+            Startup::new(plan).with_editable_profiles_file(profiles),
+            async move {
+                let _ = wait.await;
+            },
+        )
+        .await
+    });
+    Serving {
+        shutdown: Some(shutdown),
+        task: Some(task),
+    }
+}
+
+/// **ADR-0060 の腕9（起こす面）: 画面の口で値だけを書き直して同じ名前へ切り替え直しても、起こした子は起こし直さない。
+/// 書き直した値は、切り替えの後に送る値として言われる**（ADR-0060 §決定3 の最後の段 / 作業単位 D-21）。
+///
+/// 切り替えは名前ではなく面ごとの値（`switch.rs` の `Target`）を比べ、子は子の記述（gguf・宛先・引数・`command`・
+/// 担う面 —— `ProfileLaunch`）で比べる。**`sampling` / `response_tokens` は子の記述に入らない**ので、子は残したまま、
+/// 面のクライアントと予算の器だけを差し替える（`KeptChild`）。
+///
+/// | 主張 | 破れると |
+/// |---|---|
+/// | 切り替えの応答で、本文の面の起こした子の状態が丸ごと前のまま（`ready`・同じ名乗り） | 子を起こし直した（`loading` になり名乗りが消える） |
+/// | 子の起動の印が再び作られず、同じ子が答え続ける | 同上（止めて起こした） |
+/// | 切り替えの後の送る値の行が 0.8・`low`・2500 を言う | 書き直した値が送る値と予算に入っていない |
+///
+/// **値は既定（1.1・`none`・1024）と違える。** 本物の推論はしないので、送る値は切り替えのログ（`occasion=switch` の行）で見る
+/// （外の上流で本文の要求そのものを見る腕は `tests/server_profile_thinking.rs` の
+/// `arm_d21_9_a_saved_profile_reaches_the_body_after_switching_to_the_same_name`）。
+#[tokio::test]
+async fn a_saved_profile_switched_to_again_keeps_the_launched_child() {
+    let log = install_global_log(DEFAULT_LOG_FILTER);
+    let mark = log.mark();
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
+    fake_llama_on_path();
+    let gguf = fake_gguf(dir.path(), "planted-d21-local.gguf");
+    let marker = dir.path().join("d21-local-started");
+    let main_port = free_port();
+    let port = free_port();
+    let endpoint = format!("http://{LAUNCH_HOST}:{main_port}");
+    let args = serde_json::json!(["--pc-ctx", "16384", "--pc-touch", marker]);
+    let source = serde_json::json!({
+        "local": {
+            "main": {
+                "endpoint": endpoint,
+                "model": "planted-d21-model-id",
+                "gguf": gguf,
+                "args": args,
+                "sampling": { "repeat_penalty": 1.3 },
+            },
+        },
+    });
+    let profiles_path = write_profiles(dir.path(), &source);
+    let (profiles, _) = read(&source.to_string());
+    let (config, plan) = config_of(&profiles, "local", dir.path(), port);
+
+    let mut serving = serve_editable(config, plan, profiles_path);
+    let ready = wait_for_ready_as(port, "main", "planted-d21-local.gguf").await;
+    let launched = ready["main"]["launch"].clone();
+    std::fs::remove_file(&marker).expect("子の起動の印を消せること");
+
+    // **画面の口で値だけを書き直す**（宛先・モデル・gguf・引数は同じ）。
+    let client = reqwest::Client::new();
+    let listing: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{port}/admin/upstream/profiles"))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .expect("一覧を読めること")
+        .json()
+        .await
+        .expect("JSON として読めること");
+    let response = client
+        .put(format!(
+            "http://127.0.0.1:{port}/admin/upstream/profiles/local"
+        ))
+        .json(&serde_json::json!({
+            "revision": listing["revision"],
+            "main": {
+                "endpoint": endpoint,
+                "model": "planted-d21-model-id",
+                "gguf": gguf,
+                "args": args,
+                "sampling": { "repeat_penalty": 0.8, "reasoning_effort": "low" },
+                "response_tokens": 2500,
+            },
+        }))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .expect("保存を頼めること");
+    let status = response.status();
+    let text = response.text().await.expect("本文を読めること");
+    assert!(status.is_success(), "保存できること: {status}: {text}");
+
+    let (status, body) = switch_to(port, "local").await;
+    assert_eq!(status, 200, "切り替え直せること: {body}");
+    // **起こした子の状態は丸ごと切り替えの前のまま**（`ready` で、同じ名乗り）。起こし直すと `loading` になり、名乗りが消える。
+    assert_eq!(
+        (&body["main"]["launch"]["state"], &body["main"]["launch"]),
+        (&serde_json::json!("ready"), &launched),
+        "値だけを書き直した同名の切り替えで、子を起こし直した: {body}"
+    );
+    assert!(
+        models_named_at(LAUNCH_HOST, main_port)
+            .await
+            .contains("planted-d21-local.gguf"),
+        "同じ子が答えていない"
+    );
+    assert!(
+        !marker.exists(),
+        "子を起こし直している（起動の印がまた作られた）"
+    );
+
+    // **書き直した値が、切り替えの後に送る値として言われる**（同じ行の中で、値で読む）。
+    // ログはこのバイナリで1つなので、ほかの腕の切り替えの行も混ざる —— **この腕だけが書く 0.8 で引く**
+    // （ほかの腕は `sampling` を書かず、既定の 1.1 を言う）。
+    let output = log.contents_since(mark);
+    let switched: Vec<&str> = output
+        .lines()
+        .filter(|line| {
+            line.contains("上流へ送るサンプラの値（面ごと）")
+                && has_field(line, "upstream_face=main")
+                && has_field(line, "occasion=\"switch\"")
+                && has_field(line, "repeat_penalty=0.8")
+        })
+        .collect();
+    assert_eq!(
+        switched.len(),
+        1,
+        "切り替えの後の本文の面の行が、書き直した 0.8 を1回だけ言うこと: {switched:?}"
+    );
+    for field in ["reasoning_effort=low", "response_tokens=2500"] {
+        assert!(
+            has_field(switched[0], field),
+            "切り替えの後の送る値の行が {field} を言っていない: {}",
+            switched[0]
+        );
+    }
+
+    serving.stop().await;
+    wait_until_gone_at(LAUNCH_HOST, main_port, "起こした本文の子").await;
+}
+
 /// **本文と抽出の両方を受けられる外の上流**（`wiremock`）。名乗る綴りは `model` だけ。
 async fn external_upstream(model: &str) -> wiremock::MockServer {
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers};

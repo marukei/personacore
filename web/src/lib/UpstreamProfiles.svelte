@@ -13,7 +13,10 @@
    * # 面ごとに「起こす」「繋ぐ」を選ぶ（作業単位 D-19 / Issue origin#87）
    *
    * **一覧は面ごとに種類の印と要点を1行で言う**（起こす: gguf のファイル名 → 待ち受けのポート / 繋ぐ: 宛先）。
-   * **下書きは面ごとに種類を選ばせ、その種類の欄だけを出す**（`upstreamProfiles.ts` の `KIND_FIELDS`）。
+   * **その下に送る値の行を添える**（作業単位 D-21 / `upstreamProfiles.ts` の `FaceSummary.sent`）—— 本文の面は思考・返答の上限・
+   * 繰り返しの罰、裏方の面は繰り返しの罰。書いていなければ「書いていない」と言い、送る既定を別の印（「既定」）で添える。
+   * **下書きは面ごとに種類を選ばせ、その面とその種類の欄だけを出す**（`upstreamProfiles.ts` の `fieldsOf` —— `KIND_FIELDS` に、
+   * 本文の面のサンプリングの組（思考の2択）と返答の上限、両面の繰り返しの罰と裏方のサンプリングの組を足したもの）。
    * **種類を切り替えても、もう一方の種類の欄の値は下書きに残す**（戻せば元に戻る）が、
    * **保存で送るのは選んだ種類の欄だけ**（繋ぐにすると gguf・起動の引数・実行ファイルはファイルから消える）。
    * ファイルに種類の鍵は無い —— サーバは gguf を書いた面を起こす。
@@ -46,9 +49,11 @@
    *
    * # 保存の失敗をどの欄に出すか
    *
-   * * **詳細に畳んだ欄**（起こす面の起動の引数・実行ファイル・コンテキスト長）を名指した理由は、**その面の詳細を開いて**欄に出す。
-   * * **その面の種類に無い欄**（繋ぐ面の gguf・起動の引数・実行ファイル）を名指した理由は、**下書き全体に出す**
-   *   （`keepOnShownField`。出す先の無い欄に結びつけて、理由を消さない）。
+   * * **詳細に畳んだ欄**（起こす面の起動の引数・実行ファイル・コンテキスト長、両面の繰り返しの罰、裏方の面のサンプリングの組）を
+   *   名指した理由は、**その面の詳細を開いて**欄に出す（`fieldsOf` の `folded`）。
+   * * **その面に無い欄**（繋ぐ面の gguf・起動の引数・実行ファイル、裏方の面の `response_tokens`）を名指した理由は、**下書き全体に出す**
+   *   （`keepOnShownField` / `faceHasField`。出す先の無い欄に結びつけて、理由を消さない）。
+   * * **`key: "sampling"` の理由は、その面のサンプリングの組の見出しに出す**（`reason` だけでは思考と繰り返しの罰を区別できない）。
    *
    * # 鍵の欄と、保存の前の確認（作業単位 A-13b-3 / Issue origin#86 / ADR-0056 §決定3・5）
    *
@@ -87,15 +92,20 @@
   import {
     DEFAULT_COMMAND,
     KEY_INPUT_NOTE,
-    KIND_FIELDS,
     NAME_TAKEN_MESSAGE,
+    REPEAT_PENALTY_NOTE,
+    RESPONSE_TOKENS_NOTE,
+    SAMPLING_APPLY_NOTE,
     SAME_AS_MAIN_SUMMARY,
+    THINKING_LABEL,
+    THINKING_NOTE,
     answerKeyQuestion,
     buildSaveRequest,
     canEdit,
     clearKey,
     contextTokensFailure,
     describeSaveFailure,
+    detailsSummary,
     draftOfProfile,
     emptyProfileDraft,
     endpointV1Failure,
@@ -104,6 +114,7 @@
     faceLabel,
     failureOnScreen,
     fieldLabel,
+    fieldsOf,
     isProfilesView,
     joinedFlagFailure,
     keepKey,
@@ -118,15 +129,20 @@
     nextKeyQuestion,
     resetApproval,
     revokeApproval,
+    samplingFailure,
     subKeyLossNote,
     summaryLines,
-    type EditableFaceKey,
+    thinkingLabel,
+    thinkingRoomNote,
     type Face,
     type FaceKind,
+    type FieldKey,
     type KeyAnswer,
     type KeyQuestion,
     type ProfileDraft,
     type SaveFailure,
+    type TextFieldKey,
+    type Thinking,
   } from "./upstreamProfiles";
   import { approvalQuestionText, carryQuestionText, nameApprovalText, type QuestionText } from "./upstreamKey";
   import { tick } from "svelte";
@@ -146,6 +162,9 @@
 
   /** 種類を選ぶボタンの並び（絵の Edit のまま、起こす → 繋ぐ）。 */
   const FACE_KINDS: readonly FaceKind[] = ["launch", "connect"];
+
+  /** 思考の2択の並び（「切る」が既定 / 作業単位 D-21）。 */
+  const THINKING_CHOICES: readonly Thinking[] = ["none", "low"];
 
   let listing = $state<ProfilesView | null>(null);
   let loadError = $state<string | null>(null);
@@ -404,8 +423,13 @@
     forgetTypedKeys();
   }
 
-  function setField(face: Face, key: EditableFaceKey, value: string): void {
+  function setField(face: Face, key: TextFieldKey, value: string): void {
     draft[face][key] = value;
+  }
+
+  /** **思考を選ぶ**（本文の面だけ / 作業単位 D-21）。 */
+  function setThinking(choice: Thinking): void {
+    draft.main.reasoning_effort = choice;
   }
 
   /** **種類を選ぶ。** 下書きの値は動かさない（もう一方の種類の欄の値も残る）。 */
@@ -433,7 +457,7 @@
    */
   $effect(() => {
     const shown = shownFailure();
-    if (shown?.kind === "field" && KIND_FIELDS[draft.kind[shown.face]].folded.includes(shown.key)) {
+    if (shown?.kind === "field" && fieldsOf(shown.face, draft.kind[shown.face]).folded.includes(shown.key)) {
       detailsOpen[shown.face] = true;
     }
   });
@@ -507,6 +531,13 @@
       fail(window, kind);
       return;
     }
+    // **繰り返しの罰の範囲と、返答の上限（正の整数・同じ面に書いた窓より小さい）も、送らずにその欄で言う**
+    // （作業単位 D-21 / `samplingFailure` の doc）。便宜で、権威はサーバの 422。
+    const sampling = samplingFailure(draft);
+    if (sampling !== null) {
+      fail(sampling, kind);
+      return;
+    }
     // **末尾が /v1 の宛先も、送らずにその欄で言う**（作業単位 B-68 / `endpointV1Failure` の doc）——
     // 送ると、サーバは受け付けて …/v1/v1/… に送る。鍵の確認より先に止める（直せば通らない下書きに答えさせない）。
     const versioned = endpointV1Failure(draft);
@@ -577,7 +608,7 @@
   }
 
   /** その欄に結びつく理由（無ければ `null`）。 */
-  function fieldFailure(face: Face, key: EditableFaceKey): string | null {
+  function fieldFailure(face: Face, key: FieldKey): string | null {
     const shown = shownFailure();
     return shown?.kind === "field" && shown.face === face && shown.key === key ? shown.message : null;
   }
@@ -611,7 +642,7 @@
   const WINDOW_NOTE =
     "コンテキスト長は、上流がコンテキスト長を答えないとき（鍵で守られた中継など）だけ、上流で選んだ窓のトークン数を書きます。空にすると書かず、上流に聞きます。";
 
-  function notesOf(face: Face, kind: FaceKind, key: EditableFaceKey): string[] {
+  function notesOf(face: Face, kind: FaceKind, key: FieldKey): string[] {
     switch (key) {
       case "endpoint":
         // **起こす面の宛先はループバックだけ**（サーバの保存の検証 `endpoint_not_loopback` と同じ集合）。
@@ -638,6 +669,14 @@
           : [WINDOW_NOTE];
       case "api_key":
         return [KEY_INPUT_NOTE];
+      // **思考・返答の上限・繰り返しの罰**（作業単位 D-21 / ADR-0060 §決定3）。
+      // サンプリングの組は、本文の面では思考の2択の注記、両面とも「保存しただけでは効かない」案内を持つ。
+      case "sampling":
+        return face === "main" ? [THINKING_NOTE, SAMPLING_APPLY_NOTE] : [SAMPLING_APPLY_NOTE];
+      case "response_tokens":
+        return [RESPONSE_TOKENS_NOTE];
+      case "repeat_penalty":
+        return [REPEAT_PENALTY_NOTE];
       case "gguf":
       case "model":
         return [];
@@ -655,7 +694,66 @@
   void load();
 </script>
 
-{#snippet field(face: Face, key: EditableFaceKey)}
+<!--
+  **面の欄の1つ**（作業単位 D-21）。**サンプリングは組**（見出し・理由・思考の2択）で、ほかは見出しと入力の1組。
+-->
+{#snippet slot(face: Face, key: FieldKey)}
+  {#if key === "sampling"}
+    {@render samplingGroup(face)}
+  {:else}
+    {@render field(face, key)}
+  {/if}
+{/snippet}
+
+<!--
+  **サンプリングの組**（作業単位 D-21 / ADR-0060 §決定3）。**`key: "sampling"` の 422 はこの組の見出しに出す**
+  （`reason` だけでは思考と繰り返しの罰のどちらかを区別できない）。本文の面では思考の2択（「切る（既定）」「入れる（low）」）を持ち、
+  思考を入れて返答の上限が空か既定以下なら、数を出さずに注意を言う。繰り返しの罰の入力は別の欄（詳細に畳む）。
+-->
+{#snippet samplingGroup(face: Face)}
+  {@const id = `profile-${face}-sampling`}
+  {@const problem = fieldFailure(face, "sampling")}
+  {@const notes = notesOf(face, draft.kind[face], "sampling")}
+  {@const caution = face === "main" ? thinkingRoomNote(draft) : null}
+  <div
+    class="flex flex-col gap-1.5"
+    role="group"
+    aria-labelledby={`${id}-heading`}
+    aria-describedby={problem === null ? undefined : `${id}-error`}
+  >
+    <p id={`${id}-heading`} class="m-0 text-sm font-semibold">{fieldLabel(draft.kind[face], "sampling")}</p>
+    {#if problem !== null}
+      <p class="field-error m-0 text-warn" id={`${id}-error`}>{problem}</p>
+    {/if}
+    {#if face === "main"}
+      <p class="m-0 text-sm">{THINKING_LABEL}</p>
+      <!-- **押せるもので、`aria-pressed` で状態を名乗る**（種類を選ぶ組と同じ作り）。 -->
+      <div
+        role="group"
+        aria-label={THINKING_LABEL}
+        class="flex w-fit max-w-full flex-wrap overflow-hidden rounded-lg border border-rule-2"
+      >
+        {#each THINKING_CHOICES as choice (choice)}
+          <button
+            type="button"
+            class="min-h-11 rounded-none border-0 px-4.5 text-ink-2 aria-pressed:bg-ink aria-pressed:font-semibold aria-pressed:text-paper"
+            aria-pressed={draft.main.reasoning_effort === choice ? "true" : "false"}
+            disabled={saving}
+            onclick={() => setThinking(choice)}>{thinkingLabel(choice)}</button
+          >
+        {/each}
+      </div>
+      {#if caution !== null}
+        <p class="thinking-room m-0 text-sm text-warn">{caution}</p>
+      {/if}
+    {/if}
+    {#each notes as note, index (index)}
+      <p class="note m-0" id={`${id}-note-${index}`}>{note}</p>
+    {/each}
+  </div>
+{/snippet}
+
+{#snippet field(face: Face, key: TextFieldKey)}
   {@const id = `profile-${face}-${key}`}
   {@const problem = fieldFailure(face, key)}
   {@const notes = notesOf(face, draft.kind[face], key)}
@@ -704,12 +802,17 @@
       <!--
         **コンテキスト長も `type="text"`**（`inputmode` で数字の鍵盤だけを促す）。
         `type="number"` だと、読めない入力の値が空文字になり「書かない」として黙って送られる。
+        **返答の上限・繰り返しの罰も同じ**（作業単位 D-21。読めない入力は `samplingFailure` が送る前に言う）。
       -->
       <input
         {id}
         class="w-full font-mono"
         type="text"
-        inputmode={key === "context_tokens" ? "numeric" : undefined}
+        inputmode={key === "context_tokens" || key === "response_tokens"
+          ? "numeric"
+          : key === "repeat_penalty"
+            ? "decimal"
+            : undefined}
         value={draft[face][key]}
         aria-invalid={problem === null ? undefined : "true"}
         aria-describedby={describedBy}
@@ -807,6 +910,7 @@
 
 {#snippet faceFields(face: Face)}
   {@const kind = draft.kind[face]}
+  {@const fields = fieldsOf(face, kind)}
   <!-- **`min-w-0`** —— `fieldset` は既定で中身より縮まないので、狭い幅で横へはみ出す。 -->
   <fieldset class="card m-0 flex min-w-0 flex-col gap-4">
     <legend class="px-2 text-base font-bold">{faceLabel(face)}</legend>
@@ -832,15 +936,19 @@
     </div>
     <p class="note m-0">{KIND_NOTE}</p>
 
-    {#each KIND_FIELDS[kind].shown as key (key)}
-      {@render field(face, key)}
+    <!--
+      **欄は面と種類で決まる**（`fieldsOf` / 作業単位 D-21 —— 思考と返答の上限は本文の面だけ、繰り返しの罰は両面とも詳細）。
+      **繋ぐ面にも詳細ができた**（繰り返しの罰）。詳細の見出しは畳んだ欄の名前を並べる（`detailsSummary`）。
+    -->
+    {#each fields.shown as key (key)}
+      {@render slot(face, key)}
     {/each}
-    {#if KIND_FIELDS[kind].folded.length > 0}
+    {#if fields.folded.length > 0}
       <details bind:open={detailsOpen[face]}>
-        <summary class="cursor-pointer text-sm text-ink-2">詳細（起動の引数・実行ファイル・コンテキスト長）</summary>
+        <summary class="cursor-pointer text-sm text-ink-2">{detailsSummary(face, kind)}</summary>
         <div class="mt-3.5 flex flex-col gap-4">
-          {#each KIND_FIELDS[kind].folded as key (key)}
-            {@render field(face, key)}
+          {#each fields.folded as key (key)}
+            {@render slot(face, key)}
           {/each}
         </div>
       </details>
@@ -937,16 +1045,34 @@
               <div class="flex gap-3">
                 <dt class="w-14 shrink-0 text-muted">{line.label}</dt>
                 <dd class="m-0 min-w-0">
-                  {#if line.summary === null}
-                    <span class="text-muted">{SAME_AS_MAIN_SUMMARY}</span>
-                  {:else}
-                    <span
-                      class="inline-flex items-center rounded-full border border-rule-2 px-2 text-xs whitespace-nowrap text-ink-2"
-                      >{faceKindBadge(line.summary.kind)}</span
-                    >{" "}<span class="font-mono break-all">{line.summary.target}</span
-                    >{#each line.summary.extras as extra, extraIndex (extraIndex)}<span class="text-muted"
-                        >{" · "}{extra}</span
-                      >{/each}
+                  <span class="summary">
+                    {#if line.summary === null}
+                      <span class="text-muted">{SAME_AS_MAIN_SUMMARY}</span>
+                    {:else}
+                      <span
+                        class="inline-flex items-center rounded-full border border-rule-2 px-2 text-xs whitespace-nowrap text-ink-2"
+                        >{faceKindBadge(line.summary.kind)}</span
+                      >{" "}<span class="font-mono break-all">{line.summary.target}</span
+                      >{#each line.summary.extras as extra, extraIndex (extraIndex)}<span class="text-muted"
+                          >{" · "}{extra}</span
+                        >{/each}
+                    {/if}
+                  </span>
+                  <!--
+                    **送る値**（作業単位 D-21 / ADR-0060 §決定3）。書いた値はそのまま、書いていなければ「書いていない」と言い、
+                    送る既定を**別の印**（`.sent-default`）で添える —— 書いた値と同じ見え方にしない。
+                  -->
+                  {#if line.summary !== null && line.summary.sent.length > 0}
+                    <span class="sent block text-xs text-ink-2"
+                      >{#each line.summary.sent as value, valueIndex (valueIndex)}<span class="sent-value"
+                          >{valueIndex === 0 ? "" : " · "}<span class="sent-text"
+                            >{value.label}{" "}{value.written ?? "書いていない"}</span
+                          >{#if value.written === null}{" "}<span
+                              class="sent-default inline-flex items-center rounded-full border border-rule-2 px-1.5 text-muted"
+                              >既定 {value.fallback}</span
+                            >{/if}</span
+                        >{/each}</span
+                    >
                   {/if}
                 </dd>
               </div>
