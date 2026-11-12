@@ -104,11 +104,14 @@ fn memory_text(index: usize, bytes: usize) -> String {
     format!("{head}{}", "m".repeat(bytes - head.len()))
 }
 
-/// 送った本文（システムの1件目）に載った記憶の行の数。
+/// 送った本文（**末尾の利用者の発言**）に載った記憶の行の数。
+///
+/// A-15 から想起した記憶は system ではなく、最新の利用者の発言の前置きに載る（ADR-0061）。
+/// このファイルの発言（`ただいま` 等）は目印 `MEM` を含まない。
 fn memory_lines(contents: &[String]) -> usize {
     contents
-        .first()
-        .map_or(0, |system| system.matches(MEMORY_HEAD).count())
+        .last()
+        .map_or(0, |latest| latest.matches(MEMORY_HEAD).count())
 }
 
 /// LM Studio が未知の口に返す形を模した本文（04-environment.md「200 ＋ エラー本文」）。

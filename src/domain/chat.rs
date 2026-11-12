@@ -16,7 +16,8 @@ use super::message::Role;
 /// 両者の変換は下の `From` 実装だけに集める。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChatRole {
-    /// システムプロンプト（ペルソナ・性格・記憶）。
+    /// システムプロンプト（ペルソナ・性格など。想起した記憶は載せず、最新の利用者の発言の前置きに置く /
+    /// ADR-0061）。
     System,
     /// 利用者の発言。
     User,
