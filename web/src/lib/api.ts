@@ -1182,7 +1182,7 @@ export interface UpstreamReport {
  * # 向きが2つある
  *
  * **Rust 側は応答と依頼で別の型**（`WrittenFace` / `WrittenFaceRequest` / 作業単位 P-2a）。
- * 応答では**9つの欄が必ず載る**（書いていない鍵は `null`、書いていない承認は `false`）。依頼の形は [`WrittenFaceRequest`]。
+ * 応答では **11 の欄が必ず載る**（書いていない鍵は `null`、書いていない承認は `false`）。依頼の形は [`WrittenFaceRequest`]。
  *
  * **作業単位 A-13b-1 で、画面の側も2つに割った** —— 応答には鍵の値の代わりに
  * `api_key_set` / `api_key_hint` が載り、依頼にそれを送ると `deny_unknown_fields` で 400 になる。
@@ -1216,6 +1216,28 @@ export interface WrittenFace {
    * 書いていなければ `false`。**実際に送るかの判定ではない**（それは `UpstreamView.key_over_plain_http`）。
    */
   allow_key_over_plain_http: boolean;
+  /**
+   * **書いたサンプラの値**（`sampling` / ADR-0058 §決定1・ADR-0059 §決定1 / 作業単位 D-21）。**書いた鍵だけ。**
+   * `null` は「書いていない」（鍵を1つも持たない `{}` も `null` で届く）。**既定値（1.1・`"none"`）では埋まっていない。**
+   */
+  sampling: WrittenSampling | null;
+  /**
+   * **書いた本文の返答の上限**（`response_tokens` / ADR-0059 §決定2 / 作業単位 D-21）。`null` は「書いていない」（既定の 1024）。
+   * **本文の面だけが持ちうる。**
+   */
+  response_tokens: number | null;
+}
+
+/**
+ * **面に書いたサンプラの値**（`profile_editor.rs` の `sampling_schema` / 作業単位 D-21）。**書いた鍵だけを持つ。**
+ *
+ * 鍵の集合は読み込みの `SAMPLING_KEYS`（`upstreams.rs`）。**画面が書ける鍵と一致することは見張り番が見る**
+ * （`tests/upstream-profiles.test.ts` の「画面のサンプリングの欄の鍵は `SAMPLING_KEYS` と一致する」）。
+ * `reasoning_effort` は本文の面だけ（`"none"` / `"low"`）。
+ */
+export interface WrittenSampling {
+  repeat_penalty?: number;
+  reasoning_effort?: string;
 }
 
 /**
@@ -1230,6 +1252,11 @@ export interface WrittenFace {
  *
  * **`allow_key_over_plain_http` は、送らない（か `null`）＝今の規則**（宛先が文字列として同じときだけ残す）、
  * **`true`＝承認する、`false`＝外す**（作業単位 A-13b-3）。画面は承認を取った・外したときだけ送る。
+ *
+ * **⚠ `sampling` / `response_tokens` も省略と `null` の意味が違う**（作業単位 D-21 / ADR-0060 §決定2）——
+ * **書いていない＝いまの値を残す / `null`＝消す / 値＝置き換える**（`sampling` は丸ごと。`{}` は `null` と同じ）。
+ * **画面は2つとも必ず送る**（空の欄は `null`。省くと、空にしたつもりの値が知らせずに残る）。**ただし裏方の面の依頼には
+ * `response_tokens` を載せない**（本文の面だけの欄 / `upstreamProfiles.ts` の `buildSaveRequest`）。
  */
 export interface WrittenFaceRequest {
   endpoint: string;
@@ -1240,6 +1267,8 @@ export interface WrittenFaceRequest {
   context_tokens?: number | null;
   api_key?: string | null;
   allow_key_over_plain_http?: boolean | null;
+  sampling?: WrittenSampling | null;
+  response_tokens?: number | null;
 }
 
 /** **1つのプロファイルの、書いたままの値**（`profile_editor.rs` の `WrittenProfile`）。 */

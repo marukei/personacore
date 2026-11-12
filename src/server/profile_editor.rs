@@ -110,9 +110,9 @@ impl ProfilesLocation {
 ///
 /// # 応答と依頼で型を分けた（作業単位 P-2a / 司令塔の決定）
 ///
-/// **線の上の約束が向きで違う**——応答は9つの欄を必ず載せ（書いていない鍵は `null`。鍵は値の代わりに
+/// **線の上の約束が向きで違う**——応答は 11 の欄を必ず載せ（書いていない鍵は `null`。鍵は値の代わりに
 /// `api_key_set` / `api_key_hint`。承認は書いていなければ `false`）、依頼は `gguf` / `args` / `command` /
-/// `context_tokens` / `api_key` / `allow_key_over_plain_http` を省ける。
+/// `context_tokens` / `api_key` / `allow_key_over_plain_http` / `sampling` / `response_tokens` を省ける。
 /// 1つの型だと、仕様書（`utoipa`）は **どちらか片方の向きでしか正しく書けない。**
 /// 依頼を読んだら [`From`] で [`FaceEdit`]（この型と [`KeyChange`]）へ移す。
 ///
@@ -129,6 +129,12 @@ impl ProfilesLocation {
 /// **値は線に載せない**（`api_key` は `#[serde(skip)]`）。応答に載るのは
 /// **`api_key_set`（書いてあるか）と `api_key_hint`（末尾4文字。書いていない・短い鍵は `null`）だけ。**
 /// 3つは [`Self::with_api_key`] だけが揃えて決める（食い違った組を作らない）。
+///
+/// # サンプラの値と返答の上限（`sampling` / `response_tokens` / 作業単位 D-21 / ADR-0060 §決定1）
+///
+/// **欄は必ず載せ、書いていなければ `null`。** `sampling` は**書いた鍵だけ**のオブジェクトで、既定値（1.1・`"none"`）で
+/// 埋めない。**鍵を1つも持たない `{}` も `null` で返す**（書いていない面と送る値が同じなので、見え方も揃える）。
+/// A-16・A-18a の間は、画面がこの欄を持たなかったので写さなかった。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub(crate) struct WrittenFace {
     endpoint: String,
@@ -155,6 +161,105 @@ pub(crate) struct WrittenFace {
     ///
     /// **ファイルへ書くのは [`FaceEdit::to_value`] だけ**（[`Self::to_value`] はこの欄を書かない）。
     allow_key_over_plain_http: bool,
+    /// **書いたサンプラの値**（`sampling` / ADR-0058 §決定1・ADR-0059 §決定1 / 作業単位 D-21）。**書いた鍵だけ。**
+    /// 書いていない面と `{}` の面は `null`（既定の 1.1・`"none"` で埋めない）。
+    ///
+    /// **ファイルへ書くのは [`FaceEdit::to_value`] だけ**（[`Self::to_value`] はこの欄を書かない）。
+    #[schema(schema_with = sampling_schema, required = true)]
+    sampling: Option<Map<String, Value>>,
+    /// **書いた本文の返答の上限**（`response_tokens` / ADR-0059 §決定2 / 作業単位 D-21）。書いていなければ `null`
+    /// （既定の 1024 で埋めない）。**本文の面（`main`）だけが持ちうる。**
+    ///
+    /// **ファイルへ書くのは [`FaceEdit::to_value`] だけ**（[`Self::to_value`] はこの欄を書かない）。
+    #[schema(required = true)]
+    response_tokens: Option<u64>,
+}
+
+/// **書けるサンプラの値の形**（仕様書のためだけ / 応答の [`WrittenFace::sampling`] と依頼の
+/// [`WrittenFaceRequest::sampling`] / 作業単位 D-21）。**`null` か、書いた鍵だけのオブジェクト。**
+///
+/// **鍵・範囲・綴りは読み込みの定義から作る**（写さない）——鍵は `upstreams::SAMPLING_KEYS`、範囲は
+/// `llm::REPEAT_PENALTY_MIN` / `REPEAT_PENALTY_MAX`、思考の量の綴りは `llm::ReasoningEffort::ALL`。
+/// **依頼では、この形に合わない値も 400 にしない**（読み込みが 422 で理由を返す / ADR-0060 §決定2）。
+fn sampling_schema() -> Object {
+    use utoipa::openapi::schema::{AdditionalProperties, ObjectBuilder, SchemaType, Type};
+
+    let [repeat_penalty, reasoning_effort] = super::upstreams::SAMPLING_KEYS;
+    ObjectBuilder::new()
+        .schema_type(SchemaType::from_iter([Type::Object, Type::Null]))
+        .property(
+            repeat_penalty,
+            ObjectBuilder::new()
+                .schema_type(Type::Number)
+                .minimum(Some(crate::llm::REPEAT_PENALTY_MIN))
+                .maximum(Some(crate::llm::REPEAT_PENALTY_MAX)),
+        )
+        .property(
+            reasoning_effort,
+            openapi::closed_string(
+                crate::llm::ReasoningEffort::ALL.map(crate::llm::ReasoningEffort::as_str),
+            ),
+        )
+        .additional_properties(Some(AdditionalProperties::FreeForm(false)))
+        .build()
+}
+
+/// **値をどうするか**（依頼の面の `sampling` / `response_tokens` / 作業単位 D-21 / ADR-0060 §決定2）。
+///
+/// | 依頼 | 値 | 保存 |
+/// |---|---|---|
+/// | 書いていない | [`Self::Keep`] | **いまのファイルの、同じ名前・同じ面の値を残す**（API 1.8 までの使い手のため。手で書いた `{}` も残す） |
+/// | `null` | [`Self::Clear`] | 消す（ファイルに鍵を書かない） |
+/// | 値 | [`Self::Set`] | 置き換える（**`sampling` は丸ごと** —— 鍵ごとに合成しない） |
+///
+/// **`sampling` の `{}` は [`Self::Clear`] として読む**（[`sampling_change`]。書いていない面とバイト列を揃える）。
+/// **中身は型の付かない JSON のまま持つ** —— 使えるかは保存の前に読み込み（[`parse_profiles`]）が決め、
+/// 止めたら 422 と、読み込みと同じ `key` / `reason` を返す（負の数・文字列も 400 にしない）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum ValueChange {
+    /// 残す。
+    #[default]
+    Keep,
+    /// 消す。
+    Clear,
+    /// 置き換える。**検証前の値**（検証は [`parse_profiles`] が保存の前に行う）。
+    Set(Value),
+}
+
+impl ValueChange {
+    /// **保存の後にファイルへ書く値**（`None` は書かない）。`current` はいまのファイルの同じ名前・同じ面。
+    fn after_save(&self, current: Option<&Map<String, Value>>, key: &str) -> Option<Value> {
+        match self {
+            Self::Keep => current.and_then(|face| face.get(key)).cloned(),
+            Self::Clear => None,
+            Self::Set(value) => Some(value.clone()),
+        }
+    }
+}
+
+/// **省いた欄と `null` を分けて読む**（[`ValueChange`]）。省いたときは `#[serde(default)]` が
+/// [`ValueChange::Keep`] を入れ、ここは呼ばれない。**中身は何でも受ける**（判定は読み込みに委ねる）。
+fn value_change<'de, D>(deserializer: D) -> Result<ValueChange, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        None => ValueChange::Clear,
+        Some(value) => ValueChange::Set(value),
+    })
+}
+
+/// **`sampling` の欄を読む**（[`value_change`] ＋ **`{}` は `null` と同じ** / ADR-0060 §決定2）。
+///
+/// ファイルに `"sampling": {}` を書かない —— 書いていない面と送る値は同じなので、バイト列も揃える。
+fn sampling_change<'de, D>(deserializer: D) -> Result<ValueChange, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match value_change(deserializer)? {
+        ValueChange::Set(Value::Object(fields)) if fields.is_empty() => ValueChange::Clear,
+        change => change,
+    })
 }
 
 /// **鍵をどうするか**（依頼の面の `api_key` / ADR-0056 §決定3）。
@@ -204,7 +309,9 @@ where
 /// **`deny_unknown_fields`**（`/admin/` の全入口で共通の方針）。
 /// **省いた鍵と `null` は同じ意味**（書かない）。応答の形は [`WrittenFace`]。
 ///
-/// **⚠ `api_key` だけは省略と `null` の意味が違う**（[`KeyChange`] / ADR-0056 §決定3）。
+/// **⚠ 例外は3つ —— `api_key`・`sampling`・`response_tokens` は省略と `null` の意味が違う**
+/// （省けば残す・`null` で消す・値で置き換える）。`api_key` は [`KeyChange`]（ADR-0056 §決定3）、
+/// `sampling` と `response_tokens` は [`ValueChange`]（作業単位 D-21 / ADR-0060 §決定2）。
 ///
 /// # 承認（`allow_key_over_plain_http` / 作業単位 A-13b-3）
 ///
@@ -238,16 +345,31 @@ pub(super) struct WrittenFaceRequest {
     /// **承認**（書いていない・`null`＝今の規則 / `true`＝承認する / `false`＝外す）。
     #[serde(default)]
     allow_key_over_plain_http: Option<bool>,
+    /// **サンプラの値**（書いていない＝残す / `null`・`{}`＝消す / オブジェクト＝丸ごと置き換える / [`ValueChange`]）。
+    /// **中身は型の付かない JSON で受ける**（形が違っても 400 にせず、読み込みが 422 で理由を返す / ADR-0060 §決定2）。
+    #[serde(default, deserialize_with = "sampling_change")]
+    #[schema(schema_with = sampling_schema)]
+    sampling: ValueChange,
+    /// **本文の返答の上限**（書いていない＝残す / `null`＝消す / 整数＝置き換える / [`ValueChange`]）。
+    /// **本文の面（`main`）だけに書ける**（裏方の面に送ると 422 `main_face_only`）。中身は `sampling` と同じく型を付けずに受ける。
+    #[serde(default, deserialize_with = "value_change")]
+    #[schema(value_type = Option<u64>)]
+    response_tokens: ValueChange,
 }
 
-/// **読んだ依頼の1面ぶん**（鍵と承認以外の欄と、鍵と承認をどうするか）。
+/// **読んだ依頼の1面ぶん**（鍵と承認とサンプラの値と返答の上限以外の欄と、それらをどうするか）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FaceEdit {
-    /// 鍵と承認以外の欄（**`api_key` は常に `None`、`allow_key_over_plain_http` は常に `false`**）。
+    /// 鍵と承認とサンプラの値と返答の上限以外の欄（**`api_key` は常に `None`、`allow_key_over_plain_http` は常に `false`、
+    /// `sampling` と `response_tokens` は常に `None`**）。
     face: WrittenFace,
     key: KeyChange,
     /// **承認をどうするか**（`None` は今の規則 / [`WrittenFaceRequest`] の表）。
     approval: Option<bool>,
+    /// **サンプラの値をどうするか**（[`ValueChange`]）。
+    sampling: ValueChange,
+    /// **本文の返答の上限をどうするか**（[`ValueChange`]）。
+    response_tokens: ValueChange,
 }
 
 /// **読んだ依頼を、応答と同じ形へ移す**（欄はそのまま / 何も整えない）。
@@ -265,9 +387,13 @@ impl From<WrittenFaceRequest> for FaceEdit {
                 api_key_set: false,
                 api_key_hint: None,
                 allow_key_over_plain_http: false,
+                sampling: None,
+                response_tokens: None,
             },
             key: request.api_key,
             approval: request.allow_key_over_plain_http,
+            sampling: request.sampling,
+            response_tokens: request.response_tokens,
         }
     }
 }
@@ -355,9 +481,8 @@ fn written_face(value: &Value, face: &'static str) -> Result<WrittenFace, Unrepr
         });
     }
     // **承認（`allow_key_over_plain_http`）は書いた値を写す**（作業単位 A-13b-3。A-13b-2 の間は画面の形に欄が無く、写さなかった）。
-    // **サンプラの値（`sampling`）は写さない**（ADR-0058 §決定6 / 作業単位 A-16 —— 画面はこの欄を持たない。
-    // 形は読み込み（`parse_profiles`）が検証済み。保存は `FaceEdit::to_value` がいまのファイルから残す）。
-    // **本文の返答の上限（`response_tokens`）も同じ**（ADR-0059 §決定5 / 作業単位 A-18a）。
+    // **サンプラの値（`sampling`）と本文の返答の上限（`response_tokens`）も書いた値を写す**（作業単位 D-21 / ADR-0060 §決定1。
+    // A-16・A-18a の間は画面がこの欄を持たず、写さなかった）。
     let [
         endpoint,
         model,
@@ -367,8 +492,8 @@ fn written_face(value: &Value, face: &'static str) -> Result<WrittenFace, Unrepr
         context_tokens,
         api_key,
         allow_key_over_plain_http,
-        _sampling,
-        _response_tokens,
+        sampling,
+        response_tokens,
     ] = FACE_KEYS;
     let required = |key: &'static str| {
         object
@@ -415,6 +540,19 @@ fn written_face(value: &Value, face: &'static str) -> Result<WrittenFace, Unrepr
             .as_bool()
             .ok_or_else(|| at(allow_key_over_plain_http))?,
     };
+    // **検証済みならオブジェクト**（読み込みが `parse_sampling` で鍵と範囲を見ている）。**鍵を1つも持たない `{}` は
+    // `null` で返す**（ADR-0060 §決定1 —— 書いていない面と送る値が同じなので、見え方も揃える）。
+    let written_sampling = match object.get(sampling) {
+        None => None,
+        Some(Value::Object(fields)) if fields.is_empty() => None,
+        Some(Value::Object(fields)) => Some(fields.clone()),
+        Some(_) => return Err(at(sampling)),
+    };
+    // **検証済みなら必ず整数**（読み込みが 1 以上・`u32` に入る、を見ている）。
+    let room = match object.get(response_tokens) {
+        None => None,
+        Some(value) => Some(value.as_u64().ok_or_else(|| at(response_tokens))?),
+    };
     Ok(WrittenFace {
         endpoint: required(endpoint)?,
         model: required(model)?,
@@ -426,6 +564,8 @@ fn written_face(value: &Value, face: &'static str) -> Result<WrittenFace, Unrepr
         api_key_set: false,
         api_key_hint: None,
         allow_key_over_plain_http: approved,
+        sampling: written_sampling,
+        response_tokens: room,
     }
     .with_api_key(key))
 }
@@ -503,8 +643,8 @@ impl WrittenFace {
     /// （鍵を足さない / 見張り番は `a_face_without_context_tokens_is_written_byte_for_byte_as_before`）。
     /// **鍵（`api_key`）を書いていない面も、A-13b-1 の前と同じバイト列になる**（同じ理由で鍵を足さない）。
     /// **承認（`allow_key_over_plain_http`）はここでは書かない**（[`FaceEdit::to_value`] が依頼といまのファイルから決める）。
-    /// **サンプラの値（`sampling`）も書かない**（同じく [`FaceEdit::to_value`] がいまのファイルから残す / ADR-0058 §決定6）。
-    /// **本文の返答の上限（`response_tokens`）も書かない**（同じ / ADR-0059 §決定5）。
+    /// **サンプラの値（`sampling`）と本文の返答の上限（`response_tokens`）も書かない**（[`FaceEdit::to_value`] が
+    /// 依頼の [`ValueChange`] といまのファイルから決める / ADR-0060 §決定2）。
     fn to_value(&self) -> Value {
         let [
             endpoint,
@@ -569,22 +709,25 @@ impl FaceEdit {
     /// **正規化しない**（末尾の `/` が違うだけでも落とす —— 落とす側は送らないだけで、鍵は出ない）。
     /// 見張り番は `tests/upstream_profile_editor.rs` の `a_hand_written_approval_survives_a_save_from_the_screen`。
     ///
-    /// # サンプラの値（`sampling` / ADR-0058 §決定6 / 作業単位 A-16）
+    /// # サンプラの値と本文の返答の上限（`sampling` / `response_tokens` / ADR-0060 §決定2 / 作業単位 D-21）
     ///
-    /// **依頼はこの欄を持たない**（[`WrittenFaceRequest`] は知らない欄を拒む）ので、**いつも、いまのファイルの
-    /// 同じ名前・同じ面の値をそのまま残す。** 承認と違い、**`endpoint` や `model` が変わっても落とさない**
-    /// （値が合わなくなるかもしれないが、知らせずに消えるほうが、知らせずに残るより見つけにくい。残した値は
-    /// 起動と切り替えのログに出る）。**別の名前・別の面の値は見ない**（値はエンジン・モデル・量子化の組に付く）。
-    /// 見張り番は `tests/upstream_profile_editor.rs` の `a_hand_written_sampling_survives_a_save_from_the_screen`。
+    /// **依頼の [`ValueChange`] に従う** —— 省けば（[`ValueChange::Keep`]）**いまのファイルの同じ名前・同じ面の値を
+    /// そのまま残し**（手で書いた `{}` も残す）、`null` なら書かず、値なら置き換える（**`sampling` は丸ごと**。
+    /// `{}` は読んだ時点で `null` と同じになっている —— [`sampling_change`]）。
     ///
-    /// # 本文の返答の上限（`response_tokens` / ADR-0059 §決定5 / 作業単位 A-18a）
+    /// **省いたときの規則は A-16・A-18a のまま**（ADR-0058 §決定6 / ADR-0059 §決定5。当時は依頼がこの欄を持たず、
+    /// 常に「残す」だった）。承認と違い、**`endpoint` や `model` が変わっても落とさない**（値が合わなくなるかもしれないが、
+    /// 知らせずに消えるほうが、知らせずに残るより見つけにくい。残した値は起動と切り替えのログに出る）。
+    /// **別の名前・別の面の値は見ない**（値はエンジン・モデル・量子化の組に付く）。
     ///
-    /// **`sampling` とまったく同じ規則**（依頼はこの欄を持たない・いまのファイルの同じ名前・同じ面の値を残す・
-    /// `endpoint` や `model` が変わっても落とさない）。**窓（`context_tokens`）を画面から小さくして上限以下にした保存は、
-    /// 保存の前の検証が `context_tokens` の欄で断る**（窓の「余白以下は止める」がその面の上限に追従する）。
-    /// 見張り番は `tests/upstream_profile_editor.rs` の `a_hand_written_response_room_survives_a_save_from_the_screen`
-    /// と、このモジュールの単体の `a_written_response_room_is_kept_from_the_same_name_and_face`・
-    /// `a_face_without_response_tokens_is_written_byte_for_byte_as_before`。
+    /// **値が使えるかはここで見ない**（保存の前に [`parse_profiles`] が全体を検証し、読み込みと同じ `key` / `reason` の
+    /// 422 で断る）。**窓（`context_tokens`）を上限以下にした保存も、上限を窓以上にした保存も、`context_tokens` の欄で断る**
+    /// （窓の「余白以下は止める」がその面の上限に追従する）。
+    ///
+    /// 見張り番は `tests/upstream_profile_editor.rs` の ADR-0060 の腕1〜5（`omitting_the_fields_keeps_what_was_written_including_an_empty_object`
+    /// ほか）と、省いたときの `a_hand_written_sampling_survives_a_save_from_the_screen` /
+    /// `a_hand_written_response_room_survives_a_save_from_the_screen`、このモジュールの単体の
+    /// `a_written_response_room_is_kept_from_the_same_name_and_face`・`a_face_without_response_tokens_is_written_byte_for_byte_as_before`。
     fn to_value(&self, current: Option<&Map<String, Value>>) -> Value {
         let mut value = self.face.to_value();
         let key = match &self.key {
@@ -609,13 +752,12 @@ impl FaceEdit {
                 .and_then(|face| face.get(super::upstreams::ALLOW_KEY_OVER_PLAIN_HTTP_KEY))
                 .cloned(),
         };
-        let sampling = current
-            .and_then(|face| face.get(super::upstreams::SAMPLING_KEY))
-            .cloned();
-        // **本文の返答の上限も、サンプラの値と同じ規則で残す**（ADR-0059 §決定5 / 作業単位 A-18a）。
-        let response_tokens = current
-            .and_then(|face| face.get(super::upstreams::RESPONSE_TOKENS_KEY))
-            .cloned();
+        let sampling = self
+            .sampling
+            .after_save(current, super::upstreams::SAMPLING_KEY);
+        let response_tokens = self
+            .response_tokens
+            .after_save(current, super::upstreams::RESPONSE_TOKENS_KEY);
         if let Value::Object(object) = &mut value {
             if let Some(sampling) = sampling {
                 object.insert(super::upstreams::SAMPLING_KEY.to_owned(), sampling);
@@ -644,6 +786,8 @@ impl FaceEdit {
     /// 鍵と承認以外の欄は全部一致すること。鍵は [`KeyChange::Clear`] なら無いこと・[`KeyChange::Set`] なら
     /// その綴りであること。**[`KeyChange::Keep`] は見ない**（残した値はいまのファイルが決める）。
     /// 承認も同じ —— 送った値なら一致すること、**送らなければ見ない**（今の規則といまのファイルが決める）。
+    /// **サンプラの値と返答の上限も同じ**（作業単位 D-21）—— [`ValueChange::Clear`] なら無いこと、[`ValueChange::Set`] なら
+    /// その値であること、**[`ValueChange::Keep`] は見ない**（残した値はいまのファイルが決める）。
     fn is_reflected_in(&self, listed: &WrittenFace) -> bool {
         let key_matches = match &self.key {
             KeyChange::Keep => true,
@@ -657,11 +801,79 @@ impl FaceEdit {
         let approval_matches = self.approval.is_none_or(|wanted| {
             listed.allow_key_over_plain_http == (wanted && listed.api_key.is_some())
         });
+        // **一覧は `{}` を `null` で返す**が、`{}` は読んだ時点で [`ValueChange::Clear`] になっている（[`sampling_change`]）。
+        // **値は意味で比べる**（[`same_sampling`] —— 数は書いて読み直すと 1 ULP ずれうる / D-21 のレビュー F1）。
+        let sampling_matches = match &self.sampling {
+            ValueChange::Keep => true,
+            ValueChange::Clear => listed.sampling.is_none(),
+            ValueChange::Set(Value::Object(fields)) => listed
+                .sampling
+                .as_ref()
+                .is_some_and(|written| same_sampling(fields, written)),
+            ValueChange::Set(_) => false,
+        };
+        let response_matches = match &self.response_tokens {
+            ValueChange::Keep => true,
+            ValueChange::Clear => listed.response_tokens.is_none(),
+            ValueChange::Set(value) => {
+                value.as_u64().is_some() && listed.response_tokens == value.as_u64()
+            }
+        };
         let others = WrittenFace {
             allow_key_over_plain_http: false,
+            sampling: None,
+            response_tokens: None,
             ..listed.clone().with_api_key(None)
         };
-        key_matches && approval_matches && others == self.face
+        key_matches
+            && approval_matches
+            && sampling_matches
+            && response_matches
+            && others == self.face
+    }
+}
+
+/// **数を同じとみなす隔たり**（ULP。[`same_sampling`]）。読み直しのずれは実測で 1 ULP —— 余裕を見て 4。
+const SAME_NUMBER_ULPS: u64 = 4;
+
+/// **送ったサンプラの値と、書いて読み直した値が同じ意味か**（作業単位 D-21 のレビュー F1）。
+///
+/// # なぜ `Value` の等しさで比べないのか（**実測** / 2026-11-13）
+///
+/// この依存の `serde_json` は `float_roundtrip` を有効にしていないので、**数の読みは最も近い倍精度から 1 ULP ずれうる。**
+/// 17 桁以上の小数（`1.8893261662489246058`）を読むと `1.8893261662489247` と書かれ、それを読み直すと
+/// `1.889326166248925` になる —— `Value` で比べると、**ファイルを書き換えた後に** 500 `upstream_profiles_verify_failed` を返していた
+/// （見張り番は `tests/upstream_profile_editor.rs` の `a_long_decimal_repeat_penalty_is_saved_without_a_verify_failure`）。
+/// 画面が送る最短の綴りでは、乱択 2,000 万件で崩れなかった（崩れるのは API の使い手が桁の多い綴りを送ったとき）。
+///
+/// **`float_roundtrip` を有効にする形は採らなかった** —— アプリの全部の JSON の数の読みが変わる依存の変更で、
+/// この照合のためだけに入れる理由にならない（照合を意味の比較にすれば、ここで閉じる）。
+///
+/// **鍵の集合が同じで、数どうしは [`SAME_NUMBER_ULPS`] 以内、ほかは値が同じ**こと。
+fn same_sampling(sent: &Map<String, Value>, written: &Map<String, Value>) -> bool {
+    sent.len() == written.len()
+        && sent.iter().all(|(key, value)| {
+            written
+                .get(key)
+                .is_some_and(|other| same_meaning(value, other))
+        })
+}
+
+/// **2つの値が同じ意味か**（数は [`SAME_NUMBER_ULPS`] 以内。ほかは等しさ）。
+fn same_meaning(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => match (left.as_f64(), right.as_f64()) {
+            (Some(left), Some(right)) => {
+                // **符号の違う2つは、ビット列の隔たりが 2^63 前後になるので、ここでは同じにならない**
+                // （`0.0` と `-0.0` は上の `==` で同じ）。
+                left == right
+                    || (left.is_finite()
+                        && right.is_finite()
+                        && left.to_bits().abs_diff(right.to_bits()) <= SAME_NUMBER_ULPS)
+            }
+            _ => left == right,
+        },
+        _ => left == right,
     }
 }
 
@@ -1463,20 +1675,23 @@ pub(super) async fn list_profiles(State(state): State<AppState>) -> Json<Profile
 /// `PUT /admin/upstream/profiles/{name}` — **1つのプロファイルを足す・直す**（ADR-0042 §決定8）。
 ///
 /// **本文**: `{ "revision": <GET の revision | null>, "main": 面, "sub": 面 | null }`
-/// （面は `{ "endpoint", "model", "gguf"?, "args"?, "command"?, "context_tokens"?, "api_key"?, "allow_key_over_plain_http"? }`。
+/// （面は `{ "endpoint", "model", "gguf"?, "args"?, "command"?, "context_tokens"?, "api_key"?, "allow_key_over_plain_http"?,
+/// "sampling"?, "response_tokens"? }`。
 /// **省いた `sub` は「無い」**。**省いた `api_key` は「いまの鍵を残す」、`null` は「消す」**（[`KeyChange`]）。
-/// **省いた（か `null` の）`allow_key_over_plain_http` は今の規則、`true` は承認する、`false` は外す**（[`WrittenFaceRequest`]））。
+/// **省いた（か `null` の）`allow_key_over_plain_http` は今の規則、`true` は承認する、`false` は外す**（[`WrittenFaceRequest`]）。
+/// **省いた `sampling` / `response_tokens` は「いまの値を残す」、`null`（`sampling` は `{}` も）は「消す」、値は「置き換える」**
+/// （[`ValueChange`] / 作業単位 D-21）。**中身の形が違っても 400 にしない**（下の 422 `upstream_profile_invalid`））。
 /// **返すのは `GET /admin/upstream/profiles` と同じ形**（保存した直後に読み直したもの）。
 ///
 /// | 応答 | いつ |
 /// |---|---|
 /// | 200 | 保存した |
-/// | 400 `invalid_body` | 本文が読めない・知らない欄 |
+/// | 400 `invalid_body` | 本文が読めない・知らない欄・`sampling` / `response_tokens` 以外の欄の形が違う |
 /// | 400 `upstream_profile_name_invalid` | `--upstream` で選べない名前 |
 /// | 409 `upstream_profiles_read_only` | 読むだけの置き場所（`PERSONACORE_UPSTREAMS`）／置き場所が無い |
 /// | 409 `upstream_profiles_changed` | 読んだ後に書き換えられていた（`revision` が違う） |
 /// | 422 `upstream_profiles_unreadable` | いまのファイルが読めない・検証に通らない（手で直す） |
-/// | 422 `upstream_profile_invalid` | 直した後が検証に通らない（`reason` / `reason_message` / `face` / `key`） |
+/// | 422 `upstream_profile_invalid` | 直した後が検証に通らない（`reason` / `reason_message` / `face` / `key`。`sampling` / `response_tokens` の値は読み込みと同じ `key` / `reason` —— 上限が窓以上なら `key` は `context_tokens`） |
 /// | 500 `upstream_profiles_write_failed` | 書けなかった（**元のファイルは残る**） |
 /// | 500 `upstream_profiles_verify_failed` | 書いた後に読み直すと違った（**ファイルは書き換わっている**。改名の直後に別の書き手が書いたとき等） |
 ///
@@ -1522,6 +1737,8 @@ mod tests {
             api_key_set: false,
             api_key_hint: None,
             allow_key_over_plain_http: false,
+            sampling: None,
+            response_tokens: None,
         }
     }
 
@@ -1549,6 +1766,8 @@ mod tests {
             api_key_set: false,
             api_key_hint: None,
             allow_key_over_plain_http: false,
+            sampling: None,
+            response_tokens: None,
         }
     }
 
@@ -1959,6 +2178,8 @@ mod tests {
             face,
             key: KeyChange::Keep,
             approval: None,
+            sampling: ValueChange::Keep,
+            response_tokens: ValueChange::Keep,
         };
         ProfileEdit {
             main: keep(main),
@@ -2067,6 +2288,8 @@ mod tests {
             face,
             key,
             approval,
+            sampling: ValueChange::Keep,
+            response_tokens: ValueChange::Keep,
         };
         let far = ProfileEdit {
             main: approving(
@@ -2120,6 +2343,8 @@ mod tests {
             face: face("http://192.0.2.44:47914", "reread"),
             key: KeyChange::Keep,
             approval: Some(true),
+            sampling: ValueChange::Keep,
+            response_tokens: ValueChange::Keep,
         };
         let listed = |approved: bool, key: Option<ApiKey>| WrittenFace {
             allow_key_over_plain_http: approved,
@@ -2140,6 +2365,129 @@ mod tests {
             ..sent
         };
         assert!(unsent.is_reflected_in(&listed(false, None)));
+    }
+
+    /// **依頼の `sampling` / `response_tokens` は三値で読み、中身は型を付けずに受ける**（作業単位 D-21 / ADR-0060 §決定2）。
+    ///
+    /// | 依頼 | 読んだ値 |
+    /// |---|---|
+    /// | 省く | [`ValueChange::Keep`] |
+    /// | `null` | [`ValueChange::Clear`] |
+    /// | **`sampling: {}`** | **[`ValueChange::Clear`]**（`null` と同じ —— ファイルに `{}` を書かない） |
+    /// | 値（形が違っても） | [`ValueChange::Set`]（**400 にしない** —— 判定は読み込みに委ねる） |
+    #[test]
+    fn the_request_reads_sampling_and_response_room_as_three_way_changes() {
+        let read = |extra: &str| -> WrittenFaceRequest {
+            let body = format!(r#"{{ "endpoint": "http://127.0.0.1:1", "model": "m"{extra} }}"#);
+            serde_json::from_str(&body).unwrap_or_else(|err| panic!("読めること: {err} / {body}"))
+        };
+        let omitted = read("");
+        assert_eq!(
+            (omitted.sampling, omitted.response_tokens),
+            (ValueChange::Keep, ValueChange::Keep)
+        );
+        let nulled = read(r#", "sampling": null, "response_tokens": null"#);
+        assert_eq!(
+            (nulled.sampling, nulled.response_tokens),
+            (ValueChange::Clear, ValueChange::Clear)
+        );
+        assert_eq!(read(r#", "sampling": {}"#).sampling, ValueChange::Clear);
+        let odd = read(r#", "sampling": "low", "response_tokens": "2000""#);
+        assert_eq!(
+            (odd.sampling, odd.response_tokens),
+            (
+                ValueChange::Set(Value::from("low")),
+                ValueChange::Set(Value::from("2000"))
+            )
+        );
+        assert_eq!(
+            read(r#", "sampling": { "repeat_penalty": 0.9 }"#).sampling,
+            ValueChange::Set(serde_json::json!({ "repeat_penalty": 0.9 }))
+        );
+    }
+
+    /// **保存の後の読み直しの確認は、送った `sampling` / `response_tokens` だけを照合する**（作業単位 D-21）。
+    ///
+    /// **省いた欄（[`ValueChange::Keep`]）は見ない**（残した値はいまのファイルが決める）。**`sampling` は丸ごと一致すること**
+    /// （送らなかった鍵が残っていれば、反映されていない）。
+    #[test]
+    fn the_reread_check_compares_only_the_sampling_and_room_that_were_sent() {
+        let listed = |sampling: Option<Value>, room: Option<u64>| WrittenFace {
+            sampling: sampling.and_then(|value| value.as_object().cloned()),
+            response_tokens: room,
+            ..face("http://127.0.0.1:47921", "reread")
+        };
+        let sent = |sampling: ValueChange, room: ValueChange| FaceEdit {
+            face: face("http://127.0.0.1:47921", "reread"),
+            key: KeyChange::Keep,
+            approval: None,
+            sampling,
+            response_tokens: room,
+        };
+        let written = listed(
+            Some(serde_json::json!({ "repeat_penalty": 1.05, "reasoning_effort": "low" })),
+            Some(2000),
+        );
+        assert!(
+            sent(ValueChange::Keep, ValueChange::Keep).is_reflected_in(&written),
+            "省いた欄を照合した"
+        );
+        assert!(!sent(ValueChange::Clear, ValueChange::Keep).is_reflected_in(&written));
+        assert!(!sent(ValueChange::Keep, ValueChange::Clear).is_reflected_in(&written));
+        assert!(sent(ValueChange::Clear, ValueChange::Clear).is_reflected_in(&listed(None, None)));
+        let replaced = ValueChange::Set(serde_json::json!({ "repeat_penalty": 0.9 }));
+        assert!(
+            sent(replaced.clone(), ValueChange::Set(Value::from(3000))).is_reflected_in(&listed(
+                Some(serde_json::json!({ "repeat_penalty": 0.9 })),
+                Some(3000)
+            ))
+        );
+        assert!(
+            !sent(replaced, ValueChange::Keep).is_reflected_in(&listed(
+                Some(serde_json::json!({ "repeat_penalty": 0.9, "reasoning_effort": "low" })),
+                None
+            )),
+            "送らなかった鍵が残っているのに、反映されたと読んだ"
+        );
+        assert!(
+            !sent(ValueChange::Keep, ValueChange::Set(Value::from(3000)))
+                .is_reflected_in(&listed(None, Some(2000)))
+        );
+    }
+
+    /// **読み直しの照合は、数を [`SAME_NUMBER_ULPS`] 以内なら同じとみなす**（D-21 のレビュー F1 / [`same_sampling`]）。
+    ///
+    /// 境界の両側（4 ULP は同じ・5 ULP は違う）と、綴り・鍵の集合・符号の取り違えを見る。**期待の隔たりは直書き**。
+    #[test]
+    fn the_reread_check_treats_numbers_a_few_ulps_apart_as_the_same() {
+        let base = 1.889_326_166_248_924_6_f64;
+        let shifted = |ulps: u64| Value::from(f64::from_bits(base.to_bits() + ulps));
+        let one = |value: Value| {
+            let mut map = Map::new();
+            map.insert("repeat_penalty".to_owned(), value);
+            map
+        };
+        let sent = one(Value::from(base));
+        assert!(same_sampling(&sent, &one(shifted(1))), "1 ULP");
+        assert!(same_sampling(&sent, &one(shifted(4))), "4 ULP");
+        assert!(!same_sampling(&sent, &one(shifted(5))), "5 ULP");
+        assert!(!same_sampling(&sent, &one(Value::from(1.9))));
+        // **符号の違う2つは同じにしない**（`1.0` と `-1.0`。`0.0` と `-0.0` は同じ値）。
+        assert!(!same_sampling(
+            &one(Value::from(1.0)),
+            &one(Value::from(-1.0))
+        ));
+        assert!(same_sampling(
+            &one(Value::from(0.0)),
+            &one(Value::from(-0.0))
+        ));
+        let mut both = one(Value::from(base));
+        both.insert("reasoning_effort".to_owned(), Value::from("low"));
+        assert!(!same_sampling(&sent, &both), "鍵の集合が違う");
+        let mut other = one(Value::from(base));
+        other.insert("reasoning_effort".to_owned(), Value::from("none"));
+        assert!(!same_sampling(&both, &other), "綴りが違う");
+        assert!(same_sampling(&both, &both.clone()));
     }
 
     /// **`context_tokens` を書いていない面は、A-13a-2 の前と1バイトも違わない形で書く**
@@ -2221,7 +2569,8 @@ mod tests {
     /// | `plain` の両面（値なし） | `model` | **書かれない**（生やさない） |
     /// | `fresh`（新しい名前） | —— | **書かれない**（他の名前から拾わない） |
     ///
-    /// 依頼の型はこの欄を持たない（[`WrittenFaceRequest`] は知らない欄を拒む）ので、ここは常に「送らない」の形。
+    /// ここは「送らない」（[`ValueChange::Keep`]）の形だけを見る（A-16 の間は依頼の型がこの欄を持たず、常にこの形だった）。
+    /// 送ったときの形（消す・置き換える）は `tests/upstream_profile_editor.rs` の ADR-0060 の腕2〜4。
     #[test]
     fn a_written_sampling_is_kept_from_the_same_name_and_face() {
         let tuned = edit(
@@ -2718,6 +3067,8 @@ mod tests {
                 context_tokens: main.context_tokens,
                 api_key: KeyChange::Keep,
                 allow_key_over_plain_http: None,
+                sampling: ValueChange::Keep,
+                response_tokens: ValueChange::Keep,
             },
             sub: None,
         }

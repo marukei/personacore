@@ -201,7 +201,7 @@ itself. It is served with `--no-ui` too, because it is part of the API, not of t
 carries the API version:
 
 ```
-x-personacore-api-version: 1.8
+x-personacore-api-version: 1.9
 ```
 
 That includes errors, 404 and 405 responses, the event stream and `/openapi.json`.
@@ -580,9 +580,8 @@ a sampler, is described below), and it must be a number from
 0.5 to 2 (otherwise reason `sampling_unusable`); both are checked when the profiles are
 read. If a profile has no background side (`sub`), the chat side's value is used for
 background work too; a background side without `sampling` uses the default. The value
-follows the profile when you switch. The profile API does not carry this field: it is not
-listed, a save request that sends it is refused with 400, and a save keeps the value already
-written for that profile and side, even when the endpoint or model changes.
+follows the profile when you switch. The profile API carries `sampling` on each side; see
+below.
 
 The chat side (`main`) of a profile can also let the upstream think, and give the reply
 more room (`"sampling": { "reasoning_effort": "low" }` and `"response_tokens": 2048` in
@@ -604,9 +603,36 @@ not answer, or a switch has not asked it yet), personacore uses 1024 instead of
 Both keys may only be written on the chat side; written on the
 background side (`sub`), the profile is refused (reason `main_face_only`). Both follow the
 profile when you switch, and the startup and switch log says what is sent (whether the
-upstream actually thought is not something personacore can see). Like `sampling`, the
-profile API does not carry `response_tokens`: it is not listed, a save request that sends it
-is refused with 400, and a save keeps the value already written for that profile and side.
+upstream actually thought is not something personacore can see).
+
+The profile API carries `sampling` and `response_tokens` on each side of a profile.
+`GET /admin/upstream/profiles` always lists both: `sampling` holds only the keys written
+(for example `{ "repeat_penalty": 1.0, "reasoning_effort": "low" }`), and is `null` when
+nothing is written, including a written `"sampling": {}`; `response_tokens` is the written
+integer or `null`. Defaults (1.1, `"none"`, 1024) are not filled in. In
+`PUT /admin/upstream/profiles/{name}` both fields are optional, and leaving a field out is
+not the same as sending `null`:
+
+| In the request | What the save does |
+|---|---|
+| Field left out | Keeps the value already written for that profile and side (even when the endpoint or model changes; a written `{}` is kept as is) |
+| `null` | Removes the key from the file |
+| A value | Replaces the value |
+
+`sampling` is replaced as a whole: sending `{ "repeat_penalty": 1.2 }` to a side that has
+`{ "repeat_penalty": 1.05, "reasoning_effort": "low" }` leaves no `reasoning_effort`.
+To change one key, read the profile list and send the whole object back. Sending `{}` is
+the same as sending `null`. The values are checked with the same rules as when the
+profiles are read, before anything is written, and a value that is not usable is refused
+with 422 `upstream_profile_invalid` and the same `key` and `reason` as above; this includes
+values of the wrong type, such as a negative or quoted `response_tokens` (only a body that is
+not JSON, a field the request does not know, or another field of the wrong type, is refused
+with 400). When `response_tokens`
+is not smaller than `context_tokens` on the same side, `key` is `context_tokens`. The pair
+with `PERSONACORE_CONTEXT_TOKENS` is not checked when saving (the save does not read
+environment variables); it is checked at startup and when you switch. A saved value does
+not reach a running upstream until you switch to that profile again (the same name is
+enough).
 
 A profile can also carry a key for each upstream (`api_key` in `upstreams.json`) for
 upstreams that require one. personacore then sends `Authorization: Bearer <key>` with
@@ -849,7 +875,7 @@ header.
 
 ## Versioning and compatibility
 
-The current API version is `1.8`.
+The current API version is `1.9`.
 
 The API version is kept separately from the application version and is stated in the
 OpenAPI document (`info.version`) and in the `X-Personacore-Api-Version` header. The
@@ -885,6 +911,17 @@ segment (such as `v1`) into the paths under `/admin`.
   working; requests that reached personacore some other way (for example through another
   host name) may start to be refused within `1.x`. The `Host` / `Origin` checks were added
   this way.
+
+Changes in `1.9` (from `1.8`): each side in the profile list (and in the response to a
+save) has two new fields, `sampling` (an object with only the keys written, or `null`) and
+`response_tokens` (an integer or `null`), and a save request accepts the same two fields as
+optional fields (see [Upstream inference servers](#upstream-inference-servers)). Leaving them
+out keeps what is written, as before, so a client written for `1.8` does not remove values
+written by hand. Because a save can now send these values, the 422
+`upstream_profile_invalid` of a save can name the `key` values `sampling` and
+`response_tokens` and the `reason` values `sampling_unusable`, `unknown_sampling_key`,
+`response_tokens_unusable` and `main_face_only`, all of which were already in the `enum`
+(the notes for `1.7` and `1.8` below said a save did not report them; that is no longer so).
 
 Changes in `1.8` (from `1.7`): a new key `response_tokens` on the chat side of an upstream
 profile, and `reasoning_effort` inside its `sampling` (see

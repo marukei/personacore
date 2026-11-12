@@ -16,6 +16,10 @@
 //! | [`arm7_the_environment_window_carries_the_room_at_startup_and_on_switching`] | （§決定2） | 環境変数の窓にも面の上限が載る（起動・切り替え）。収まらない上限への切り替えは 422 |
 //! | [`arm8_an_unknown_window_keeps_the_default_room_until_the_window_is_known`] | （§決定2） | 窓が分からない間は面の上限を使わず既定の 1024。窓が分かったら面の値に戻る |
 //! | [`arm9_switching_to_an_upstream_that_does_not_answer_the_window_keeps_the_default_room`] | （§決定2） | 窓を答えない上流への切り替えでも面の上限を使わず既定の 1024（切り替えの送る値の行は `window_unknown`） |
+//! | [`arm_d21_9_a_saved_profile_reaches_the_body_after_switching_to_the_same_name`] | ADR-0060 の腕9 | 画面の口（`PUT /admin/upstream/profiles/{name}`）で書き直した値は、保存しただけでは効かず、同じ名前へ切り替え直すと送る値と予算に入る。`null` で消して切り替え直すと既定（1.1・`none`・1024）に戻る |
+//!
+//! 起こす面で子を起こし直さないこと（ADR-0060 の腕9 の後半）は、偽の `llama` を起こせる `tests/upstream_launch.rs` の
+//! `a_saved_profile_switched_to_again_keeps_the_launched_child` が見る。
 //!
 //! 変容（`drift`）の経路の帰属は `tests/server_stat_drift.rs` の `each_path_sends_its_own_reasoning_effort` が見る
 //! （ここでは変容は既定で off）。
@@ -172,12 +176,15 @@ fn kind_of(request: &Value) -> Kind {
     }
 }
 
-/// **上流へ届いた1件のチャットの依頼**（種類と、見る2つの欄）。
+/// **上流へ届いた1件のチャットの依頼**（種類と、見る3つの欄）。
+///
+/// `repeat_penalty` は ADR-0060 の腕9（[`arm_d21_9_a_saved_profile_reaches_the_body_after_switching_to_the_same_name`]）が見る。
 #[derive(Debug, Clone, PartialEq)]
 struct Seen {
     kind: Kind,
     reasoning_effort: Value,
     max_tokens: Value,
+    repeat_penalty: Value,
 }
 
 /// **その上流へ届いたチャットの依頼**（届いた順）。
@@ -194,6 +201,7 @@ async fn seen(server: &MockServer) -> Vec<Seen> {
                 kind: kind_of(&body),
                 reasoning_effort: body["reasoning_effort"].clone(),
                 max_tokens: body["max_tokens"].clone(),
+                repeat_penalty: body["repeat_penalty"].clone(),
             }
         })
         .collect()
@@ -310,10 +318,23 @@ struct Running {
 
 impl Running {
     async fn start(config: &AppConfig, profiles: Option<&Path>) -> Self {
-        let mut app = App::bind(config).await.expect("待ち受けを開始できること");
-        if let Some(path) = profiles {
-            app = app.with_profiles_file_for_tests(path.to_path_buf());
-        }
+        Self::start_with(config, |app| match profiles {
+            Some(path) => app.with_profiles_file_for_tests(path.to_path_buf()),
+            None => app,
+        })
+        .await
+    }
+
+    /// **画面から書ける置き場所で起動する**（ADR-0060 の腕9 —— 保存してから同じ名前へ切り替え直す）。
+    async fn start_editable(config: &AppConfig, profiles: &Path) -> Self {
+        Self::start_with(config, |app| {
+            app.with_editable_profiles_file_for_tests(profiles.to_path_buf())
+        })
+        .await
+    }
+
+    async fn start_with(config: &AppConfig, place: impl FnOnce(App) -> App) -> Self {
+        let app = place(App::bind(config).await.expect("待ち受けを開始できること"));
         app.store()
             .create_character(
                 &Handle::parse(HANDLE).expect("正当な名前であること"),
@@ -419,6 +440,40 @@ impl Running {
         let status = response.status().as_u16();
         let text = response.text().await.expect("本文を読めること");
         (status, text)
+    }
+
+    /// **画面と同じ口で1つのプロファイルを保存する**（`GET` で印を読み、`PUT` に添える）。200 でなければ落とす。
+    async fn save_profile(&self, name: &str, main: &Value) {
+        let listing: Value = reqwest::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{}/admin/upstream/profiles",
+                self.port
+            ))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .expect("一覧を読めること")
+            .json()
+            .await
+            .expect("JSON として読めること");
+        assert_eq!(
+            listing["editable"],
+            json!(true),
+            "前提: 書ける置き場所: {listing}"
+        );
+        let response = reqwest::Client::new()
+            .put(format!(
+                "http://127.0.0.1:{}/admin/upstream/profiles/{name}",
+                self.port
+            ))
+            .json(&json!({ "revision": listing["revision"], "main": main }))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .expect("保存を頼めること");
+        let status = response.status();
+        let text = response.text().await.expect("本文を読めること");
+        assert!(status.is_success(), "保存できること: {status}: {text}");
     }
 
     async fn stop(mut self) {
@@ -1176,6 +1231,92 @@ async fn arm9_switching_to_an_upstream_that_does_not_answer_the_window_keeps_the
         "切り替えの行が、窓が分からないので既定にしたと言っていない: {}",
         switched[0]
     );
+
+    running.stop().await;
+}
+
+/// **ADR-0060 の腕9: 画面の口で書き直した値は、保存しただけでは効かず、同じ名前へ切り替え直すと送る値と予算に入る**
+/// （ADR-0060 §決定3 の最後の段 / 作業単位 D-21）。
+///
+/// | 回 | その前にしたこと | 本文の `repeat_penalty` | `reasoning_effort` | `max_tokens` = 予算の余白 |
+/// |---|---|---|---|---|
+/// | 1 | 起動（`tuned` は手で 1.3 だけを書いた） | 1.3 | `none` | 1024 |
+/// | 2 | **保存だけ**（0.8・`low`・2500） | **1.3 のまま** | **`none` のまま** | **1024 のまま** |
+/// | 3 | **同じ名前 `tuned` へ切り替え直す** | 0.8 | `low` | 2500 |
+/// | 4 | 両方 `null` で保存して、同じ名前へ切り替え直す | **1.1（既定）** | `none` | **1024（余白が既定に戻る）** |
+///
+/// **宛先とモデルは変えない**（値だけが違う同名の切り替え —— 名前で比べる実装なら3回目が赤になる）。
+/// 値は既定（1.1・`none`・1024）と違える。
+#[tokio::test]
+async fn arm_d21_9_a_saved_profile_reaches_the_body_after_switching_to_the_same_name() {
+    let _serial = SERIAL.lock().await;
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let shared = upstream(ROOMY_WINDOW).await;
+    let uri = shared.uri();
+    let source = json!({
+        "tuned": { "main": face(&uri, MAIN_MODEL, &json!({ "sampling": { "repeat_penalty": 1.3 } })) },
+    });
+    let path = dir.path().join("upstreams.json");
+    std::fs::write(&path, source.to_string()).expect("プロファイルを置けること");
+    let running = Running::start_editable(
+        &config_of(&source, "tuned", &dir.path().join("arm-d21-9.sqlite")),
+        &path,
+    )
+    .await;
+
+    let mut before = 0;
+    for (turn, step, penalty, effort, room) in [
+        (1, None, json!(1.3), "none", 1024),
+        (
+            2,
+            Some((
+                json!({ "sampling": { "repeat_penalty": 0.8, "reasoning_effort": "low" }, "response_tokens": 2500 }),
+                false,
+            )),
+            json!(1.3),
+            "none",
+            1024,
+        ),
+        (3, Some((Value::Null, true)), json!(0.8), "low", 2500),
+        (
+            4,
+            Some((json!({ "sampling": null, "response_tokens": null }), true)),
+            json!(1.1),
+            "none",
+            1024,
+        ),
+    ] {
+        if let Some((fields, switch)) = step {
+            if let Some(fields) = fields.as_object() {
+                let mut main = face(&uri, MAIN_MODEL, &json!({}));
+                for (key, value) in fields {
+                    main[key] = value.clone();
+                }
+                running.save_profile("tuned", &main).await;
+            }
+            if switch {
+                running.switch_to("tuned").await;
+            }
+        }
+        running.turn(&[&shared], turn).await;
+        let all = seen(&shared).await;
+        let this_turn = &all[before..];
+        before = all.len();
+        assert_eq!(
+            (
+                of_kind(this_turn, Kind::Body, |one| one.repeat_penalty.clone()),
+                of_kind(this_turn, Kind::Body, |one| one.reasoning_effort.clone()),
+                of_kind(this_turn, Kind::Body, |one| one.max_tokens.clone()),
+            ),
+            (vec![penalty], vec![json!(effort)], vec![json!(room)]),
+            "{turn} 回目の本文の送る値が期待と違う: {this_turn:?}"
+        );
+        assert_eq!(
+            running.budget.response_tokens_for_tests(),
+            room,
+            "{turn} 回目の予算の余白が期待と違う"
+        );
+    }
 
     running.stop().await;
 }

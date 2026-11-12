@@ -37,11 +37,18 @@ import {
 } from "../src/lib/api";
 import {
   DEFAULT_COMMAND,
+  DEFAULT_REPEAT_PENALTY,
+  DEFAULT_RESPONSE_TOKENS,
   EDITABLE_FACE_KEYS,
   FACE_KEYS,
   FACES,
   KIND_FIELDS,
   LAUNCH_STATE,
+  REPEAT_PENALTY_MAX,
+  REPEAT_PENALTY_MIN,
+  fieldsOf,
+  samplingFailure,
+  thinkingRoomNote,
   argsOfText,
   buildSaveRequest,
   canEdit,
@@ -84,6 +91,8 @@ const ALPHA: WrittenProfile = {
     api_key_set: false,
     api_key_hint: null,
     allow_key_over_plain_http: false,
+    sampling: null,
+    response_tokens: null,
   },
   sub: {
     endpoint: "http://127.0.0.1:41002",
@@ -95,9 +104,15 @@ const ALPHA: WrittenProfile = {
     api_key_set: false,
     api_key_hint: null,
     allow_key_over_plain_http: false,
+    sampling: null,
+    response_tokens: null,
   },
 };
 
+/**
+ * **`sampling` / `response_tokens` は真ん中の `beta` にだけ書く**（作業単位 D-21 / ADR-0060 §決定6）。
+ * 値は既定（1.1・1024・`"none"`）と違え、本文と裏方でも違える。
+ */
 const BETA: WrittenProfile = {
   name: "beta",
   main: {
@@ -110,6 +125,8 @@ const BETA: WrittenProfile = {
     api_key_set: false,
     api_key_hint: null,
     allow_key_over_plain_http: false,
+    sampling: { repeat_penalty: 1.05, reasoning_effort: "low" },
+    response_tokens: 2000,
   },
   sub: {
     endpoint: "http://127.0.0.1:41004",
@@ -121,6 +138,8 @@ const BETA: WrittenProfile = {
     api_key_set: false,
     api_key_hint: null,
     allow_key_over_plain_http: false,
+    sampling: { repeat_penalty: 1.25 },
+    response_tokens: null,
   },
 };
 
@@ -136,6 +155,8 @@ const GAMMA: WrittenProfile = {
     api_key_set: false,
     api_key_hint: null,
     allow_key_over_plain_http: false,
+    sampling: null,
+    response_tokens: null,
   },
   sub: null,
 };
@@ -400,8 +421,10 @@ describe("面の種類（作業単位 D-19）", () => {
       args: null,
       command: null,
       context_tokens: 28672,
+      sampling: null,
+      response_tokens: null,
     });
-    expect(request.sub).toEqual(requested(ALPHA.sub as WrittenFace));
+    expect(request.sub).toEqual(requested(ALPHA.sub as WrittenFace, "sub"));
     // **下書きには残っている。**
     expect(draft.main.gguf).toBe("~/models/alpha-main.gguf");
     draft.kind.main = "launch";
@@ -420,6 +443,7 @@ describe("面の種類（作業単位 D-19）", () => {
       args: null,
       command: null,
       context_tokens: null,
+      sampling: null,
     });
   });
 
@@ -440,6 +464,7 @@ describe("面の種類（作業単位 D-19）", () => {
       args: ["-ngl", "5"],
       command: "E:/llama.exe",
       context_tokens: 10240,
+      sampling: { repeat_penalty: 1.25 },
     });
   });
 
@@ -615,10 +640,19 @@ describe("末尾が /v1 の宛先（作業単位 B-68）", () => {
  *
  * 応答の `api_key_set` / `api_key_hint` は依頼に無い（送ると `deny_unknown_fields` で 400）。
  * **`api_key` も `allow_key_over_plain_http` も足さない**（触らない鍵と承認は送らない＝残す・今の規則 / 作業単位 A-13b-3）。
+ *
+ * **`sampling` / `response_tokens` は書いた値（か `null`）のまま送る**（作業単位 D-21 / ADR-0060 §決定3 —— 画面は2つの欄を
+ * 必ず送る）。**ただし裏方の面の依頼には `response_tokens` を載せない**（本文の面だけの欄）。
  */
-function requested(face: WrittenFace): WrittenFaceRequest {
-  const { api_key_set: _set, api_key_hint: _hint, allow_key_over_plain_http: _approved, ...rest } = face;
-  return rest;
+function requested(face: WrittenFace, side: "main" | "sub" = "main"): WrittenFaceRequest {
+  const {
+    api_key_set: _set,
+    api_key_hint: _hint,
+    allow_key_over_plain_http: _approved,
+    response_tokens,
+    ...rest
+  } = face;
+  return side === "main" ? { ...rest, response_tokens } : rest;
 }
 
 describe("下書きと、送る本文", () => {
@@ -631,7 +665,7 @@ describe("下書きと、送る本文", () => {
     expect(request).toEqual({
       revision: "rev-1",
       main: requested(profile.main),
-      sub: profile.sub === null ? null : requested(profile.sub),
+      sub: profile.sub === null ? null : requested(profile.sub, "sub"),
     });
   });
 
@@ -671,7 +705,16 @@ describe("下書きと、送る本文", () => {
     const draft = emptyProfileDraft();
     expect(buildSaveRequest(draft, null)).toEqual({
       revision: null,
-      main: { endpoint: "", model: "", gguf: null, args: null, command: null, context_tokens: null },
+      main: {
+        endpoint: "",
+        model: "",
+        gguf: null,
+        args: null,
+        command: null,
+        context_tokens: null,
+        sampling: null,
+        response_tokens: null,
+      },
       sub: null,
     });
   });
@@ -683,7 +726,7 @@ describe("下書きと、送る本文", () => {
     expect(buildSaveRequest(draft, "r").sub).toBeNull();
     // 対照: 戻せば送る。
     draft.hasSub = true;
-    expect(buildSaveRequest(draft, "r").sub).toEqual(requested(ALPHA.sub as WrittenFace));
+    expect(buildSaveRequest(draft, "r").sub).toEqual(requested(ALPHA.sub as WrittenFace, "sub"));
   });
 
   it("引数は1行に1つ。空行は落とし、行の中の空白はそのまま", () => {
@@ -707,6 +750,10 @@ describe("下書きと、送る本文", () => {
       context_tokens: "28672",
       // **新しい鍵の欄は、開いたときは必ず空**（画面は鍵の値を持たない / 作業単位 A-13b-3）。
       api_key: "",
+      // **書いていない思考・返答の上限・繰り返しの罰は、切る・空・空**（作業単位 D-21）。
+      reasoning_effort: "none",
+      response_tokens: "",
+      repeat_penalty: "",
     });
     expect(draft.sub).toEqual({
       endpoint: "http://127.0.0.1:41002",
@@ -716,6 +763,9 @@ describe("下書きと、送る本文", () => {
       command: "C:/tools/llama-b.exe",
       context_tokens: "",
       api_key: "",
+      reasoning_effort: "none",
+      response_tokens: "",
+      repeat_penalty: "",
     });
     expect(draftOfProfile(GAMMA).hasSub).toBe(false);
   });
@@ -987,6 +1037,218 @@ function invalid(face: string | null, key: string | null): ApiRequestError {
   );
 }
 
+/**
+ * **思考・返答の上限・繰り返しの罰**（作業単位 D-21 / ADR-0060 §決定3 / §決定6 の腕7）。
+ *
+ * **期待値は直書き**（`upstreamProfiles.ts` の定数から作らない）。値は真ん中の `beta` にだけ書いてある。
+ */
+describe("思考・返答の上限・繰り返しの罰（作業単位 D-21）", () => {
+  /** 一覧の送る値を `[見出し, 書いた値 | null, 既定]` で読む。 */
+  function sentOf(profile: WrittenProfile): unknown[][][] {
+    return summaryLines(profile).map((line) =>
+      (line.summary?.sent ?? []).map((one) => [one.label, one.written, one.fallback]),
+    );
+  }
+
+  /**
+   * **一覧: 書いた値を見せ、書いていなければ「書いていない」側に置いて、送る既定を添える**（ADR-0060 §決定3 の1つ目）。
+   *
+   * 本文の面は3つ（思考・返答の上限・繰り返しの罰）、裏方の面は繰り返しの罰だけ。**既定は書いた値の欄に入れない**
+   * （`written` は `null` のまま —— 「書いた」と「決まった」を同じ見え方にしない）。
+   */
+  it("一覧: 面ごとに書いた値を出し、書いていなければ既定を別に添える", () => {
+    expect(sentOf(BETA)).toEqual([
+      [
+        ["思考", "入れる（low）", "切る"],
+        ["返答の上限", "2,000", "1,024"],
+        ["繰り返しの罰", "1.05", "1.1"],
+      ],
+      [["繰り返しの罰", "1.25", "1.1"]],
+    ]);
+    expect(sentOf(ALPHA)).toEqual([
+      [
+        ["思考", null, "切る"],
+        ["返答の上限", null, "1,024"],
+        ["繰り返しの罰", null, "1.1"],
+      ],
+      [["繰り返しの罰", null, "1.1"]],
+    ]);
+    // **裏方を書いていなければ、何も添えない**（本文と同じ）。
+    expect(sentOf(GAMMA)[1]).toEqual([]);
+    // **手で書いた `"none"` は「切る」と書いた側に出る**（既定の側に混ぜない）。
+    const handWritten: WrittenProfile = {
+      ...GAMMA,
+      main: { ...GAMMA.main, sampling: { reasoning_effort: "none" } },
+    };
+    expect(sentOf(handWritten)[0]?.[0]).toEqual(["思考", "切る（none）", "切る"]);
+  });
+
+  it("下書き: 書いた値がその面の欄に入る（思考は本文の面だけ）", () => {
+    const draft = draftOfProfile(BETA);
+    expect([draft.main.reasoning_effort, draft.main.response_tokens, draft.main.repeat_penalty]).toEqual([
+      "low",
+      "2000",
+      "1.05",
+    ]);
+    expect([draft.sub.reasoning_effort, draft.sub.response_tokens, draft.sub.repeat_penalty]).toEqual([
+      "none",
+      "",
+      "1.25",
+    ]);
+  });
+
+  /**
+   * **保存では2つの欄を必ず送る。空の欄は省かず `null`**（省くと「残す」に当たり、空にしたつもりの値が知らせずに残る）。
+   * **裏方の面の依頼には `response_tokens` も `reasoning_effort` も載せない**（ADR-0060 §決定3）。
+   */
+  it("送る本文: 空にした欄は省かず `null` で送り、裏方には本文の面だけの欄を載せない", () => {
+    const draft = draftOfProfile(BETA);
+    draft.main.reasoning_effort = "none";
+    draft.main.repeat_penalty = "";
+    draft.main.response_tokens = "";
+    draft.sub.repeat_penalty = "";
+    // **裏方の下書きに思考を入れても、送らない**（画面は欄を出さないが、下書きに値が残る形でも）。
+    draft.sub.reasoning_effort = "low";
+    const request = buildSaveRequest(draft, "r");
+    expect(Object.keys(request.main)).toEqual(expect.arrayContaining(["sampling", "response_tokens"]));
+    expect([request.main.sampling, request.main.response_tokens]).toEqual([null, null]);
+    expect(request.sub).not.toBeNull();
+    expect(Object.keys(request.sub ?? {})).toContain("sampling");
+    expect(Object.keys(request.sub ?? {})).not.toContain("response_tokens");
+    expect(request.sub?.sampling).toBeNull();
+  });
+
+  /**
+   * **思考の「切る」は `reasoning_effort` を書かない**（`"none"` を書かない）。**繰り返しの罰はそのまま残る**
+   * （ADR-0060 §決定3 —— 片方の欄で、もう片方の鍵を落とさない）。**両方が空なら `{}` ではなく `null`。**
+   */
+  it("思考を「切る」にすると `reasoning_effort` だけが落ち、繰り返しの罰が残る。両方空なら `null`", () => {
+    const draft = draftOfProfile(BETA);
+    draft.main.reasoning_effort = "none";
+    expect(buildSaveRequest(draft, "r").main.sampling).toEqual({ repeat_penalty: 1.05 });
+    draft.main.reasoning_effort = "low";
+    draft.main.repeat_penalty = "";
+    expect(buildSaveRequest(draft, "r").main.sampling).toEqual({ reasoning_effort: "low" });
+    draft.main.reasoning_effort = "none";
+    expect(buildSaveRequest(draft, "r").main.sampling).toBeNull();
+    // **繰り返しの罰の前後の空白は落として数で送る。**
+    draft.main.repeat_penalty = " 0.95 ";
+    draft.main.response_tokens = " 3000 ";
+    const request = buildSaveRequest(draft, "r");
+    expect([request.main.sampling, request.main.response_tokens]).toEqual([{ repeat_penalty: 0.95 }, 3000]);
+  });
+
+  /** **本文の面にだけ思考と返答の上限を置き、繰り返しの罰は両面とも詳細に畳む**（ADR-0060 §決定3 の表）。 */
+  it("欄の置き場所: 思考（サンプリングの組）と返答の上限は本文の面だけですぐ出し、繰り返しの罰は詳細に畳む", () => {
+    expect(fieldsOf("main", "launch")).toEqual({
+      shown: ["gguf", "model", "endpoint", "api_key", "sampling", "response_tokens"],
+      folded: ["args", "command", "context_tokens", "repeat_penalty"],
+    });
+    expect(fieldsOf("main", "connect")).toEqual({
+      shown: ["endpoint", "model", "api_key", "context_tokens", "sampling", "response_tokens"],
+      folded: ["repeat_penalty"],
+    });
+    expect(fieldsOf("sub", "launch")).toEqual({
+      shown: ["gguf", "model", "endpoint", "api_key"],
+      folded: ["args", "command", "context_tokens", "sampling", "repeat_penalty"],
+    });
+    expect(fieldsOf("sub", "connect")).toEqual({
+      shown: ["endpoint", "model", "api_key", "context_tokens"],
+      folded: ["sampling", "repeat_penalty"],
+    });
+    expect(fieldLabel("launch", "sampling")).toBe("サンプリング（sampling）");
+    expect(fieldLabel("connect", "response_tokens")).toBe("返答の上限（response_tokens）");
+    expect(fieldLabel("connect", "repeat_penalty")).toBe("繰り返しの罰（repeat_penalty）");
+  });
+
+  describe("保存の前の検査", () => {
+    it("繰り返しの罰は 0.5〜2.0 の数。端は通し、外と数でない綴りは、その面の欄で止める", () => {
+      const at = (main: string, sub = "") => {
+        const draft = draftOfProfile(BETA);
+        draft.main.repeat_penalty = main;
+        draft.sub.repeat_penalty = sub;
+        return samplingFailure(draft);
+      };
+      for (const ok of ["", "0.5", "2", "2.0", "1", ".9", " 1.3 "]) {
+        expect(at(ok), ok).toBeNull();
+      }
+      for (const bad of ["0.49", "2.01", "abc", "1,1", "-1", "1e0", "１.１"]) {
+        expect(at(bad), bad).toMatchObject({ kind: "field", face: "main", key: "repeat_penalty" });
+      }
+      // **裏方の欄なら裏方の欄に。** 両方なら本文を先に言う。
+      expect(at("", "3")).toMatchObject({ kind: "field", face: "sub", key: "repeat_penalty" });
+      expect(at("3", "3")).toMatchObject({ face: "main" });
+    });
+
+    it("裏方を別にしないなら、裏方の欄に残った繰り返しの罰では止めない", () => {
+      const draft = draftOfProfile(BETA);
+      draft.sub.repeat_penalty = "9";
+      draft.hasSub = false;
+      expect(samplingFailure(draft)).toBeNull();
+    });
+
+    /**
+     * **返答の上限は正の整数で、同じ面に書いた窓より小さい**（境界は窓と等しいところで止める）。
+     * **窓を書いていなければ、窓とは比べない**（照会した窓との組は実行時に既定へ戻す / ADR-0059 §決定2）。
+     */
+    it("返答の上限は正の整数で、同じ面に書いた窓より小さい。窓を書いていなければ比べない", () => {
+      const at = (room: string, window: string) => {
+        const draft = draftOfProfile(BETA);
+        draft.main.response_tokens = room;
+        draft.main.context_tokens = window;
+        return samplingFailure(draft);
+      };
+      for (const bad of ["0", "1.5", "-1", "2k", "２０００", "9007199254740992"]) {
+        expect(at(bad, ""), bad).toMatchObject({ kind: "field", face: "main", key: "response_tokens" });
+      }
+      expect(at("8192", "8192")).toMatchObject({ kind: "field", face: "main", key: "response_tokens" });
+      expect(at("9000", "8192")).toMatchObject({ kind: "field", face: "main", key: "response_tokens" });
+      expect(at("8191", "8192")).toBeNull();
+      expect(at("90000", "")).toBeNull();
+      expect(at("", "8192")).toBeNull();
+    });
+
+    it("止めた文面は欄ごとに違い、範囲と既定を言う", () => {
+      const draft = draftOfProfile(BETA);
+      draft.main.repeat_penalty = "3";
+      const penalty = samplingFailure(draft);
+      expect(penalty?.message).toContain("0.5");
+      expect(penalty?.message).toContain("2.0");
+      draft.main.repeat_penalty = "";
+      draft.main.response_tokens = "8192";
+      draft.main.context_tokens = "8192";
+      expect(samplingFailure(draft)?.message).toContain("コンテキスト長より小さく");
+      draft.main.response_tokens = "0";
+      expect(samplingFailure(draft)?.message).toContain("1 以上");
+    });
+  });
+
+  /**
+   * **思考を入れて返答の上限が空か既定以下なら、欄の隣で言う。数は出さない**（ADR-0060 §決定3 —— 測った思考の量は
+   * この機の1つのモデルの値なので、画面に数を置かない。値も自動で入れない）。
+   */
+  it("思考を入れて上限が空か既定以下なら案内を出し、数は出さない", () => {
+    const at = (effort: "none" | "low", room: string) => {
+      const draft = draftOfProfile(BETA);
+      draft.main.reasoning_effort = effort;
+      draft.main.response_tokens = room;
+      return thinkingRoomNote(draft);
+    };
+    const note = at("low", "");
+    expect(note).not.toBeNull();
+    expect(note).toContain("思考は返答の上限の中で書かれます");
+    expect(note ?? "").not.toMatch(/[0-9０-９]/u);
+    expect(at("low", "1024")).toBe(note);
+    expect(at("low", "1025")).toBeNull();
+    expect(at("none", "")).toBeNull();
+    // **値を自動で入れない**（下書きは空のまま）。
+    const draft = draftOfProfile(BETA);
+    draft.main.response_tokens = "";
+    thinkingRoomNote(draft);
+    expect(draft.main.response_tokens).toBe("");
+  });
+});
+
 describe("保存の失敗を読み分ける", () => {
   it("422 は、止まった面と鍵に結びつける（理由の文面ごと）", () => {
     expect(describeSaveFailure(invalid("sub", "endpoint"), true)).toEqual({
@@ -1029,15 +1291,39 @@ describe("保存の失敗を読み分ける", () => {
     expect(describeSaveFailure(invalid("sub", "model"), false).kind).toBe("form");
   });
 
-  it("欄の無い鍵（`allow_key_over_plain_http` / `sampling` / `response_tokens`）を名指した 422 は、全体に出す（ADR-0058 §決定6 / ADR-0059 §決定5）", () => {
-    for (const key of ["allow_key_over_plain_http", "sampling", "response_tokens"] as const) {
-      // **前提: 3つとも写し元の鍵ではある**（知らない鍵だから全体に出た、ではない）。
-      expect(FACE_KEYS as readonly string[]).toContain(key);
-      expect(EDITABLE_FACE_KEYS as readonly string[]).not.toContain(key);
-      for (const face of ["main", "sub"] as const) {
-        expect(describeSaveFailure(invalid(face, key), true).kind, `${face} / ${key}`).toBe("form");
-      }
+  /**
+   * **欄の無い鍵（`allow_key_over_plain_http`）を名指した 422 は、全体に出す**（ADR-0056 §決定5）。
+   *
+   * > A-16・A-18a の間は `sampling` / `response_tokens` もここに居た（ADR-0058 §決定6 / ADR-0059 §決定5）。
+   * > **作業単位 D-21 で画面が欄を持ったので、欄に結びつく側へ移した**（下の [`it`]・ADR-0060 §決定4）。
+   */
+  it("欄の無い鍵（`allow_key_over_plain_http`）を名指した 422 は、全体に出す", () => {
+    const key = "allow_key_over_plain_http";
+    // **前提: 写し元の鍵ではある**（知らない鍵だから全体に出た、ではない）。
+    expect(FACE_KEYS as readonly string[]).toContain(key);
+    expect(EDITABLE_FACE_KEYS as readonly string[]).not.toContain(key);
+    for (const face of ["main", "sub"] as const) {
+      expect(describeSaveFailure(invalid(face, key), true).kind, `${face} / ${key}`).toBe("form");
     }
+  });
+
+  /**
+   * **`sampling` / `response_tokens` の 422 は、その面のその欄に結びつく**（作業単位 D-21 / ADR-0060 §決定3・§決定4）。
+   *
+   * `sampling` は思考と繰り返しの罰の2つの欄の組（サンプリングの見出し）に出る。**裏方の面は `response_tokens` の欄を持たない**
+   * ので、裏方の `response_tokens` を名指した理由は全体に出す（**本文の面の欄に出さない**）。裏方の `sampling` は裏方の組に出る。
+   */
+  it("`sampling` / `response_tokens` の 422 は、その面の欄に結びつき、裏方の `response_tokens` は全体に出る", () => {
+    const kind = { main: "launch", sub: "connect" } as const;
+    const shown = (face: "main" | "sub", key: string) =>
+      failureOnScreen(describeSaveFailure(invalid(face, key), true), { hasSub: true, kind });
+    expect(EDITABLE_FACE_KEYS as readonly string[]).toEqual(expect.arrayContaining(["sampling", "response_tokens"]));
+    expect(shown("main", "sampling")).toMatchObject({ kind: "field", face: "main", key: "sampling" });
+    expect(shown("main", "response_tokens")).toMatchObject({ kind: "field", face: "main", key: "response_tokens" });
+    expect(shown("sub", "sampling")).toMatchObject({ kind: "field", face: "sub", key: "sampling" });
+    expect(shown("sub", "response_tokens").kind).toBe("form");
+    // **窓の欄**（上限が窓以上の 422 は `key: "context_tokens"`）。
+    expect(shown("main", "context_tokens")).toMatchObject({ kind: "field", face: "main", key: "context_tokens" });
   });
 
   it("409 `upstream_profiles_changed` は、上書きしていないことと、読み直すことを言う", () => {
@@ -1503,6 +1789,50 @@ const UPSTREAMS_RS = readFileSync(
   fileURLToPath(new URL("../../src/server/upstreams.rs", import.meta.url)),
   "utf8",
 );
+const REQUEST_RS = readFileSync(
+  fileURLToPath(new URL("../../src/llm/request.rs", import.meta.url)),
+  "utf8",
+);
+const BUDGET_RS = readFileSync(
+  fileURLToPath(new URL("../../src/prompt/budget.rs", import.meta.url)),
+  "utf8",
+);
+
+/**
+ * **`pub const NAME: 型 = 数;` の数**（行頭の字下げ・`_` の区切りを許す。`impl` の中の関連定数も読む）。
+ * 宣言がちょうど1つでなければ投げる。
+ */
+function numberConstOf(source: string, name: string): number {
+  const pattern = new RegExp(`^\\s*pub const ${name}: [A-Za-z0-9]+ = ([0-9_.]+);\\r?$`, "gmu");
+  const hits = [...source.matchAll(pattern)].map((found) => found[1]);
+  if (hits.length !== 1 || hits[0] === undefined) {
+    throw new Error(`const ${name} の数の宣言が ${hits.length} 個あります`);
+  }
+  return Number(hits[0].replace(/_/gu, ""));
+}
+
+/**
+ * **`llm::RequestPolicy::PERSONACORE` の `repeat_penalty`**（personacore が送る既定の繰り返しの罰）。
+ * `const PERSONACORE: Self = Self {` から `};` までの `repeat_penalty: 数,` を読む。
+ */
+function personacoreRepeatPenaltyOf(source: string): number {
+  const lines = source.split("\n").map((line) => line.replace(/\r$/u, ""));
+  const at = lines.findIndex((line) => line.trim().endsWith("const PERSONACORE: Self = Self {"));
+  if (at < 0) {
+    throw new Error("PERSONACORE の宣言が見つかりません");
+  }
+  for (let index = at + 1; index < lines.length; index += 1) {
+    const line = (lines[index] ?? "").trim();
+    if (line === "};") {
+      break;
+    }
+    const found = /^repeat_penalty: ([0-9.]+),$/u.exec(line);
+    if (found?.[1] !== undefined) {
+      return Number(found[1]);
+    }
+  }
+  throw new Error("PERSONACORE に repeat_penalty がありません");
+}
 const LAUNCH_RS = readFileSync(
   fileURLToPath(new URL("../../src/server/launch.rs", import.meta.url)),
   "utf8",
@@ -1521,6 +1851,34 @@ describe("写し元の綴り", () => {
   /** **画面の注記が「書かなければ何を起こすか」を言うので、その綴り。** */
   it("既定の実行ファイル名は `DEFAULT_COMMAND` と一致する", () => {
     expect(DEFAULT_COMMAND).toBe(stringConstOf(UPSTREAMS_RS, "DEFAULT_COMMAND"));
+  });
+
+  /**
+   * **画面のサンプリングの欄の鍵は `SAMPLING_KEYS` と一致する**（作業単位 D-21 / ADR-0060 §決定4 の見張り番）。
+   *
+   * **画面の保存は `sampling` を丸ごと置き換える**ので、読み込みが受け付けて画面が書けない鍵は、画面から保存するたびに
+   * 知らせずに消える。**定数ではなく、全部の欄を埋めた下書きから組んだ依頼の鍵で見る**（画面が実際に書ける鍵の集合）。
+   * 読み込みに鍵を足して画面の欄を後回しにした作業単位は、ここで赤になる（逆に、画面だけに鍵を足しても赤になる）。
+   */
+  it("画面のサンプリングの欄の鍵は `SAMPLING_KEYS` と一致する", () => {
+    const draft = draftOfProfile(BETA);
+    draft.main.reasoning_effort = "low";
+    draft.main.repeat_penalty = "1.2";
+    const written = buildSaveRequest(draft, "r").main.sampling;
+    expect(written).not.toBeNull();
+    expect(Object.keys(written ?? {}).sort()).toEqual(
+      [...stringArrayConstOf(UPSTREAMS_RS, "SAMPLING_KEYS")].sort(),
+    );
+  });
+
+  /** **画面が言う範囲・既定の値**（ずれると、画面が通した値をサーバが断る・既定の印が嘘をつく）。 */
+  it("繰り返しの罰の範囲と既定、返答の上限の既定は、写し元と一致する", () => {
+    expect([REPEAT_PENALTY_MIN, REPEAT_PENALTY_MAX]).toEqual([
+      numberConstOf(REQUEST_RS, "REPEAT_PENALTY_MIN"),
+      numberConstOf(REQUEST_RS, "REPEAT_PENALTY_MAX"),
+    ]);
+    expect(DEFAULT_REPEAT_PENALTY).toBe(personacoreRepeatPenaltyOf(REQUEST_RS));
+    expect(DEFAULT_RESPONSE_TOKENS).toBe(numberConstOf(BUDGET_RS, "DEFAULT_RESPONSE_TOKENS"));
   });
 
   /**
@@ -1572,6 +1930,23 @@ describe("写し元の綴り", () => {
     it("文字列の定数", () => {
       expect(stringConstOf('pub const X: &str = "zz";\r\n', "X")).toBe("zz");
       expect(() => stringConstOf('pub const X: &str = "a";\npub const X: &str = "b";', "X")).toThrow();
+    });
+
+    it("数の定数と、既定の繰り返しの罰", () => {
+      expect(numberConstOf("    pub const X: u32 = 2_048;\r\npub const Y: f64 = 0.7;\n", "X")).toBe(2048);
+      expect(numberConstOf("pub const Y: f64 = 0.7;\n", "Y")).toBe(0.7);
+      expect(() => numberConstOf("pub const Y: f64 = 0.7;\npub const Y: f64 = 0.8;\n", "Y")).toThrow();
+      const planted = [
+        "    pub(super) const PERSONACORE: Self = Self {",
+        '        reasoning_effort: "none",',
+        "        repeat_penalty: 1.35,",
+        "    };",
+        "    const OTHER: Self = Self {",
+        "        repeat_penalty: 9.9,",
+        "    };",
+      ].join("\r\n");
+      expect(personacoreRepeatPenaltyOf(planted)).toBe(1.35);
+      expect(() => personacoreRepeatPenaltyOf("const OTHER: Self = Self {\n};")).toThrow();
     });
 
     it("状態の綴り", () => {

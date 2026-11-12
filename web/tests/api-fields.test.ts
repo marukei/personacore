@@ -268,6 +268,13 @@ const LISTENING_PORT_MIRRORED = ["ServerView", "SavePortView", "SavePortRequest"
 /** `api.ts` にあるが、写し元が `admin.rs` ではないもの。 */
 const FE_ONLY = ["ErrorBody", "ApiErrorDetail"] as const;
 
+/**
+ * **写し元が構造体ではないもの**（作業単位 D-21）。`WrittenSampling` は `profile_editor.rs` の `WrittenFace.sampling`
+ * （`Map<String, Value>`）の形で、**鍵の集合の写し元は `upstreams.rs` の `SAMPLING_KEYS`**。突き合わせは下の
+ * 「`WrittenSampling` の欄は `SAMPLING_KEYS` と一致する」が持つ。
+ */
+const SAMPLING_KEYS_MIRRORED = ["WrittenSampling"] as const;
+
 const ADMIN_RS = readFileSync(
   fileURLToPath(new URL("../../src/server/admin.rs", import.meta.url)),
   "utf8",
@@ -297,6 +304,20 @@ const API_TS = readFileSync(
   fileURLToPath(new URL("../src/lib/api.ts", import.meta.url)),
   "utf8",
 );
+
+const UPSTREAMS_RS = readFileSync(
+  fileURLToPath(new URL("../../src/server/upstreams.rs", import.meta.url)),
+  "utf8",
+);
+
+/** **`pub const SAMPLING_KEYS: [&str; N] = ["…", …];` の綴り**（1行の宣言だけを読む。読めなければ投げる）。 */
+function samplingKeysOf(source: string): string[] {
+  const found = /^pub const SAMPLING_KEYS: \[&str; \d+\] = \[([^\]]*)\];\r?$/mu.exec(source);
+  if (found?.[1] === undefined) {
+    throw new Error("SAMPLING_KEYS の宣言が読めません");
+  }
+  return [...found[1].matchAll(/"([^"]*)"/gu)].map((spelled) => spelled[1] as string);
+}
 
 describe("欄名は写し元と一致する", () => {
   /**
@@ -331,6 +352,7 @@ describe("欄名は写し元と一致する", () => {
         ...SWITCH_MIRRORED,
         ...LISTENING_PORT_MIRRORED,
         ...FE_ONLY,
+        ...SAMPLING_KEYS_MIRRORED,
       ]),
     );
   });
@@ -439,6 +461,23 @@ describe("上流プロファイルの欄名は写し元と一致する（`profil
     );
   });
 
+  /**
+   * **`WrittenSampling` の欄は `SAMPLING_KEYS` と一致する**（作業単位 D-21）。どちらも省略可（書いた鍵だけが載る）。
+   * 画面が実際に書ける鍵の見張り番は `tests/upstream-profiles.test.ts` の「画面のサンプリングの欄の鍵は…」（ADR-0060 §決定4）。
+   */
+  it("`WrittenSampling` の欄は `SAMPLING_KEYS` と一致する", () => {
+    expect(labelsOf(tsFieldsOf(API_TS, "WrittenSampling"))).toEqual(
+      samplingKeysOf(UPSTREAMS_RS)
+        .map((key) => `${key}?`)
+        .sort(),
+    );
+  });
+
+  it("対照: 植えたソースの `SAMPLING_KEYS` を読む", () => {
+    expect(samplingKeysOf('pub const SAMPLING_KEYS: [&str; 2] = ["p", "q"];\r\n')).toEqual(["p", "q"]);
+    expect(() => samplingKeysOf("pub const OTHER: [&str; 1] = [\"p\"];")).toThrow();
+  });
+
   it.each(SWITCH_MIRRORED)("`%s` の欄が `switch.rs` と一致する", (name) => {
     expect(labelsOf(tsFieldsOf(API_TS, name))).toEqual(
       labelsOf(rustFieldsOf(SWITCH_RS, name)),
@@ -470,6 +509,7 @@ describe("上流プロファイルの欄名は写し元と一致する（`profil
     // **応答は `Option` でも省略可ではない**（`null` として必ず載る）。
     // **鍵の値（`api_key`）は `#[serde(skip)]` で線に乗らない**（作業単位 A-13b-1）。
     // **承認（`allow_key_over_plain_http`）は作業単位 A-13b-3 で両方の向きに入った**（応答は必ず載る・依頼は省ける）。
+    // **`sampling` / `response_tokens` は作業単位 D-21 で両方の向きに入った**（応答は必ず載る・依頼は省ける）。
     expect(labelsOf(rustFieldsOf(PROFILE_EDITOR_RS, "WrittenFace"))).toEqual([
       "allow_key_over_plain_http",
       "api_key_hint",
@@ -480,6 +520,8 @@ describe("上流プロファイルの欄名は写し元と一致する（`profil
       "endpoint",
       "gguf",
       "model",
+      "response_tokens",
+      "sampling",
     ]);
     // **依頼なら、書かなくてよい鍵は省略可になる。**
     expect(labelsOf(rustFieldsOf(PROFILE_EDITOR_RS, "WrittenFaceRequest"))).toEqual([
@@ -491,6 +533,8 @@ describe("上流プロファイルの欄名は写し元と一致する（`profil
       "endpoint",
       "gguf?",
       "model",
+      "response_tokens?",
+      "sampling?",
     ]);
     // **応答の型は依頼の向きを持たない**（黙って片方を選ばない）。
     expect(() => rustFieldsAs(PROFILE_EDITOR_RS, "WrittenFace", "deserialize")).toThrow();

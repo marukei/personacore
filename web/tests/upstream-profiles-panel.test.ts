@@ -52,10 +52,18 @@ import { enterAsReader, readerInZone } from "./support/zone";
  * **一覧の面を、保存の依頼の面の形にする**（作業単位 A-13b-1）。
  *
  * 応答の `api_key_set` / `api_key_hint` は依頼に無く、画面は触らない鍵と承認を送らない（＝残す・今の規則 / 作業単位 A-13b-3）。
+ *
+ * **`sampling` / `response_tokens` は書いた値（か `null`）のまま必ず送る**（作業単位 D-21）。**裏方の面には `response_tokens` を載せない。**
  */
-function requested(face: WrittenFace): WrittenFaceRequest {
-  const { api_key_set: _set, api_key_hint: _hint, allow_key_over_plain_http: _approved, ...rest } = face;
-  return rest;
+function requested(face: WrittenFace, side: "main" | "sub" = "main"): WrittenFaceRequest {
+  const {
+    api_key_set: _set,
+    api_key_hint: _hint,
+    allow_key_over_plain_http: _approved,
+    response_tokens,
+    ...rest
+  } = face;
+  return side === "main" ? { ...rest, response_tokens } : rest;
 }
 
 // **画面が `browserZone()` を訊く**（上流の状態の文面の時刻 / Issue origin#40）。
@@ -85,6 +93,8 @@ const ALPHA: WrittenProfile = {
     api_key_set: false,
     api_key_hint: null,
     allow_key_over_plain_http: false,
+    sampling: null,
+    response_tokens: null,
   },
   sub: {
     endpoint: "http://127.0.0.1:41002",
@@ -96,9 +106,15 @@ const ALPHA: WrittenProfile = {
     api_key_set: false,
     api_key_hint: null,
     allow_key_over_plain_http: false,
+    sampling: null,
+    response_tokens: null,
   },
 };
 
+/**
+ * **`sampling` / `response_tokens` は真ん中の `beta` にだけ書く**（作業単位 D-21 / ADR-0060 §決定6）。
+ * 既定（1.1・1024・`"none"`）と違え、本文と裏方でも違える。
+ */
 const BETA: WrittenProfile = {
   name: "beta",
   main: {
@@ -111,6 +127,8 @@ const BETA: WrittenProfile = {
     api_key_set: false,
     api_key_hint: null,
     allow_key_over_plain_http: false,
+    sampling: { repeat_penalty: 1.05, reasoning_effort: "low" },
+    response_tokens: 2000,
   },
   sub: {
     endpoint: "http://127.0.0.1:41004",
@@ -122,6 +140,8 @@ const BETA: WrittenProfile = {
     api_key_set: false,
     api_key_hint: null,
     allow_key_over_plain_http: false,
+    sampling: { repeat_penalty: 1.25 },
+    response_tokens: null,
   },
 };
 
@@ -137,6 +157,8 @@ const GAMMA: WrittenProfile = {
     api_key_set: false,
     api_key_hint: null,
     allow_key_over_plain_http: false,
+    sampling: null,
+    response_tokens: null,
   },
   sub: null,
 };
@@ -382,9 +404,25 @@ const WINDOW_LABEL = "コンテキスト長（context_tokens）";
  * **`<dt>` / `<dd>` の文面そのもの**（`data-*` ではない）。
  */
 function summaryOf(name: string): string[][] {
-  return [...profileBlock(name).querySelectorAll("dl > div")].map((row) =>
-    [...row.querySelectorAll("dt, dd")].map((cell) => flat(cell)),
-  );
+  return [...profileBlock(name).querySelectorAll("dl > div")].map((row) => [
+    flat(row.querySelector("dt")),
+    // **要点の1行だけ**（作業単位 D-21 で同じ `<dd>` に足した送る値の行は [`sentOf`] が読む）。
+    flat(row.querySelector("dd .summary")),
+  ]);
+}
+
+/**
+ * **プロファイル1件の、面ごとの送る値**（作業単位 D-21 / ADR-0060 §決定3）。行ごとに `[見出し, [[文面, 既定の印 | null], …]]`。
+ * **既定の印は、書いた値の文面とは別の要素**（`.sent-default`）—— 書いた値と区別できる形で出ていることを見る。
+ */
+function sentOf(name: string): [string, [string, string | null][]][] {
+  return [...profileBlock(name).querySelectorAll("dl > div")].map((row) => [
+    flat(row.querySelector("dt")),
+    [...row.querySelectorAll("dd .sent-value")].map((value) => {
+      const fallback = value.querySelector(".sent-default");
+      return [flat(value.querySelector(".sent-text")), fallback === null ? null : flat(fallback)];
+    }),
+  ]);
 }
 
 /** 開いている下書きの、その面の欄の組。 */
@@ -1420,10 +1458,13 @@ describe("足す・直す", () => {
         body: {
           revision: "rev-1",
           main: requested({ ...BETA.main, model: "beta-main-2" }),
-          sub: requested({
-            ...(BETA.sub as WrittenFace),
-            args: ["--batch-size", "512", "--alias", "two words"],
-          }),
+          sub: requested(
+            {
+              ...(BETA.sub as WrittenFace),
+              args: ["--batch-size", "512", "--alias", "two words"],
+            },
+            "sub",
+          ),
         },
       },
     ]);
@@ -1505,7 +1546,7 @@ describe("足す・直す", () => {
       {
         revision: "rev-1",
         main: requested({ ...BETA.main, context_tokens: 20480 }),
-        sub: requested({ ...(BETA.sub as WrittenFace), context_tokens: null }),
+        sub: requested({ ...(BETA.sub as WrittenFace), context_tokens: null }, "sub"),
       },
     ]);
     expect(summaryOf("beta")).toEqual([
@@ -1618,6 +1659,9 @@ describe("足す・直す", () => {
             args: ["--ctx-size", "8192"],
             command: null,
             context_tokens: null,
+            // **足すときも2つの欄を必ず送る**（空は `null` / 作業単位 D-21）。
+            sampling: null,
+            response_tokens: null,
           },
           sub: {
             endpoint: "http://127.0.0.1:41008",
@@ -1626,6 +1670,8 @@ describe("足す・直す", () => {
             args: null,
             command: null,
             context_tokens: 12288,
+            // **裏方には `response_tokens` を載せない。**
+            sampling: null,
           },
         },
       },
@@ -1947,8 +1993,13 @@ describe("編集欄の場所とフォーカス", () => {
  * **選んだ種類の欄だけを出し、保存で送るのも選んだ種類の欄だけ。もう一方の欄の値は下書きに残す。**
  */
 describe("面の種類", () => {
-  /** **鍵は両方の種類の欄**（作業単位 A-13b-3 のレビュー是正で、起こす面にも出した）。 */
-  const LAUNCH_LABELS = [
+  /**
+   * **鍵は両方の種類の欄**（作業単位 A-13b-3 のレビュー是正で、起こす面にも出した）。
+   *
+   * **作業単位 D-21 で、本文の面に返答の上限（すぐ出す）、両面に繰り返しの罰（詳細の最後）が入った**（ADR-0060 §決定3）。
+   * 思考の2択とサンプリングの組は `label` ではない（組の見出しとボタン）ので、ここには数えない。
+   */
+  const LAUNCH_LABELS_SUB = [
     "gguf のパス（gguf）",
     "依頼するモデルの綴り（model）",
     ENDPOINT_LAUNCH,
@@ -1956,9 +2007,28 @@ describe("面の種類", () => {
     "起動の引数（args）",
     "実行ファイル（command）",
     WINDOW_LABEL,
+    "繰り返しの罰（repeat_penalty）",
+  ];
+  const LAUNCH_LABELS = [
+    "gguf のパス（gguf）",
+    "依頼するモデルの綴り（model）",
+    ENDPOINT_LAUNCH,
+    "鍵（api_key）",
+    "返答の上限（response_tokens）",
+    "起動の引数（args）",
+    "実行ファイル（command）",
+    WINDOW_LABEL,
+    "繰り返しの罰（repeat_penalty）",
   ];
   /** **鍵は両方の種類の欄**（作業単位 A-13b-3 で足した）。 */
-  const CONNECT_LABELS = [ENDPOINT_CONNECT, "依頼するモデルの綴り（model）", "鍵（api_key）", WINDOW_LABEL];
+  const CONNECT_LABELS = [
+    ENDPOINT_CONNECT,
+    "依頼するモデルの綴り（model）",
+    "鍵（api_key）",
+    WINDOW_LABEL,
+    "返答の上限（response_tokens）",
+    "繰り返しの罰（repeat_penalty）",
+  ];
 
   async function openEditor(name: string): Promise<Record<string, unknown>> {
     const view = await open();
@@ -1986,7 +2056,16 @@ describe("面の種類", () => {
     ]);
     expect(labelsOf(MAIN_LEGEND)).toEqual(LAUNCH_LABELS);
     // **起動の引数・実行ファイル・コンテキスト長は「詳細」に畳む**（コンテキスト長も落とさない / ADR-0054）。
-    expect(foldedLabels(MAIN_LEGEND)).toEqual(["起動の引数（args）", "実行ファイル（command）", WINDOW_LABEL]);
+    // **繰り返しの罰も詳細に畳む**（作業単位 D-21 / ADR-0060 §決定3）。
+    expect(foldedLabels(MAIN_LEGEND)).toEqual([
+      "起動の引数（args）",
+      "実行ファイル（command）",
+      WINDOW_LABEL,
+      "繰り返しの罰（repeat_penalty）",
+    ]);
+    expect(flat(fieldsetOf(MAIN_LEGEND).querySelector("details > summary"))).toBe(
+      "詳細（起動の引数・実行ファイル・コンテキスト長・繰り返しの罰）",
+    );
     mustButton(target.querySelector("form") as HTMLFormElement, "やめる").click();
     await vi.waitFor(() => {
       expect(target.querySelector("form")).toBeNull();
@@ -1998,7 +2077,8 @@ describe("面の種類", () => {
     });
     expect(pressedOf(MAIN_LEGEND)).toEqual(["false", "true"]);
     expect(labelsOf(MAIN_LEGEND)).toEqual(CONNECT_LABELS);
-    expect(fieldsetOf(MAIN_LEGEND).querySelector("details")).toBeNull();
+    // **繋ぐ面の詳細は、繰り返しの罰だけ**（作業単位 D-21。D-19 の間は繋ぐ面に詳細が無かった）。
+    expect(foldedLabels(MAIN_LEGEND)).toEqual(["繰り返しの罰（repeat_penalty）"]);
     await unmount(view, { outro: false });
   });
 
@@ -2020,7 +2100,7 @@ describe("面の種類", () => {
       expect(target.querySelectorAll("form fieldset")).toHaveLength(2);
     });
     expect(pressedOf(SUB_LEGEND)).toEqual(["true", "false"]);
-    expect(labelsOf(SUB_LEGEND)).toEqual(LAUNCH_LABELS);
+    expect(labelsOf(SUB_LEGEND)).toEqual(LAUNCH_LABELS_SUB);
     mustButton(target.querySelector("form") as HTMLFormElement, "やめる").click();
     await vi.waitFor(() => {
       expect(target.querySelector("form")).toBeNull();
@@ -2106,8 +2186,11 @@ describe("面の種類", () => {
           args: null,
           command: null,
           context_tokens: 24576,
+          // **思考・返答の上限・繰り返しの罰は種類によらず送る**（作業単位 D-21 —— 起こす面・繋ぐ面とも同じ欄）。
+          sampling: { repeat_penalty: 1.05, reasoning_effort: "low" },
+          response_tokens: 2000,
         },
-        sub: requested(BETA.sub as WrittenFace),
+        sub: requested(BETA.sub as WrittenFace, "sub"),
       },
     ]);
     expect(summaryOf("beta")).toEqual([
@@ -2420,6 +2503,9 @@ describe("保存を断られたとき", () => {
         key: "context_tokens",
       });
     const view = await openBetaEditor();
+    // **`beta` の本文に書いた返答の上限（2000）は空にする**（作業単位 D-21 で `beta` に足した値。残すと、窓 1024 は
+    // 「上限が窓以上」として画面が送る前に止め、ここで見たいサーバの 422 に届かない）。
+    type(fieldOf(MAIN_LEGEND, "返答の上限（response_tokens）"), "");
     type(fieldOf(MAIN_LEGEND, WINDOW_LABEL), "1024");
     mustButton(target.querySelector("form") as HTMLFormElement, "保存する").click();
 
@@ -2873,6 +2959,256 @@ describe("旗と値を1行に書いた引数", () => {
     // **欄の注記を、欄から離れた下書きの末尾に並べない**（着手前の形）。
     const loose = [...form.querySelectorAll(":scope > p.note")].map((note) => flat(note));
     expect(loose.filter((note) => note.includes("起動の引数") || note.includes("コンテキスト長"))).toEqual([]);
+    await unmount(view, { outro: false });
+  });
+});
+
+/**
+ * **思考・返答の上限・繰り返しの罰**（作業単位 D-21 / ADR-0060 §決定3 / §決定6 の腕7）。
+ *
+ * 値は真ん中の `beta` にだけ書いてある（本文 1.05・`low`・2000 / 裏方 1.25）。**文面は直書き**（定数から作らない）。
+ */
+describe("思考・返答の上限・繰り返しの罰（作業単位 D-21）", () => {
+  const THINKING_GROUP = "思考（reasoning_effort）";
+  const ROOM_LABEL = "返答の上限（response_tokens）";
+  const PENALTY_LABEL = "繰り返しの罰（repeat_penalty）";
+  const SAMPLING_HEADING = "サンプリング（sampling）";
+
+  async function openEditor(name: string): Promise<Record<string, unknown>> {
+    const view = await open();
+    mustButton(profileBlock(name), "直す").click();
+    await vi.waitFor(() => {
+      expect(target.querySelector("form")).not.toBeNull();
+    });
+    return view;
+  }
+
+  /** **その面のサンプリングの組**（見出しで名乗る `role=group`）。無ければ `null`。 */
+  function samplingGroup(legend: string): HTMLElement | null {
+    const groups = [...fieldsetOf(legend).querySelectorAll<HTMLElement>("[role=group][aria-labelledby]")].filter(
+      (group) => flat(document.getElementById(group.getAttribute("aria-labelledby") ?? "")) === SAMPLING_HEADING,
+    );
+    expect(groups.length, `面「${legend}」のサンプリングの組は1つまで`).toBeLessThanOrEqual(1);
+    return groups[0] ?? null;
+  }
+
+  /** 本文の面の思考の2択（`[切る, 入れる]`）。 */
+  function thinkingButtons(): [HTMLButtonElement, HTMLButtonElement] {
+    const group = fieldsetOf(MAIN_LEGEND).querySelector(`[role=group][aria-label="${THINKING_GROUP}"]`);
+    expect(group, "本文の面に思考の2択があること").not.toBeNull();
+    return [mustButton(group as Element, "切る（既定）"), mustButton(group as Element, "入れる（low）")];
+  }
+
+  function lastPut(): { main: Record<string, unknown>; sub: Record<string, unknown> | null } {
+    const puts = sent.filter((s) => s.method === "PUT");
+    return puts.at(-1)?.body as { main: Record<string, unknown>; sub: Record<string, unknown> | null };
+  }
+
+  /**
+   * **一覧: 書いた値を見せ、書いていなければ「書いていない」と言って既定の印を添える**（ADR-0060 §決定3）。
+   * **本文の面は3つ、裏方の面は繰り返しの罰だけ。** 既定の印は書いた値の文面と別の要素。
+   */
+  it("一覧: 面ごとに書いた値を出し、書いていなければ既定の印を別に添える", async () => {
+    const view = await open();
+    expect(sentOf("beta")).toEqual([
+      [
+        "本文",
+        [
+          ["思考 入れる（low）", null],
+          ["返答の上限 2,000", null],
+          ["繰り返しの罰 1.05", null],
+        ],
+      ],
+      ["裏方", [["繰り返しの罰 1.25", null]]],
+    ]);
+    expect(sentOf("alpha")).toEqual([
+      [
+        "本文",
+        [
+          ["思考 書いていない", "既定 切る"],
+          ["返答の上限 書いていない", "既定 1,024"],
+          ["繰り返しの罰 書いていない", "既定 1.1"],
+        ],
+      ],
+      ["裏方", [["繰り返しの罰 書いていない", "既定 1.1"]]],
+    ]);
+    // **裏方を書いていなければ、何も添えない**（本文と同じ）。
+    expect(sentOf("gamma")[1]).toEqual(["裏方", []]);
+    await unmount(view, { outro: false });
+  });
+
+  /**
+   * **下書き: 本文の面は思考（すぐ出す）・返答の上限（すぐ出す）・繰り返しの罰（詳細）。裏方の面は繰り返しの罰（詳細）だけ**
+   * （ADR-0060 §決定3 の表）。書いた値がその面の欄に入る。
+   */
+  it("直す: 書いた値がその面の欄に入り、思考と返答の上限は本文の面だけですぐ出し、繰り返しの罰は詳細に畳む", async () => {
+    const view = await openEditor("beta");
+    expect(thinkingButtons().map((button) => button.getAttribute("aria-pressed"))).toEqual(["false", "true"]);
+    expect(thinkingButtons()[0].closest("details")).toBeNull();
+    expect(fieldOf(MAIN_LEGEND, ROOM_LABEL).value).toBe("2000");
+    expect(fieldOf(MAIN_LEGEND, ROOM_LABEL).closest("details")).toBeNull();
+    expect(fieldOf(MAIN_LEGEND, PENALTY_LABEL).value).toBe("1.05");
+    expect(fieldOf(MAIN_LEGEND, PENALTY_LABEL).closest("details")).not.toBeNull();
+    expect(samplingGroup(MAIN_LEGEND)?.closest("details")).toBeNull();
+
+    // **裏方の面は、思考も返答の上限も出さない。**
+    expect(labelsOf(SUB_LEGEND)).not.toContain(ROOM_LABEL);
+    expect(fieldsetOf(SUB_LEGEND).querySelector(`[aria-label="${THINKING_GROUP}"]`)).toBeNull();
+    expect(fieldOf(SUB_LEGEND, PENALTY_LABEL).value).toBe("1.25");
+    expect(fieldOf(SUB_LEGEND, PENALTY_LABEL).closest("details")).not.toBeNull();
+    expect(samplingGroup(SUB_LEGEND)?.closest("details")).not.toBeNull();
+    // **裏方の組も「保存しただけでは効かず、切り替え直すと効く」と言う**（D-21 のレビュー F2）。思考の注記は本文の面だけ。
+    const subNotes = [...(samplingGroup(SUB_LEGEND) as HTMLElement).querySelectorAll("p.note")].map((note) => flat(note));
+    expect(subNotes.join(" ")).toContain("同じ名前へ切り替え直すと効きます");
+    expect(subNotes.join(" ")).not.toContain("思考させるか");
+    await unmount(view, { outro: false });
+  });
+
+  /**
+   * **保存では2つの欄を必ず送る**（空の欄は `null`）。**思考を「切る」にすると `reasoning_effort` だけが落ち、繰り返しの罰が残る。**
+   * **裏方の依頼には `response_tokens` を載せない**（ADR-0060 §決定3）。
+   */
+  it("保存: 思考を切ると繰り返しの罰だけが残り、空の上限は null で送り、裏方には上限を載せない", async () => {
+    const view = await openEditor("beta");
+    thinkingButtons()[0].click();
+    await vi.waitFor(() => {
+      expect(thinkingButtons()[0].getAttribute("aria-pressed")).toBe("true");
+    });
+    type(fieldOf(MAIN_LEGEND, ROOM_LABEL), "");
+    mustButton(target.querySelector("form") as HTMLFormElement, "保存する").click();
+    await vi.waitFor(() => {
+      expect(sent.filter((s) => s.method === "PUT")).toHaveLength(1);
+    });
+    const body = lastPut();
+    expect([body.main["sampling"], body.main["response_tokens"]]).toEqual([{ repeat_penalty: 1.05 }, null]);
+    expect(Object.keys(body.main)).toEqual(expect.arrayContaining(["sampling", "response_tokens"]));
+    expect(body.sub?.["sampling"]).toEqual({ repeat_penalty: 1.25 });
+    expect(Object.keys(body.sub ?? {})).not.toContain("response_tokens");
+    expect(Object.keys(body.sub ?? {})).not.toContain("reasoning_effort");
+    await unmount(view, { outro: false });
+  });
+
+  it("保存: 両方の欄を空にした面は、`sampling` を省かず `null` で送る", async () => {
+    const view = await openEditor("beta");
+    thinkingButtons()[0].click();
+    type(fieldOf(MAIN_LEGEND, PENALTY_LABEL), "");
+    type(fieldOf(SUB_LEGEND, PENALTY_LABEL), "");
+    mustButton(target.querySelector("form") as HTMLFormElement, "保存する").click();
+    await vi.waitFor(() => {
+      expect(sent.filter((s) => s.method === "PUT")).toHaveLength(1);
+    });
+    const body = lastPut();
+    expect([body.main["sampling"], body.sub?.["sampling"]]).toEqual([null, null]);
+    expect(Object.keys(body.sub ?? {})).toContain("sampling");
+    await unmount(view, { outro: false });
+  });
+
+  /** **事前の検査は、その欄で言う。直せば送る**（範囲 0.5〜2.0・上限は同じ面に書いた窓より小さい）。 */
+  it("送る前の検査: 繰り返しの罰の範囲と、窓以上の上限を、その欄で言い、直せば送る", async () => {
+    const view = await openEditor("beta");
+    type(fieldOf(SUB_LEGEND, PENALTY_LABEL), "2.5");
+    mustButton(target.querySelector("form") as HTMLFormElement, "保存する").click();
+    await vi.waitFor(() => {
+      expect(fieldOf(SUB_LEGEND, PENALTY_LABEL).getAttribute("aria-invalid")).toBe("true");
+    });
+    expect(describedText(fieldOf(SUB_LEGEND, PENALTY_LABEL))).toContain("0.5 以上 2.0 以下");
+    expect((fieldOf(SUB_LEGEND, PENALTY_LABEL).closest("details") as HTMLDetailsElement).open).toBe(true);
+    expect(fieldOf(MAIN_LEGEND, PENALTY_LABEL).getAttribute("aria-invalid")).toBeNull();
+
+    type(fieldOf(SUB_LEGEND, PENALTY_LABEL), "2");
+    type(fieldOf(MAIN_LEGEND, WINDOW_LABEL), "8192");
+    type(fieldOf(MAIN_LEGEND, ROOM_LABEL), "8192");
+    mustButton(target.querySelector("form") as HTMLFormElement, "保存する").click();
+    await vi.waitFor(() => {
+      expect(fieldOf(MAIN_LEGEND, ROOM_LABEL).getAttribute("aria-invalid")).toBe("true");
+    });
+    expect(describedText(fieldOf(MAIN_LEGEND, ROOM_LABEL))).toContain("コンテキスト長より小さく");
+    expect(sent.filter((s) => s.method === "PUT")).toHaveLength(0);
+
+    type(fieldOf(MAIN_LEGEND, ROOM_LABEL), "8191");
+    mustButton(target.querySelector("form") as HTMLFormElement, "保存する").click();
+    await vi.waitFor(() => {
+      expect(sent.filter((s) => s.method === "PUT")).toHaveLength(1);
+    });
+    const body = lastPut();
+    expect([body.main["response_tokens"], body.sub?.["sampling"]]).toEqual([8191, { repeat_penalty: 2 }]);
+    await unmount(view, { outro: false });
+  });
+
+  /**
+   * **422 の `sampling` は、その面のサンプリングの組の見出しに出る**（`reason` だけでは思考と繰り返しの罰を区別できない）。
+   * **裏方の面の失敗は本文の面の組に出ない**（詳細に畳んだ裏方の組が開いて見える）。
+   */
+  it("422: `sampling` はその面のサンプリングの組に出て、裏方の失敗は本文の組に出ない", async () => {
+    const message = "sampling が使えません（オブジェクトで書き、repeat_penalty は 0.5 以上 2 以下の数、reasoning_effort は none / low で書いてください）";
+    onSave = () =>
+      apiError(422, "upstream_profile_invalid", "上流プロファイルの形が不正なので保存しませんでした", {
+        reason: "sampling_unusable",
+        reason_message: message,
+        face: "sub",
+        key: "sampling",
+      });
+    const view = await openEditor("beta");
+    mustButton(target.querySelector("form") as HTMLFormElement, "保存する").click();
+    await vi.waitFor(() => {
+      expect(flat(samplingGroup(SUB_LEGEND))).toContain(`保存しませんでした: ${message}`);
+    });
+    expect(flat(samplingGroup(MAIN_LEGEND))).not.toContain("保存しませんでした");
+    expect((samplingGroup(SUB_LEGEND)?.closest("details") as HTMLDetailsElement).open).toBe(true);
+    // **組の見出しと理由は結びついている。**
+    expect(describedText(samplingGroup(SUB_LEGEND) as HTMLElement)).toContain(message);
+    await unmount(view, { outro: false });
+  });
+
+  /** **上限が窓以上の 422 は `key: "context_tokens"`。起こす面の窓の欄は詳細に畳まれているので、詳細が開く**（作業単位 D-19 の振る舞い）。 */
+  it("422: `context_tokens`（上限が窓以上）は窓の欄に出て、起こす面の詳細が開く", async () => {
+    onSave = () =>
+      apiError(422, "upstream_profile_invalid", "上流プロファイルの形が不正なので保存しませんでした", {
+        reason: "context_tokens_unusable",
+        reason_message: "context_tokens が使えません（応答の余白より大きい整数のトークン数で書いてください）",
+        face: "main",
+        key: "context_tokens",
+      });
+    const view = await openEditor("beta");
+    const details = fieldOf(MAIN_LEGEND, WINDOW_LABEL).closest("details") as HTMLDetailsElement;
+    expect(details.open).toBe(false);
+    type(fieldOf(MAIN_LEGEND, ROOM_LABEL), "4000");
+    mustButton(target.querySelector("form") as HTMLFormElement, "保存する").click();
+    await vi.waitFor(() => {
+      expect(fieldOf(MAIN_LEGEND, WINDOW_LABEL).getAttribute("aria-invalid")).toBe("true");
+    });
+    expect(details.open).toBe(true);
+    expect(fieldOf(MAIN_LEGEND, ROOM_LABEL).getAttribute("aria-invalid")).toBeNull();
+    await unmount(view, { outro: false });
+  });
+
+  /**
+   * **思考を入れて上限が空か既定以下なら、欄の隣で言う。数は出さない**（ADR-0060 §決定3）。
+   * **範囲は柵だと言い、保存しただけでは効かず同じ名前へ切り替え直すと効くと言う。**
+   */
+  it("案内: 思考を入れて上限が空なら注意を出し、範囲は柵だと言い、切り替え直すと効くと言う", async () => {
+    const view = await openEditor("gamma");
+    const caution = "思考は返答の上限の中で書かれます";
+    expect(flat(samplingGroup(MAIN_LEGEND))).not.toContain(caution);
+    thinkingButtons()[1].click();
+    await vi.waitFor(() => {
+      expect(flat(samplingGroup(MAIN_LEGEND))).toContain(caution);
+    });
+    const warned = [...(samplingGroup(MAIN_LEGEND) as HTMLElement).querySelectorAll("p")].find((p) =>
+      flat(p).includes(caution),
+    );
+    expect(flat(warned)).not.toMatch(/[0-9]/u);
+    type(fieldOf(MAIN_LEGEND, ROOM_LABEL), "1500");
+    await vi.waitFor(() => {
+      expect(flat(samplingGroup(MAIN_LEGEND))).not.toContain(caution);
+    });
+    // **値を自動で入れない**（入れたのは利用者の 1500 だけ）。
+    expect(fieldOf(MAIN_LEGEND, ROOM_LABEL).value).toBe("1500");
+
+    expect(notesNear(fieldOf(MAIN_LEGEND, PENALTY_LABEL)).join(" ")).toContain("柵");
+    expect(flat(samplingGroup(MAIN_LEGEND))).toContain("同じ名前へ切り替え直すと効きます");
+    // **繋ぐ面にも詳細ができる**（繰り返しの罰）。
+    expect(flat(fieldsetOf(MAIN_LEGEND).querySelector("details > summary"))).toBe("詳細（繰り返しの罰）");
     await unmount(view, { outro: false });
   });
 });

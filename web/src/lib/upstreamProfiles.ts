@@ -10,6 +10,11 @@
  * **書いていない鍵を、決まる値（既定の実行ファイル名・本文の上流）で埋めない** ——
  * 埋めると「書いた」と「決まった」が同じ見え方になる。**書いていないと言う。**
  *
+ * **例外は「既定の印」だけ**（作業単位 D-21 / ADR-0060 §決定3）。思考・返答の上限・繰り返しの罰は、書いていなければ
+ * 送る値（思考を切る・1024・1.1）を**値の欄とは別の「既定」の印として**添える（[`SentValue`]）。**値の欄は埋めない**
+ * （`written` は `null` のまま、下書きの欄も空のまま）—— どの値で送っているかを、ログを開かずに見られるようにするため。
+ * それ以外（実行ファイル名・窓）は今までどおり何も添えない。
+ *
  * # 帰属は1箇所で決める
  *
  * どのプロファイルの、どちらの面の、どの鍵か ——**入れ替えの変異を1本で押さえる**ため、
@@ -23,6 +28,10 @@
  * | [`FACE_KEYS`] | 同 `FACE_KEYS` | 同上 |
  * | [`DEFAULT_COMMAND`] | 同 `DEFAULT_COMMAND` | 同上 |
  * | [`LAUNCH_STATE`]（[`launchLabel`] と会話の画面が読む綴り） | `src/server/launch.rs` の `FaceState::label` | 同上（**変種ごとに**） |
+ * | 画面が書ける `sampling` の鍵（[`buildSaveRequest`] が組む） | `src/server/upstreams.rs` の `SAMPLING_KEYS` | 同上（**集合が一致する** / ADR-0060 §決定4） |
+ * | [`REPEAT_PENALTY_MIN`] / [`REPEAT_PENALTY_MAX`] | `src/llm/request.rs` の同じ名前 | 同上 |
+ * | [`DEFAULT_REPEAT_PENALTY`] | 同 `RequestPolicy::PERSONACORE` の `repeat_penalty` | 同上 |
+ * | [`DEFAULT_RESPONSE_TOKENS`] | `src/prompt/budget.rs` の `TokenBudget::DEFAULT_RESPONSE_TOKENS` | 同上 |
  */
 
 import {
@@ -34,6 +43,7 @@ import {
   type WrittenFace,
   type WrittenFaceRequest,
   type WrittenProfile,
+  type WrittenSampling,
 } from "./api";
 import { instantOf, wallTimeOf } from "./timestamp";
 import { keyDestination } from "./upstreamKey";
@@ -55,11 +65,9 @@ export type Face = (typeof FACES)[number];
  * **`allow_key_over_plain_http` は作業単位 A-13b-2 で足した**（ADR-0056 §決定5）。**欄にはしない**
  * （真偽値を打たせない）。承認は保存の前の確認で取る（作業単位 A-13b-3 / [`nextKeyQuestion`]）。
  *
- * **`sampling` は作業単位 A-16 で足した**（ADR-0058 §決定6）。**欄にはしない**（画面で値を見せる・直す作業は
- * 別の作業単位）。画面は値を受け取らず送りもしない —— 保存はサーバが、いまのファイルの同じ名前・同じ面の値を残す。
- *
- * **`response_tokens` は作業単位 A-18a で足した**（ADR-0059 §決定5）。**`sampling` と同じく欄にはしない**
- * （画面の欄は別の作業単位）。書けるのは本文の面（`main`）だけで、画面は値を受け取らず送りもしない。
+ * **`sampling` は作業単位 A-16 で、`response_tokens` は作業単位 A-18a で足した**（ADR-0058 / ADR-0059）。
+ * **欄は作業単位 D-21 で足した**（ADR-0060）。それまでは画面が値を受け取らず送りもせず、保存はサーバが
+ * いまのファイルの同じ名前・同じ面の値を残していた。`response_tokens` を書けるのは本文の面（`main`）だけ。
  */
 export const FACE_KEYS = [
   "endpoint",
@@ -78,7 +86,7 @@ export const FACE_KEYS = [
 export type FaceKey = (typeof FACE_KEYS)[number];
 
 /**
- * **画面が欄を持つ鍵**（[`FACE_KEYS`] から `allow_key_over_plain_http` と `sampling` と `response_tokens` を除いたもの。並びは同じ）。
+ * **画面が欄を持つ鍵**（[`FACE_KEYS`] から `allow_key_over_plain_http` を除いたもの。並びは同じ）。
  *
  * **`api_key` の欄は、値を出さない**（応答は鍵の値を返さない —— `api_key_set` / `api_key_hint` だけ / ADR-0056 §決定3）。
  * 下書きの `api_key` は**新しい鍵**の入力で、空なら置き換えない（[`FaceDraft`]）。作業単位 A-13b-3 で欄にした
@@ -87,22 +95,44 @@ export type FaceKey = (typeof FACE_KEYS)[number];
  * **`allow_key_over_plain_http` を除く理由**: 真偽値を欄で打たせない。承認は保存の前の確認で取り、
  * 鍵の欄の隣で状態を言う（[`keySendingState`]）。
  *
- * **`sampling` を除く理由**（ADR-0058 §決定6）: 画面はまだこの欄を持たない（`EditableFaceKey` は下書き・欄の型を決めるので、
- * 除かないと存在しない欄が型に現れる）。仕様書の `enum` には `sampling` があるが、いまの保存の 422 は名指さない。
- * 名指す形が生じたときに、存在しない欄へ結びつけて理由を画面から消さないための予防でもある（[`isEditableFaceKey`]）。
- *
- * **`response_tokens` を除く理由**（ADR-0059 §決定5）: `sampling` と同じ（画面はまだこの欄を持たない）。
+ * **`sampling` と `response_tokens` は作業単位 D-21 で入れた**（ADR-0060 §決定4。A-16・A-18a の間は画面が欄を持たず、除いていた）。
+ * **`sampling` を名指した 422 は、思考と繰り返しの罰の2つの欄の組の見出しに出る**（`reason` だけでは2つのどちらかを
+ * 区別できない）。`response_tokens` は本文の面の返答の上限の欄に出る（裏方の面には欄が無いので、全体に出る / [`fieldsOf`]）。
  */
 export const EDITABLE_FACE_KEYS = FACE_KEYS.filter(
-  (key): key is EditableFaceKey =>
-    key !== "allow_key_over_plain_http" && key !== "sampling" && key !== "response_tokens",
+  (key): key is EditableFaceKey => key !== "allow_key_over_plain_http",
 );
 
 /** 画面が欄を持つ鍵。 */
-export type EditableFaceKey = Exclude<
-  FaceKey,
-  "allow_key_over_plain_http" | "sampling" | "response_tokens"
->;
+export type EditableFaceKey = Exclude<FaceKey, "allow_key_over_plain_http">;
+
+/**
+ * **画面が描く欄**（[`EditableFaceKey`] と、`sampling` の中の繰り返しの罰 / 作業単位 D-21）。
+ *
+ * **`sampling` は2つの欄の組の見出し**（本文の面では思考の2択も持つ）で、**`repeat_penalty` はその組の片方の入力**。
+ * 保存の失敗はこのどれかに結びつく（サーバの 422 は `sampling` を、画面の事前の検査は `repeat_penalty` を名指す）。
+ */
+export type FieldKey = EditableFaceKey | "repeat_penalty";
+
+/** **下書きの文字列の欄**（入力欄の値そのもの。`sampling` は組の見出しなので入らない）。 */
+export type TextFieldKey = Exclude<FieldKey, "sampling">;
+
+/** **思考の2択**（`"none"` は「切る」= 書かない / ADR-0060 §決定3）。 */
+export type Thinking = "none" | "low";
+
+/**
+ * **繰り返しの罰の範囲**（`llm::REPEAT_PENALTY_MIN` / `REPEAT_PENALTY_MAX` の写し。両端を含む）。
+ *
+ * **測って決めた範囲ではない**（壊れた値と打ち損じを止める柵 / ADR-0060 §決定3）—— 画面もそう言う（[`REPEAT_PENALTY_NOTE`]）。
+ */
+export const REPEAT_PENALTY_MIN = 0.5;
+export const REPEAT_PENALTY_MAX = 2;
+
+/** **書いていない面で送る繰り返しの罰**（`llm::RequestPolicy::PERSONACORE` の写し）。既定の印にだけ使う。 */
+export const DEFAULT_REPEAT_PENALTY = 1.1;
+
+/** **書いていない面の本文の返答の上限**（`prompt::TokenBudget::DEFAULT_RESPONSE_TOKENS` の写し）。既定の印と案内の条件にだけ使う。 */
+export const DEFAULT_RESPONSE_TOKENS = 1024;
 
 /**
  * **`command` を書かなかった面で起こす実行ファイルの名前**（`upstreams.rs` の `DEFAULT_COMMAND` の写し）。
@@ -179,11 +209,56 @@ function kindHasKey(kind: FaceKind, key: EditableFaceKey): boolean {
 }
 
 /**
+ * **面と種類ごとに、下書きが持つ欄**（[`KIND_FIELDS`] に、作業単位 D-21 の欄を足したもの / ADR-0060 §決定3 の表）。
+ *
+ * | 欄 | 本文の面 | 裏方の面 |
+ * |---|---|---|
+ * | サンプリングの組（`sampling`。本文の面では思考の2択「切る（既定）／入れる（low）」を持つ） | すぐ出す | 詳細に畳む（組は繰り返しの罰だけ） |
+ * | 返答の上限（`response_tokens`） | すぐ出す | **出さない** |
+ * | 繰り返しの罰（`repeat_penalty`） | 詳細に畳む | 詳細に畳む |
+ *
+ * **起こす面・繋ぐ面とも同じ置き場所**（思考と返答の上限は、長い会話で返答が縮まないように使う値で、変える人が多いと見て
+ * すぐ出す。繰り返しの罰は上流ごとの微調整なので畳む）。**繋ぐ面にも「詳細」ができる**（繰り返しの罰）。
+ */
+export function fieldsOf(face: Face, kind: FaceKind): { shown: readonly FieldKey[]; folded: readonly FieldKey[] } {
+  const base = KIND_FIELDS[kind];
+  return face === "main"
+    ? { shown: [...base.shown, "sampling", "response_tokens"], folded: [...base.folded, "repeat_penalty"] }
+    : { shown: [...base.shown], folded: [...base.folded, "sampling", "repeat_penalty"] };
+}
+
+/** **その面・その種類の下書きが持つ欄か**（出す欄でも、詳細に畳む欄でも / [`fieldsOf`]）。 */
+function faceHasField(face: Face, kind: FaceKind, key: FieldKey): boolean {
+  const fields = fieldsOf(face, kind);
+  return fields.shown.includes(key) || fields.folded.includes(key);
+}
+
+/** **「詳細」の見出し**（畳んだ欄の短い名前を並べる / 作業単位 D-21 で繋ぐ面にも詳細ができた）。 */
+export function detailsSummary(face: Face, kind: FaceKind): string {
+  const short: Record<FieldKey, string | null> = {
+    endpoint: null,
+    model: null,
+    gguf: null,
+    api_key: null,
+    args: "起動の引数",
+    command: "実行ファイル",
+    context_tokens: "コンテキスト長",
+    sampling: null,
+    response_tokens: null,
+    repeat_penalty: "繰り返しの罰",
+  };
+  const names = fieldsOf(face, kind)
+    .folded.map((key) => short[key])
+    .filter((name): name is string => name !== null);
+  return `詳細（${names.join("・")}）`;
+}
+
+/**
  * 欄の見出し。**ファイルの鍵の綴りを添える**（利用者は JSON を手で書くこともある）。
  *
  * **起こす面の `endpoint` は「待ち受ける場所」**（起こした llama がそこで待ち受ける）、繋ぐ面は「宛先」。
  */
-export function fieldLabel(kind: FaceKind, key: EditableFaceKey): string {
+export function fieldLabel(kind: FaceKind, key: FieldKey): string {
   switch (key) {
     case "endpoint":
       return kind === "launch" ? "待ち受ける場所（endpoint）" : "宛先（endpoint）";
@@ -199,7 +274,21 @@ export function fieldLabel(kind: FaceKind, key: EditableFaceKey): string {
       return "コンテキスト長（context_tokens）";
     case "api_key":
       return "鍵（api_key）";
+    case "sampling":
+      return "サンプリング（sampling）";
+    case "response_tokens":
+      return "返答の上限（response_tokens）";
+    case "repeat_penalty":
+      return "繰り返しの罰（repeat_penalty）";
   }
+}
+
+/** **思考の2択の見出し**（サンプリングの組の中 / 本文の面だけ）。 */
+export const THINKING_LABEL = "思考（reasoning_effort）";
+
+/** **思考の2択の文面**（「切る」が既定 / ADR-0060 §決定3）。 */
+export function thinkingLabel(choice: Thinking): string {
+  return choice === "none" ? "切る（既定）" : "入れる（low）";
 }
 
 // ----------------------------------------------------------------------
@@ -220,11 +309,67 @@ export function fieldLabel(kind: FaceKind, key: EditableFaceKey): string {
  *
  * **書いた値だけから組む**（書いた値と観測した値を混ぜない）。**書いていない鍵を、決まる値で埋めない**
  * （既定の実行ファイル名も、既定の窓も出さない）。
+ *
+ * `sent` は思考・返答の上限・繰り返しの罰（作業単位 D-21 / ADR-0060 §決定3 の一覧）。**本文の面は3つ、裏方の面は繰り返しの罰
+ * だけ。** 書いていなければ「書いていない」と言い、送る既定を**値とは別の印**で添える（[`SentValue`] / モジュールの doc の例外）。
  */
 export interface FaceSummary {
   readonly kind: FaceKind;
   readonly target: string;
   readonly extras: readonly string[];
+  readonly sent: readonly SentValue[];
+}
+
+/**
+ * **一覧の、送る値の1つ**（作業単位 D-21）。
+ *
+ * | 欄 | 中身 |
+ * |---|---|
+ * | `label` | 思考 / 返答の上限 / 繰り返しの罰 |
+ * | `written` | **書いた値の綴り**（`null` は書いていない —— 既定で埋めない） |
+ * | `fallback` | 書いていないときに送る値の綴り（**「既定」の印として、書いた値と区別できる形で出す**） |
+ */
+export interface SentValue {
+  readonly label: string;
+  readonly written: string | null;
+  readonly fallback: string;
+}
+
+/** 思考の綴り（書いた `"none"` / `"low"`）。知らない綴りはそのまま出す（欄を消さない）。 */
+function thinkingWritten(effort: string): string {
+  switch (effort) {
+    case "none":
+      return "切る（none）";
+    case "low":
+      return "入れる（low）";
+    default:
+      return effort;
+  }
+}
+
+/** **その面の送る値**（[`SentValue`]）。本文の面は3つ、裏方の面は繰り返しの罰だけ。 */
+function sentValues(face: Face, written: WrittenFace): SentValue[] {
+  const penalty: SentValue = {
+    label: "繰り返しの罰",
+    written: written.sampling?.repeat_penalty === undefined ? null : String(written.sampling.repeat_penalty),
+    fallback: String(DEFAULT_REPEAT_PENALTY),
+  };
+  if (face === "sub") {
+    return [penalty];
+  }
+  return [
+    {
+      label: "思考",
+      written: written.sampling?.reasoning_effort === undefined ? null : thinkingWritten(written.sampling.reasoning_effort),
+      fallback: "切る",
+    },
+    {
+      label: "返答の上限",
+      written: written.response_tokens === null ? null : grouped(written.response_tokens),
+      fallback: grouped(DEFAULT_RESPONSE_TOKENS),
+    },
+    penalty,
+  ];
 }
 
 /** 一覧の1行。**`summary` が `null` なら、その面を書いていない（本文と同じ上流）。** */
@@ -305,7 +450,7 @@ function grouped(value: number): string {
   return String(value).replace(/\B(?=(\d{3})+(?!\d))/gu, ",");
 }
 
-function faceSummary(face: WrittenFace): FaceSummary {
+function faceSummary(side: Face, face: WrittenFace): FaceSummary {
   const kind = kindOfFace(face);
   const target =
     face.gguf === null
@@ -319,7 +464,7 @@ function faceSummary(face: WrittenFace): FaceSummary {
   if (face.context_tokens !== null) {
     extras.push(`窓 ${grouped(face.context_tokens)}`);
   }
-  return { kind, target, extras };
+  return { kind, target, extras, sent: sentValues(side, face) };
 }
 
 /**
@@ -329,11 +474,11 @@ function faceSummary(face: WrittenFace): FaceSummary {
  */
 export function summaryLines(profile: WrittenProfile): readonly SummaryLine[] {
   return [
-    { face: "main", label: faceShortLabel("main"), summary: faceSummary(profile.main) },
+    { face: "main", label: faceShortLabel("main"), summary: faceSummary("main", profile.main) },
     {
       face: "sub",
       label: faceShortLabel("sub"),
-      summary: profile.sub === null ? null : faceSummary(profile.sub),
+      summary: profile.sub === null ? null : faceSummary("sub", profile.sub),
     },
   ];
 }
@@ -350,6 +495,10 @@ export function summaryLines(profile: WrittenProfile): readonly SummaryLine[] {
  *
  * **`api_key` は新しい鍵の入力**（作業単位 A-13b-3）。**開いたときは必ず空**（画面は鍵の値を持たない）。
  * **空なら置き換えない**（いまの鍵を残す）。整えない（前後の空白も送る —— サーバが理由つきで断る）。
+ *
+ * **思考・返答の上限・繰り返しの罰**（作業単位 D-21）。`reasoning_effort` は2択（[`Thinking`]。書いていなければ「切る」）、
+ * `response_tokens` と `repeat_penalty` は文字列のまま持つ（読めない入力を送る前に言う / [`samplingFailure`]）。
+ * **空なら書かない**（送る値は既定の 1024・1.1）。裏方の面の `reasoning_effort` / `response_tokens` は欄を出さず、送らない。
  */
 export interface FaceDraft {
   endpoint: string;
@@ -359,6 +508,9 @@ export interface FaceDraft {
   command: string;
   context_tokens: string;
   api_key: string;
+  reasoning_effort: Thinking;
+  response_tokens: string;
+  repeat_penalty: string;
 }
 
 /**
@@ -406,7 +558,18 @@ export interface ProfileDraft {
 }
 
 function emptyFaceDraft(): FaceDraft {
-  return { endpoint: "", model: "", gguf: "", args: "", command: "", context_tokens: "", api_key: "" };
+  return {
+    endpoint: "",
+    model: "",
+    gguf: "",
+    args: "",
+    command: "",
+    context_tokens: "",
+    api_key: "",
+    reasoning_effort: "none",
+    response_tokens: "",
+    repeat_penalty: "",
+  };
 }
 
 function faceKeyDraft(face: WrittenFace | null): FaceKeyDraft {
@@ -453,6 +616,10 @@ function faceDraftOf(face: WrittenFace): FaceDraft {
     command: face.command ?? "",
     context_tokens: face.context_tokens === null ? "" : String(face.context_tokens),
     api_key: "",
+    // **手で書いた `"none"` も「切る」で開く**（送る値は同じ。保存すると鍵ごと書かない / ADR-0060 §決定3）。
+    reasoning_effort: face.sampling?.reasoning_effort === "low" ? "low" : "none",
+    response_tokens: face.response_tokens === null ? "" : String(face.response_tokens),
+    repeat_penalty: face.sampling?.repeat_penalty === undefined ? "" : String(face.sampling.repeat_penalty),
   };
 }
 
@@ -503,6 +670,8 @@ export function argsOfText(text: string): string[] | null {
  * | それ以外（`32k` / `1.5` / `-1` / 全角の数字 …） | 読めない |
  *
  * **範囲（応答の余白より大きいか）の規則を写さない**のは、写すとサーバと画面で規則が2つになるから。
+ * **例外は、同じ面に書いた返答の上限との比較だけ**（作業単位 D-21 / ADR-0060 §決定3 —— 便宜として写した。権威はサーバの 422 で、
+ * 比べるのは [`samplingFailure`] が返答の上限の欄で行う。既定の余白 1024 との比較は今までどおり写さない）。
  */
 type ContextTokensReading =
   | { kind: "value"; value: number | null }
@@ -549,6 +718,123 @@ export function contextTokensFailure(draft: ProfileDraft): SaveFailure | null {
   }
   return null;
 }
+
+// ----------------------------------------------------------------------
+// 思考・返答の上限・繰り返しの罰（作業単位 D-21 / ADR-0060 §決定3）
+// ----------------------------------------------------------------------
+
+/**
+ * **繰り返しの罰の欄を読む。** 空・空白だけは `null`（書かない）。**半角の数字と小数点だけ**（`1` / `1.05` / `.9`）を数として読み、
+ * それ以外（`1,1` / `1e0` / 全角 / 負の数）は読めない。**範囲はここでは見ない**（[`samplingFailure`]）。
+ */
+type PenaltyReading = { kind: "value"; value: number | null } | { kind: "unreadable" };
+
+function readRepeatPenalty(text: string): PenaltyReading {
+  const trimmed = text.trim();
+  if (trimmed === "") {
+    return { kind: "value", value: null };
+  }
+  return /^(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)$/u.test(trimmed)
+    ? { kind: "value", value: Number(trimmed) }
+    : { kind: "unreadable" };
+}
+
+/** 繰り返しの罰が数として読めない・範囲の外のときの文面（**範囲は柵**だと言う）。 */
+const REPEAT_PENALTY_UNUSABLE = `保存しませんでした: 繰り返しの罰は、${REPEAT_PENALTY_MIN} 以上 ${REPEAT_PENALTY_MAX.toFixed(1)} 以下の数で書いてください（空にすると書かず、既定の ${DEFAULT_REPEAT_PENALTY} を送ります）。`;
+
+/** 返答の上限が数字だけでないときの文面。 */
+const RESPONSE_TOKENS_NOT_DIGITS =
+  "保存しませんでした: 返答の上限は、半角の数字だけで書いてください（空にすると書きません）。";
+
+/** 返答の上限が 0 のときの文面。 */
+const RESPONSE_TOKENS_NOT_POSITIVE = "保存しませんでした: 返答の上限は 1 以上の数で書いてください。";
+
+/** 返答の上限が正確に送れない桁数のときの文面。 */
+const RESPONSE_TOKENS_TOO_LARGE = "保存しませんでした: 返答の上限が大きすぎます。";
+
+/** 返答の上限が同じ面に書いた窓以上のときの文面。 */
+const RESPONSE_TOKENS_NOT_BELOW_WINDOW =
+  "保存しませんでした: 返答の上限は、同じ面に書いたコンテキスト長より小さくしてください。";
+
+/**
+ * **繰り返しの罰と返答の上限を、送る前に検査する**（作業単位 D-21 / ADR-0060 §決定3）。**便宜で、権威はサーバの 422。**
+ *
+ * | 欄 | 止める | 結びつける欄 |
+ * |---|---|---|
+ * | 繰り返しの罰（両面） | 数として読めない・0.5〜2.0 の外（端は通す） | その面の `repeat_penalty` |
+ * | 返答の上限（本文の面） | 数字だけでない・0・正確に送れない桁数・**同じ面に書いた窓以上** | 本文の面の `response_tokens` |
+ *
+ * **同じ面に窓を書いていなければ、窓とは比べない**（照会した窓との組は実行時に既定へ戻して `warn` を出す / ADR-0059 §決定2）。
+ * 窓の欄が読めない形なら比べない（[`contextTokensFailure`] が先に止める）。
+ * **裏方を別にしないなら、裏方の欄は送らない**ので見ない。両方の面にあれば本文の面を先に言う。
+ */
+export function samplingFailure(draft: ProfileDraft): SaveFailure | null {
+  const faces: Face[] = draft.hasSub ? ["main", "sub"] : ["main"];
+  for (const face of faces) {
+    const penalty = readRepeatPenalty(draft[face].repeat_penalty);
+    if (
+      penalty.kind === "unreadable" ||
+      (penalty.value !== null && (penalty.value < REPEAT_PENALTY_MIN || penalty.value > REPEAT_PENALTY_MAX))
+    ) {
+      return { kind: "field", face, key: "repeat_penalty", message: REPEAT_PENALTY_UNUSABLE };
+    }
+    if (face !== "main") {
+      continue;
+    }
+    const room = readContextTokens(draft.main.response_tokens);
+    const fail = (message: string): SaveFailure => ({ kind: "field", face, key: "response_tokens", message });
+    if (room.kind === "not_digits") {
+      return fail(RESPONSE_TOKENS_NOT_DIGITS);
+    }
+    if (room.kind === "too_large") {
+      return fail(RESPONSE_TOKENS_TOO_LARGE);
+    }
+    if (room.value === 0) {
+      return fail(RESPONSE_TOKENS_NOT_POSITIVE);
+    }
+    const window = readContextTokens(draft.main.context_tokens);
+    if (room.value !== null && window.kind === "value" && window.value !== null && room.value >= window.value) {
+      return fail(RESPONSE_TOKENS_NOT_BELOW_WINDOW);
+    }
+  }
+  return null;
+}
+
+/**
+ * **思考を入れて返答の上限が空か既定（1024）以下なら、欄の隣で言う一言**（作業単位 D-21 / ADR-0060 §決定3）。
+ *
+ * **数は出さない**（測った思考の量はこの機の1つのモデルの値で、上流によって変わる / ADR-0033・ADR-0036）。
+ * **値も自動で入れない**（下書きは読むだけ）。上流ごとの候補を示すのは A-19（marukei/personacore#37）の役目。
+ * 返答の上限の欄が読めない形なら言わない（[`samplingFailure`] が先に止める）。
+ */
+export function thinkingRoomNote(draft: ProfileDraft): string | null {
+  if (draft.main.reasoning_effort !== "low") {
+    return null;
+  }
+  const room = readContextTokens(draft.main.response_tokens);
+  if (room.kind !== "value") {
+    return null;
+  }
+  return room.value === null || room.value <= DEFAULT_RESPONSE_TOKENS ? THINKING_ROOM_NOTE : null;
+}
+
+/** [`thinkingRoomNote`] の文面（**数を含めない**）。 */
+const THINKING_ROOM_NOTE =
+  "思考は返答の上限の中で書かれます。上限が足りないと、本文が切れたり空になったりします。思考を入れるときは、返答の上限を上げてください。";
+
+/** **繰り返しの罰の欄の注記**（範囲は推奨ではなく柵だと言う / ADR-0060 §決定3）。 */
+export const REPEAT_PENALTY_NOTE = `繰り返しの罰は ${REPEAT_PENALTY_MIN}〜${REPEAT_PENALTY_MAX.toFixed(1)} の数で書けます。この範囲は、壊れた値と打ち損じを止めるための柵で、勧める範囲ではありません。空にすると書かず、既定の ${DEFAULT_REPEAT_PENALTY} を送ります。`;
+
+/** **返答の上限の欄の注記。** */
+export const RESPONSE_TOKENS_NOTE = `返答の上限は、本文の返答に取っておくトークン数です。空にすると書かず、既定の ${grouped(DEFAULT_RESPONSE_TOKENS)} を送ります。同じ面にコンテキスト長を書くなら、それより小さくします。`;
+
+/** **思考の2択の注記**（「切る」は書かない形で保存する / ADR-0060 §決定3）。 */
+export const THINKING_NOTE =
+  "本文の要求で上流に思考させるかを選びます（裏方は常に切ります）。「切る」で保存すると、思考の量は書きません（送る値は none と同じです）。";
+
+/** **保存しただけでは効かないことの案内**（ADR-0060 §決定3 の最後の段 —— 今の画面の案内に揃える）。 */
+export const SAMPLING_APPLY_NOTE =
+  "思考・返答の上限・繰り返しの罰は、保存しただけでは動いている上流に効きません。同じ名前へ切り替え直すと効きます。";
 
 /**
  * **宛先のパス（末尾の `/` を除く）の最後の区切りが、ちょうど `v1` か**（作業単位 B-68 / Issue origin#97）。
@@ -610,6 +896,11 @@ export function endpointV1Failure(draft: ProfileDraft): SaveFailure | null {
  * （読めない値はここでは `null` になる —— 画面は保存の前に必ず止めている）。
  *
  * **鍵と承認は、変えるときだけ送る**（[`keyRequest`] / [`approvalRequest`]）。
+ *
+ * **`sampling` と `response_tokens` は必ず送る**（作業単位 D-21 / ADR-0060 §決定3）—— 空の欄は省かず `null`
+ * （省くとサーバは「残す」と読み、空にしたつもりの値が知らせずに残る）。**裏方の面には `response_tokens` を載せない**
+ * （本文の面だけの欄。[`samplingRequest`] も裏方では思考を載せない）。
+ * **⚠ 繰り返しの罰・返答の上限が読めない下書きは、ここへ渡す前に [`samplingFailure`] で止めること**（読めない値はここでは `null` になる）。
  */
 function faceOfDraft(draft: ProfileDraft, face: Face): WrittenFaceRequest {
   const values = draft[face];
@@ -624,7 +915,12 @@ function faceOfDraft(draft: ProfileDraft, face: Face): WrittenFaceRequest {
     args: kindHasKey(kind, "args") ? argsOfText(values.args) : null,
     command: written("command", values.command),
     context_tokens: kindHasKey(kind, "context_tokens") && window.kind === "value" ? window.value : null,
+    sampling: samplingRequest(draft, face),
   };
+  if (face === "main") {
+    const room = readContextTokens(values.response_tokens);
+    request.response_tokens = room.kind === "value" ? room.value : null;
+  }
   const key = keyRequest(draft, face);
   if (key !== undefined) {
     request.api_key = key;
@@ -637,9 +933,34 @@ function faceOfDraft(draft: ProfileDraft, face: Face): WrittenFaceRequest {
 }
 
 /**
+ * **依頼の `sampling`**（作業単位 D-21 / ADR-0060 §決定3）。**書いてある欄の鍵だけのオブジェクト。両方とも空なら `null`**
+ * （`{}` にしない —— サーバは同じに読むが、形を1つにする）。
+ *
+ * | 欄 | 書く鍵 |
+ * |---|---|
+ * | 思考が「入れる」（本文の面だけ） | `reasoning_effort: "low"`（「切る」は書かない —— `"none"` を書かない） |
+ * | 繰り返しの罰が空でない | `repeat_penalty`（数） |
+ *
+ * **丸ごと置き換わる**（サーバは鍵ごとに合成しない）ので、**ここが書ける鍵の集合は、読み込みの `SAMPLING_KEYS` と一致していなければ
+ * ならない**（見張り番は `tests/upstream-profiles.test.ts` の「画面のサンプリングの欄の鍵は `SAMPLING_KEYS` と一致する」）。
+ */
+function samplingRequest(draft: ProfileDraft, face: Face): WrittenSampling | null {
+  const sampling: WrittenSampling = {};
+  const penalty = readRepeatPenalty(draft[face].repeat_penalty);
+  if (penalty.kind === "value" && penalty.value !== null) {
+    sampling.repeat_penalty = penalty.value;
+  }
+  if (face === "main" && draft.main.reasoning_effort === "low") {
+    sampling.reasoning_effort = "low";
+  }
+  return Object.keys(sampling).length === 0 ? null : sampling;
+}
+
+/**
  * **送る本文を組む。**
  *
  * **6つの鍵を必ず送る**（`null` と省略はサーバで同じ意味。形を1つにする）。
+ * **`sampling` と `response_tokens`（本文の面だけ）も必ず送る**（省略は「残す」で、`null` とは意味が違う / 作業単位 D-21）。
  * **`api_key` と `allow_key_over_plain_http` は、変えるときだけ送る**（省略は「残す」「今の規則」で、
  * `null` / `false` とは意味が違う / ADR-0056 §決定3・作業単位 A-13b-3）。
  * **`sub` も必ず送る**——`null` は「このプロファイルに裏方の面を書かない」。
@@ -951,12 +1272,15 @@ export function answerKeyQuestion(draft: ProfileDraft, question: KeyQuestion, an
  * 画面は保存の失敗をすべてここに通してから出す。
  *
  * **詳細に畳んだ欄は「在る欄」**（画面が詳細を開いて見せる）。
+ *
+ * **面ごとの欄で決める**（[`fieldsOf`] / 作業単位 D-21）—— **裏方の面は返答の上限の欄を持たない**ので、裏方の
+ * `response_tokens` を名指した理由は全体に出す（本文の面の欄へ移さない）。
  */
 export function keepOnShownField(
   failure: SaveFailure,
   kind: Readonly<Record<Face, FaceKind>>,
 ): SaveFailure {
-  if (failure.kind === "field" && !kindHasKey(kind[failure.face], failure.key)) {
+  if (failure.kind === "field" && !faceHasField(failure.face, kind[failure.face], failure.key)) {
     return { kind: "form", message: failure.message };
   }
   return failure;
@@ -1113,7 +1437,7 @@ export const NAME_TAKEN_MESSAGE =
  * | `form` | 全体 |
  */
 export type SaveFailure =
-  | { kind: "field"; face: Face; key: EditableFaceKey; message: string }
+  | { kind: "field"; face: Face; key: FieldKey; message: string }
   | { kind: "name"; message: string }
   | { kind: "changed"; message: string }
   | { kind: "form"; message: string };
@@ -1134,7 +1458,9 @@ function isFace(value: string | null | undefined): value is Face {
  * **画面に欄がある鍵か**（[`EDITABLE_FACE_KEYS`]）。
  *
  * **`api_key` を名指した理由は、その面の鍵の欄に出す**（作業単位 A-13b-3。A-13b-1・A-13b-2 の間は欄が無く、全体に出した）。
- * **`allow_key_over_plain_http` と `sampling` と `response_tokens` を名指した理由は全体に出す**（欄の無い鍵に結びつけると、理由が画面から消える）。
+ * **`allow_key_over_plain_http` を名指した理由は全体に出す**（欄の無い鍵に結びつけると、理由が画面から消える）。
+ * **`sampling` / `response_tokens` は作業単位 D-21 で欄に結びつくようになった**（それまでは全体に出した）。
+ * 欄がその面に無いとき（裏方の `response_tokens`）は [`keepOnShownField`] が全体へ移す。
  */
 function isEditableFaceKey(value: string | null | undefined): value is EditableFaceKey {
   return EDITABLE_FACE_KEYS.some((key) => key === value);

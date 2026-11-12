@@ -108,23 +108,20 @@ pub const FACE_NAMES: [&str; 2] = ["main", "sub"];
 /// （`profile_editor` の `FaceEdit::to_value`）ので、**手で書いた承認は、画面から別の欄を直しても消えない。**
 /// **宛先を変えた保存では落とす**（承認は宛先に付く —— 持ち越すと、承認していない宛先へ鍵が平文で出る）。
 ///
-/// # `sampling` も画面の欄より先に入った（作業単位 A-16 / ADR-0058 §決定6）
+/// # `sampling` と `response_tokens` は、画面が追いついた（作業単位 D-21 / ADR-0060 §決定4）
 ///
-/// **上の「画面が追いつくまで足さない」の3つ目の例外。** 画面の編集（`WrittenFace` / `WrittenFaceRequest`）は
-/// この欄を持たない —— 一覧は値を返さず、依頼は送れない（依頼の型は知らない欄を拒む）。
-/// 保存は**いまのファイルの、同じ名前・同じ面の値を残す**（`profile_editor` の `FaceEdit::to_value`）ので、
-/// **手で書いた値は、画面から別の欄を直しても消えない。** `allow_key_over_plain_http` と違い、
-/// **`endpoint` や `model` を変えた保存でも落とさない**（知らせずに消えるほうが、知らせずに残るより見つけにくい。
-/// 残した値は起動と切り替えのログに出る —— ADR-0058 §決定3）。
-/// 画面の写し（`web/src/lib/upstreamProfiles.ts`）は `FACE_KEYS` に足し、`EDITABLE_FACE_KEYS` からは除く。
+/// **A-16（ADR-0058 §決定6）と A-18a（ADR-0059 §決定5）の間は、上の「画面が追いつくまで足さない」の3つ目・4つ目の例外だった**
+/// （画面の編集は欄を持たず、一覧は値を返さず、依頼は送れなかった）。**作業単位 D-21 で画面が欄を持ったので例外から外した。**
+/// 例外として残るのは `api_key` と `allow_key_over_plain_http` の2つだけ。いまは一覧が書いた値を返し、依頼は
+/// **省けば残す・`null` で消す・値で置き換える**（`profile_editor` の `ValueChange`。`sampling` は丸ごと置き換え）。
+/// **省いたときは、いまのファイルの同じ名前・同じ面の値を残し、`endpoint` や `model` を変えた保存でも落とさない**
+/// （A-16 のまま —— 知らせずに消えるほうが、知らせずに残るより見つけにくい）。
+/// **`response_tokens` を書けるのは `main` 面だけ**（`sub` 面に書けば読み込みが [`ShapeReason::MainFaceOnly`] で止める）。
+/// 画面の写し（`web/src/lib/upstreamProfiles.ts`）は2つを `FACE_KEYS` と `EDITABLE_FACE_KEYS` の両方に持つ。
 ///
-/// # `response_tokens` も画面の欄より先に入った（作業単位 A-18a / ADR-0059 §決定5）
-///
-/// **上の「画面が追いつくまで足さない」の4つ目の例外。** 扱いは `sampling` とまったく同じ ——
-/// 画面の編集はこの欄を持たず（一覧は値を返さず、依頼は送れない）、保存は**いまのファイルの、同じ名前・同じ面の値を残す**
-/// （`profile_editor` の `FaceEdit::to_value`。`endpoint` や `model` を変えた保存でも落とさない）。
-/// **書けるのは `main` 面だけ**（`sub` 面に書けば読み込みが [`ShapeReason::MainFaceOnly`] で止める）。
-/// 画面の写しは `FACE_KEYS` に足し、`EDITABLE_FACE_KEYS` からは除く。画面の欄は marukei/personacore#36 で追いつく。
+/// **⚠ [`SAMPLING_KEYS`] に鍵を足す作業単位は、画面の欄も同じ作業単位で足すこと**（ADR-0060 §決定4）。
+/// 画面の保存は `sampling` を丸ごと置き換えるので、画面の知らない鍵は、画面から保存するたびに知らせずに消える。
+/// 見張り番は `web/tests/upstream-profiles.test.ts` の「画面のサンプリングの欄の鍵は `SAMPLING_KEYS` と一致する」。
 pub const FACE_KEYS: [&str; 10] = [
     "endpoint",
     "model",
@@ -157,6 +154,9 @@ pub const RESPONSE_TOKENS_KEY: &str = FACE_KEYS[9];
 ///
 /// **面で共通の一覧**（知らない鍵の判定はどちらの面でも同じ）。**`reasoning_effort` は `main` 面だけ**で、
 /// `sub` 面に書いたら知らない鍵とは別の理由（[`ShapeReason::MainFaceOnly`]）で止める（[`REASONING_EFFORT_KEY`]）。
+///
+/// **⚠ 鍵を足すなら、画面の欄も同じ作業単位で足すこと**（ADR-0060 §決定4 / [`FACE_KEYS`] の doc）。
+/// **⚠ 綴りは直書きで並べること** —— 画面の見張り番（`web/tests/upstream-profiles.test.ts`）がこの宣言の文字列リテラルを読む。
 pub const SAMPLING_KEYS: [&str; 2] = ["repeat_penalty", "reasoning_effort"];
 
 /// **本文の面の思考の量の鍵**（[`SAMPLING_KEY`] の中 / ADR-0059 §決定1 / 作業単位 A-18a）。値は `"none"` / `"low"`。
@@ -416,7 +416,8 @@ pub enum ShapeReason {
     /// `sampling` が使えない（オブジェクトでない・`repeat_penalty` が数でないか範囲の外 / ADR-0058 §決定1・
     /// `reasoning_effort` が `none` / `low` の外 / ADR-0059 §決定1）。
     ///
-    /// **鍵（[`ProfileShape::key`]）は [`SAMPLING_KEY`]**（画面はこの欄を持たないので、理由は全体に出る）。
+    /// **鍵（[`ProfileShape::key`]）は [`SAMPLING_KEY`]**（画面は理由を、思考と繰り返しの罰の2つの欄の組の見出しに出す /
+    /// 作業単位 D-21 —— `reason` だけでは2つのどちらかを区別できない）。
     SamplingUnusable,
     /// `sampling` に知らない鍵がある（書けるのは [`SAMPLING_KEYS`] だけ / ADR-0058 §決定1）。
     ///

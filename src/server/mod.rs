@@ -2047,6 +2047,18 @@ impl App {
         self
     }
 
+    /// **[`Self::with_profiles_file_for_tests`] と同じ。そのうえ画面から書ける。テスト専用**（作業単位 D-21）。
+    ///
+    /// **[`Startup::with_editable_profiles_file`] から写すのと同じ1行。** 画面の保存（`PUT /admin/upstream/profiles/{name}`）の
+    /// 後に同じ名前へ切り替え直し、予算の器（[`Self::budget_handle`]）で余白を見るテストが通る
+    /// （`tests/server_profile_thinking.rs` の ADR-0060 の腕9）。
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn with_editable_profiles_file_for_tests(mut self, path: std::path::PathBuf) -> Self {
+        self.profiles_file = profile_editor::ProfilesLocation::Editable(path);
+        self
+    }
+
     /// **裏方（抽出と変容の1本の枠）が空いたかを見る口。テスト専用**（作業単位 A-8）。
     ///
     /// **`serve` が `AppState` へ載せるのと同じ抽出器**（`Arc` の複製）を見る。
