@@ -81,4 +81,4 @@ pub use stat::{AxisError, ScaleError, StatAlloc, StatAxis, StatScale, StatValue,
 #[cfg(test)]
 pub(crate) use stat::fixture_scale;
 pub use text::{LINE_BREAKS, TRIMMABLE};
-pub use thinking::{StrippedThinking, strip_leaked_thinking};
+pub use thinking::{ReplyBody, StrippedThinking, reply_body, strip_leaked_thinking};

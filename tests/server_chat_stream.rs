@@ -203,7 +203,10 @@ fn usage_only_chunk(prompt_tokens: u32) -> Result<ChatChunk, LlmError> {
     Ok(ChatChunk {
         delta: String::new(),
         finish_reason: None,
-        usage: Some(TokenUsage { prompt_tokens }),
+        usage: Some(TokenUsage {
+            prompt_tokens,
+            completion_tokens: None,
+        }),
     })
 }
 
@@ -1186,6 +1189,7 @@ async fn the_usage_crosscheck_runs_on_the_streaming_path() {
                 finish_reason: Some(FinishReason::Stop),
                 usage: Some(TokenUsage {
                     prompt_tokens: 100_000,
+                    completion_tokens: None,
                 }),
             }),
         ]),

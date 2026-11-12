@@ -1438,6 +1438,10 @@ async fn the_streaming_path_strips_a_thought_split_across_chunks() {
     assert!(has_field(line, "outcome=empty"), "{line:?}");
     assert!(has_field(line, "thinking_blocks_stripped=1"), "{line:?}");
     assert!(has_field(line, "thinking_unclosed=false"), "{line:?}");
+    // **前提の明示**（作業単位 A-18b）: この回は思考だけの空なので、中継は1回だけ引き直そうとする。
+    // `MockLlm::streaming` は2回目の `stream` を開けないので、引き直しの失敗の経路（1回目を保存する）を通る ——
+    // 上の保存の主張はその経路に寄りかかっている（引き直しが無かったときと同じ結果 / ADR-0059 §決定3）。
+    assert!(has_field(line, "empty_retry_failed=true"), "{line:?}");
 
     server.stop().await;
 }

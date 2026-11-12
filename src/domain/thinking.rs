@@ -165,6 +165,37 @@ pub fn strip_leaked_thinking(raw: &str) -> StrippedThinking<'_> {
     }
 }
 
+/// **思考を剥がした後に本文が残るか**（[ADR-0059](../../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md) §決定3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyBody {
+    /// 剥がした後に、空白でない文字が1つ以上残る。**上流が文字を返した回**
+    /// （空の `「」` だけ・宙に浮いた強調の印だけも、こちら）。
+    Present,
+    /// 剥がした後が**空か空白だけ**。`unclosed` は、閉じない思考を剥がした回か。
+    Blank {
+        /// 閉じないまま末尾に達した思考を剥がしたか（[`StrippedThinking::unclosed`]）。
+        unclosed: bool,
+    },
+}
+
+/// **本文が空の回か**を決める（ADR-0059 §決定3 —— 空の本文を1回引き直す判定の材料）。**panic しない。**
+///
+/// [`strip_leaked_thinking`] で剥がした後の文字列が、空か空白だけなら [`ReplyBody::Blank`]。
+/// 空白は `TRIMMABLE` と `LINE_BREAKS`（剥がしの空行と同じ集合 / `domain::text` の doc。広げない）。
+///
+/// **分解の `ParseOutcome::Empty` とは別の判定**である —— あちらは空の `「」` だけ・宙に浮いた強調の印だけも
+/// 空とみなすが、それは上流が文字を返した回なので、引き直しの対象にしない。
+pub fn reply_body(raw: &str) -> ReplyBody {
+    let stripped = strip_leaked_thinking(raw);
+    if stripped.text.chars().all(is_whitespace) {
+        ReplyBody::Blank {
+            unclosed: stripped.unclosed,
+        }
+    } else {
+        ReplyBody::Present
+    }
+}
+
 /// タグの種類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TagKind {
@@ -461,6 +492,49 @@ mod tests {
                 let stripped = strip_leaked_thinking(prefix);
                 assert!(stripped.text.len() <= prefix.len(), "{prefix:?}");
             }
+        }
+    }
+
+    // ---- 本文が空の回の判定（ADR-0059 §決定3 / 作業単位 A-18b）----
+
+    /// **剥がした後が空か空白だけなら空**。閉じない思考だったかも返す。
+    ///
+    /// 空白は `TRIMMABLE` と `LINE_BREAKS`（剥がしの空行と同じ集合）。
+    #[test]
+    fn a_reply_that_is_blank_after_stripping_is_blank() {
+        for (raw, unclosed) in [
+            // 思考を別欄で返す上流で、本文が空のまま終わった回。
+            ("", false),
+            // 空白だけ（半角・全角・TAB・改行・NBSP・U+2028）。
+            (" \t\n\r\n\u{3000}\u{00A0}\u{2028}", false),
+            // 本文の中で閉じた思考だけ。
+            ("<think>\nThe user is home.\n</think>\n\n", false),
+            ("<think >a</think >\n<think >b</think >", false),
+            // 閉じない思考（剥がして空）。
+            ("<think>\nThe user is asking", true),
+            ("\n<think>考え中", true),
+        ] {
+            assert_eq!(reply_body(raw), ReplyBody::Blank { unclosed }, "{raw:?}");
+        }
+    }
+
+    /// **上流が文字を返した回は空ではない**（`ParseOutcome::Empty` に落ちる形でも）。
+    ///
+    /// 空の `「」` だけ・宙に浮いた強調の印だけは、分解では `Empty` になるが、引き直しの対象にしない
+    /// （ADR-0059 §決定3）。**閉じない思考の前に本文がある回**も空ではない。
+    #[test]
+    fn a_reply_with_any_visible_character_is_not_blank() {
+        for raw in [
+            "「」",
+            "**",
+            "`",
+            "本文",
+            "<think>x</think>「おかえり」",
+            "「おかえり」<think>まだ考え",
+            // U+2009 は空白の集合に無い（`TRIMMABLE` を広げない / `domain::text` の doc）。
+            "\u{2009}",
+        ] {
+            assert_eq!(reply_body(raw), ReplyBody::Present, "{raw:?}");
         }
     }
 }

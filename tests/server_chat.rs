@@ -120,7 +120,10 @@ impl MockLlm {
             reply: Completion {
                 content: content.to_owned(),
                 finish_reason: Some(FinishReason::Stop),
-                usage: Some(TokenUsage { prompt_tokens }),
+                usage: Some(TokenUsage {
+                    prompt_tokens,
+                    completion_tokens: None,
+                }),
             },
             queued: Mutex::new(VecDeque::new()),
             failure: None,

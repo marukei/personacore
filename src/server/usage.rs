@@ -361,6 +361,7 @@ mod tests {
             max_tokens,
             Some(TokenUsage {
                 prompt_tokens: actual_tokens,
+                completion_tokens: None,
             }),
         )
         .expect("usage があれば答え合わせできること")
@@ -491,7 +492,10 @@ mod tests {
             &plan,
             budget(),
             TokenBudget::DEFAULT_RESPONSE_TOKENS,
-            Some(TokenUsage { prompt_tokens: 1 }),
+            Some(TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: None,
+            }),
         )
         .expect("usage があれば答え合わせできること");
 
@@ -791,6 +795,7 @@ mod tests {
                 TokenBudget::DEFAULT_RESPONSE_TOKENS,
                 Some(TokenUsage {
                     prompt_tokens: u32::MAX,
+                    completion_tokens: None,
                 }),
             );
         });

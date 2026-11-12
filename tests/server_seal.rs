@@ -1330,7 +1330,10 @@ impl TokenizingCopy {
         self.usage_of
             .map(|rule| rule(body))
             .or(self.usage)
-            .map(|prompt_tokens| TokenUsage { prompt_tokens })
+            .map(|prompt_tokens| TokenUsage {
+                prompt_tokens,
+                completion_tokens: None,
+            })
     }
 }
 

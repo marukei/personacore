@@ -24,8 +24,8 @@
 //!
 //! | 経路 | 保存する場所 |
 //! |---|---|
-//! | 非ストリーミング | 上流の応答を受け取った直後（ここ） |
-//! | 中継 | **上流が尽きた枝だけ**（`super::relay::chunk_events`） |
+//! | 非ストリーミング | 上流の応答を受け取った直後（ここ）。**本文が空なら、1回だけ引き直した2回目の後**（ADR-0059 §決定3 / `super::empty_retry`） |
+//! | 中継 | **上流が尽きた枝だけ**（`super::relay::chunk_events`。空の本文を引き直した回は2回目の上流が尽きた後） |
 //!
 //! **応答は上流から受け取ったまま返す。** 分解結果は DB にだけ入る
 //! （クライアントに返す `content` を組み直すと、モデルが直前に自分で出した形式と
@@ -44,6 +44,8 @@
 //! `find_session` が `character_id` と併せて引くことだけが、
 //! 「他キャラのセッション id を書くと別キャラの会話へ書き込める」を塞いでいる。
 
+use std::sync::Arc;
+
 use axum::Json;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
@@ -55,9 +57,10 @@ use utoipa::ToSchema;
 use utoipa::openapi::schema::Object;
 use uuid::Uuid;
 
+use super::empty_retry;
 use super::error::{ApiError, ErrorBody};
 use super::openapi::ChatCompletionEvent;
-use super::relay::{Relay, relay_response};
+use super::relay::{Redo, Relay, relay_response};
 use super::turn::TurnSink;
 use super::{AppState, counted_plan, openapi, seal, usage};
 use crate::domain::{Character, Handle, ModelSelector, SessionId, SessionRef};
@@ -451,15 +454,25 @@ pub(super) async fn chat_completions(
                 stats,
                 state.extraction(&character),
             ),
+            // **空の本文の引き直しに使う、同じ写しと同じ要求**（ADR-0059 §決定3 / 作業単位 A-18b）。
+            // 途中で上流が切り替わっても、引き直しは1回目と同じ上流へ送る。
+            Redo::new(Arc::clone(&llm), upstream),
         ));
     }
 
-    let completion = llm
+    let first = llm
         .complete(&upstream)
         .await
         .map_err(|err| upstream_error(&err))?;
     // **本文を受け付けた後に覚える**（中継の枝と同じ / `super::seal` の doc）。
     sealed.accepted();
+
+    // 9b. **本文が空なら、保存の前に1回だけ引き直す**（ADR-0059 §決定3 / 作業単位 A-18b）。
+    //     **同じ写し（`llm`）・同じ要求**で送る（途中で上流が切り替わっても1回目と同じ上流へ）。
+    //     2回目が失敗したら1回目を採用する（応答の成否は変えない / `super::empty_retry`）。
+    //     **以下の答え合わせ・清算・保存・応答は、採用した回だけで1回ずつ行う。**
+    let (completion, retry) =
+        empty_retry::complete_again_if_empty(llm.as_ref(), &upstream, first).await;
 
     // 10. **答え合わせ**（ADR-0013 第3層）。上流が数えた実トークン数と突き合わせる。
     //
@@ -496,7 +509,8 @@ pub(super) async fn chat_completions(
         stats,
         state.extraction(&character),
     )
-    .persist(&completion.content)
+    // **採用した回の生の出力を保存し、引き直しの記録は分解の行へ**（捨てた1回目は保存しない）。
+    .persist(&completion.content, retry)
     .await;
 
     tracing::info!(

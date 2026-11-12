@@ -38,6 +38,7 @@
 //! [`turn_messages`] が定数で組み立てるので、`(User, Assistant)` 以外にならない。
 //! 種別ごとの出し分けを持たないのはそのため（起きたら実装の誤りで、`error!` に出る）。
 
+use super::empty_retry::EmptyRetry;
 use super::extract::Extraction;
 use crate::domain::{NewMessage, Role, SessionId, StatAlloc, strip_leaked_thinking};
 use crate::parse::leak::{AxisLeaks, detect_axis_leaks};
@@ -156,6 +157,7 @@ fn log_outcome(
     thinking: ThinkingTally,
     leaks: &AxisLeaks<'_>,
     session_id: SessionId,
+    retry: EmptyRetry,
 ) {
     // **`%`（Display）で載せる。** `&str` をそのまま渡すと `outcome="structured"` と
     // 引用符付きになり、集計キーとして扱うたびに剥がすことになる。
@@ -179,6 +181,16 @@ fn log_outcome(
         // （ADR-0053 §結果。そのとき画面は「応答が空でした。」になる）。
         thinking_blocks_stripped = thinking.blocks,
         thinking_unclosed = thinking.unclosed,
+        // **空の本文の引き直し**（ADR-0059 §決定3 / 作業単位 A-18b）。**0 / false / None の回も出す**
+        // （出さないと分母が作れない）。`empty_retries` は2回目の要求を送った回数（失敗した回も 1）。
+        // `empty_retry_failed=true` は2回目が失敗して1回目を保存した回（捨てた回は無いので `discarded_*` は 0）。
+        // `discarded_*` は捨てた1回目のもの —— 生の出力は保存しないので、長さ（文字数・思考込み）・
+        // 閉じない思考だったか・上流が数えた生成数（返さなければ `None`）だけがここに残る。
+        empty_retries = retry.retries(),
+        empty_retry_failed = retry.failed_over(),
+        discarded_reply_chars = retry.discarded_chars(),
+        discarded_reply_unclosed = retry.discarded_unclosed(),
+        discarded_completion_tokens = ?retry.discarded_completion_tokens(),
         session_id = session_id.get(),
         "応答を分解しました"
     );
@@ -230,11 +242,16 @@ impl TurnSink {
     /// 往復を保存する。**応答が完全に返り切った回だけ呼ぶこと。**
     ///
     /// 途中で失敗した回に呼ぶと、部分的な応答が履歴に載って以後の文脈が汚れる。
-    /// 「呼ばない」ことで守っているので、呼び出し位置は
-    /// `super::relay::chunk_events` の**上流が尽きた枝だけ**にしてある。
+    /// 「呼ばない」ことで守っているので、中継での呼び出し位置は `super::relay` の
+    /// `RelayState::complete` の1箇所だけにしてある。そこへ来るのは2経路
+    /// （`chunk_events` の**上流が尽きた枝**と、空の本文を引き直す2回目が**開けなかった後の締め**（`finish_next`） /
+    /// ADR-0059 §決定3）で、どちらも `[DONE]` を流す直前。非ストリーミングは `super::chat` の1箇所。
     ///
     /// 失敗しても応答は壊さない（モジュールの doc）。
-    pub(super) async fn persist(&self, raw_reply: &str) {
+    ///
+    /// **`raw_reply` は採用した回の生の出力**（空の本文を引き直した回は2回目 / ADR-0059 §決定3）。
+    /// `retry` は引き直しの記録で、分解の行の欄にだけ載る（保存する2件には影響しない）。
+    pub(super) async fn persist(&self, raw_reply: &str, retry: EmptyRetry) {
         let turn = turn_messages(&self.user_message, raw_reply, &self.stats);
 
         // **保存できてもできなくても記録する。** 成功率は保存の成否と別の話。
@@ -255,6 +272,7 @@ impl TurnSink {
             turn.thinking,
             &turn.leaks,
             self.session_id,
+            retry,
         );
 
         // **1トランザクションで往復を書く**（11b-1）。ここに `await` する外部通信は無い。
@@ -625,6 +643,7 @@ mod tests {
                 ThinkingTally::default(),
                 &no_leaks(),
                 session(),
+                EmptyRetry::default(),
             );
         });
 
@@ -671,7 +690,14 @@ mod tests {
 
         for (outcome, label, fell_back) in cases {
             let output = captured_under_default_filter(|| {
-                log_outcome(outcome, 0, ThinkingTally::default(), &no_leaks(), session());
+                log_outcome(
+                    outcome,
+                    0,
+                    ThinkingTally::default(),
+                    &no_leaks(),
+                    session(),
+                    EmptyRetry::default(),
+                );
             });
 
             // **3つの欄が同じ1行に載ること**まで見る（作業単位 B-2）。
@@ -701,6 +727,7 @@ mod tests {
                 ThinkingTally::default(),
                 &no_leaks(),
                 session(),
+                EmptyRetry::default(),
             );
         });
 
@@ -758,6 +785,7 @@ mod tests {
                 turn.thinking,
                 &turn.leaks,
                 session(),
+                EmptyRetry::default(),
             );
         });
 
@@ -833,6 +861,7 @@ mod tests {
                 turn.thinking,
                 &turn.leaks,
                 session(),
+                EmptyRetry::default(),
             );
         });
 
@@ -867,6 +896,7 @@ mod tests {
                 turn.thinking,
                 &turn.leaks,
                 session(),
+                EmptyRetry::default(),
             );
         });
 
@@ -912,6 +942,7 @@ mod tests {
                 turn.thinking,
                 &turn.leaks,
                 session(),
+                EmptyRetry::default(),
             );
         });
 
@@ -944,6 +975,7 @@ mod tests {
                 turn.thinking,
                 &turn.leaks,
                 session(),
+                EmptyRetry::default(),
             );
         });
 
@@ -986,6 +1018,7 @@ mod tests {
                 turn.thinking,
                 &turn.leaks,
                 session(),
+                EmptyRetry::default(),
             );
         });
 
@@ -1139,6 +1172,7 @@ mod tests {
                     turn.thinking,
                     &turn.leaks,
                     session(),
+                    EmptyRetry::default(),
                 );
             });
 
@@ -1158,5 +1192,72 @@ mod tests {
                 "思考の中身をログに出さないこと: {output:?}"
             );
         }
+    }
+
+    // ---- 空の本文の引き直し（ADR-0059 §決定3 / 作業単位 A-18b）----
+
+    /// **引き直しの欄が、分解の記録と同じ1行に載る。0 の回も出す**（出さないと分母が作れない）。
+    ///
+    /// 3つの回（引き直さなかった・捨てた・2回目が失敗した）を**それぞれ別の値**で見る。
+    /// 捨てた回の文字数（11）と生成数（57）は互いにも、ほかの欄の値とも違えてある。
+    #[test]
+    fn the_empty_retry_is_recorded_in_the_parse_line() {
+        let discarded = EmptyRetry::discarded(
+            "<think>考え中のまま",
+            Some(crate::llm::TokenUsage {
+                prompt_tokens: 900,
+                completion_tokens: Some(57),
+            }),
+        );
+        for (retry, expected) in [
+            (
+                EmptyRetry::default(),
+                [
+                    "empty_retries=0",
+                    "empty_retry_failed=false",
+                    "discarded_reply_chars=0",
+                    "discarded_reply_unclosed=false",
+                    "discarded_completion_tokens=None",
+                ],
+            ),
+            (
+                discarded,
+                [
+                    "empty_retries=1",
+                    "empty_retry_failed=false",
+                    "discarded_reply_chars=13",
+                    "discarded_reply_unclosed=true",
+                    "discarded_completion_tokens=Some(57)",
+                ],
+            ),
+            (
+                EmptyRetry::failed(),
+                [
+                    "empty_retries=1",
+                    "empty_retry_failed=true",
+                    "discarded_reply_chars=0",
+                    "discarded_reply_unclosed=false",
+                    "discarded_completion_tokens=None",
+                ],
+            ),
+        ] {
+            let output = captured_under_default_filter(|| {
+                log_outcome(
+                    ParseOutcome::Structured,
+                    0,
+                    ThinkingTally::default(),
+                    &no_leaks(),
+                    session(),
+                    retry,
+                );
+            });
+            let line = line_containing(&output, "応答を分解しました");
+            for field in expected {
+                assert!(has_field(line, field), "{retry:?}: {field}: {line:?}");
+            }
+            assert!(has_field(line, "session_id=42"), "{line:?}");
+        }
+        // 前提: 捨てた回の文字数は材料の文字数（バイト数ではない）。
+        assert_eq!("<think>考え中のまま".chars().count(), 13);
     }
 }
