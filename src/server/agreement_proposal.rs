@@ -80,7 +80,7 @@ use std::sync::{Mutex, PoisonError};
 
 use super::extract::{TurnJob, character_vanished, record_vanished};
 use crate::domain::{Agreement, AgreementState, CharacterId, NewAgreement, SessionId};
-use crate::llm::{ChatMessage, ChatRequest, LlmClient, SUB_LLM_TEMPERATURE};
+use crate::llm::{ChatMessage, ChatRequest, LlmClient};
 use crate::parse::agreement_proposal::{
     Candidate, CheckReading, Outcome, PRODUCTION_DEDUP, Unsaveable, decide, detection_candidates,
     needs_another_draw, proposal_to_save, read_check, read_detection,
@@ -265,12 +265,8 @@ pub(in crate::server) async fn run_agreement_proposals(
 
 /// 提案の依頼の形（**温度は裏方と同じ・応答の上限は 320**）。
 fn proposal_request(messages: Vec<ChatMessage>) -> ChatRequest {
-    ChatRequest {
-        messages,
-        // **温度は抽出・変容と同じ値**（`llm::SUB_LLM_TEMPERATURE` の doc。ここに数を書かない）。
-        temperature: Some(SUB_LLM_TEMPERATURE),
-        max_tokens: Some(PROPOSAL_MAX_TOKENS),
-    }
+    // **温度は抽出・変容と同じ値、思考させない**（裏方の要求の口 / `llm::ChatRequest::background`）。
+    ChatRequest::background(messages, PROPOSAL_MAX_TOKENS)
 }
 
 /// **検出**を1本送り、候補を返す（送れなかった・読めなかったら 0 件）。
@@ -529,7 +525,9 @@ mod tests {
         DisplayName, Handle, MessageId, NewMessage, Persona, ResolvedDriftMode, Role,
         StatDriftMode, StatScale,
     };
-    use crate::llm::{ChatStream, Completion, FinishReason, LlmError, LlmFuture};
+    use crate::llm::{
+        ChatStream, Completion, FinishReason, LlmError, LlmFuture, SUB_LLM_TEMPERATURE,
+    };
     use crate::server::extract::SubContext;
     use crate::testlog::{captured_under_default_filter, has_field, line_containing};
 
@@ -789,6 +787,8 @@ mod tests {
             for request in sub.requests() {
                 assert_eq!(request.max_tokens, Some(320));
                 assert_eq!(request.temperature, Some(SUB_LLM_TEMPERATURE));
+                // **裏方は思考の量を上書きしない**（線は既定の `none` / ADR-0059 §決定1）。
+                assert_eq!(request.reasoning_effort, None);
             }
 
             assert_eq!(

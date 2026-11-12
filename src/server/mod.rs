@@ -521,8 +521,14 @@ impl AppState {
     /// 読み直す変更を入れても緑のまま）。破れたときの実害は、**引き直しを跨いだ
     /// その1リクエストの答え合わせ**（`usage::report`）が別のコンテキスト長と
     /// 突き合わさり、**その回だけ警告が余分に出る／出ない**ことに留まる。
-    pub(crate) fn budget(&self) -> TokenBudget {
-        self.budget.get()
+    ///
+    /// # 本文の面の思考の量も、同じ1回の読みで返す（ADR-0059 §決定1 / 作業単位 A-18a）
+    ///
+    /// **2つ目は本文の面に書いた `reasoning_effort`**（書いていなければ `None` —— 線は既定の `none`）。
+    /// 予算と同じ器・同じ錠から読む（`context::SharedBudget::turn`）ので、切り替えを跨いだ1ターンが
+    /// 「切り替え先の予算と切り替え前の思考の量」で組まれることは無い。**本文の経路だけが読む**（裏方はこの器を見ない）。
+    pub(crate) fn budget(&self) -> (TokenBudget, Option<crate::llm::ReasoningEffort>) {
+        self.budget.turn()
     }
 
     /// 記憶抽出の配線を、このキャラクター向けに作る（ADR-0021 §6）。
@@ -690,6 +696,11 @@ struct Resolved {
     /// **`bind` の中で照会しなかった面のうち、照会してよい面**（コンテキスト長を書いた外の上流の面）。
     /// **`bind` の中では待たない** —— 背景タスクの最初の1回として `serve` の直後に走る。
     check_at_start: context::CheckAtStart,
+    /// **本文の面に書いた思考の量と返答の上限**（ADR-0059 §決定1・2 / 作業単位 A-18a）。
+    ///
+    /// **予算（`budget`）は、すでにこの返答の上限で組んである。** ここでは器へ入れるだけ
+    /// （`context::PendingRefresh::with_body`）——引き直しとチャットの入口が読む。
+    body: config::BodyFace,
 }
 
 /// **この起動が自分で起こすもの**（ADR-0042 / 作業単位 F-4b-1 / `launch` モジュール）。
@@ -1250,9 +1261,6 @@ impl App {
         // 走ったまま差し替えたとき、全員が次の往復から新しい上流へ行く。
         // **2つ作ると「本文は新しい上流、引き直しは古い上流」が書ける。**
         let faces = context::FaceClients::new(Arc::clone(&llm), Arc::clone(&sub_client));
-        // **送るサンプラの値を面ごとに言う**（ADR-0058 §決定3 / 作業単位 A-16）。差し替え口から読むので、
-        // 本文と裏方がそれぞれ実際に送る値になる（`sub` 面が無ければ裏方は本文の複製 —— 同じ値）。
-        context::report_samplers(&faces, "startup");
         let main_face = faces.face(crate::measured::ModelFace::Main).clone();
         let sub_face = faces.face(crate::measured::ModelFace::Sub).clone();
         let sub: Arc<dyn LlmClient> = Arc::new(sub_face.clone());
@@ -1266,19 +1274,19 @@ impl App {
         // 他のサーバテストは `bind_with_client`（照会を行わない入口）を通るので、
         // ここが潰れても赤くならない。**変異の向きごとに捕まえる本数が違う:**
         //
-        // * 照会を落とす（`context::choose_budget(explicit, None)` に潰す）→ **3本が赤**。
+        // * 照会を落とす（`context::choose_budget(explicit, None, body)` に潰す）→ **3本が赤**。
         //   `the_queried_context_length_survives_the_real_bind` と
         //   `the_running_budget_is_shared_with_the_handlers`（`tests/server_chat.rs`）、
         //   `the_periodic_requery_is_wired_into_the_real_bind`
         //   （`tests/server_context_refresh.rs`。起動時の照会が 1 回であることを見ている）。
-        // * 明示設定を落とす（`context::resolve_budget(None, &llm)` に潰す）→ **2本が赤**。
+        // * 明示設定を落とす（`context::resolve_budget(None, &llm, body)` に潰す）→ **2本が赤**。
         //   `the_explicit_context_setting_survives_the_real_bind`（`tests/server_chat.rs`）と
         //   `an_explicit_setting_disables_the_requery_on_the_real_bind`
         //   （`tests/server_context_refresh.rs`）。
         //
         // **`the_explicit_context_setting_survives_the_real_bind` は、照会を落とす変異では
         // 原理的に赤にできない。** 明示設定があるとき `resolve_budget` は
-        // `choose_budget(explicit, None)` そのものを返すので、その経路では**等価変異**。
+        // `choose_budget(explicit, None, body)` そのものを返すので、その経路では**等価変異**。
         // 11c-3b の「この2行の見張り番は今も上の2本だけである」は**誤りだった**
         // （数も、内訳も、向きの区別も合っていない）。
         //
@@ -1286,8 +1294,14 @@ impl App {
         // 上流プロファイルの面に書いた値が `PERSONACORE_CONTEXT_TOKENS` に勝ち、ぶつかったら `warn` を1本。
         // **抽出の上限の明示は面の値だけ**（環境変数は抽出を止めない / `context::resolve_sub_context` の doc）。
         // 見張り番は `tests/server_profile_context.rs`（つまみ1つにつき1本 / ADR-0036 §決定3）。
+        //
+        // **本文の面の返答の上限が、予算の余白になる**（ADR-0059 §決定2 / 作業単位 A-18a）——明示の窓には組んだ時点で、
+        // 照会した窓には `choose_budget` が載せる（窓が上限以下なら既定の 1024 に戻して `warn`）。
+        // 見張り番は `tests/server_profile_thinking.rs`（腕3・腕6）。
         let profile_context = config.profile_context();
-        let explicit = context::explicit_main_budget(config.context_budget(), profile_context.main);
+        let body = profile_context.body;
+        let explicit =
+            context::explicit_main_budget(config.context_budget(), profile_context.main, body);
         let sub_explicit = profile_context.sub;
 
         // **2つの照会を同時に投げる**（ADR-0036 決定2 の第1階層 / 作業単位 B-7）。
@@ -1313,12 +1327,16 @@ impl App {
             async {
                 if launching_main {
                     // **落とし所で始める。** 載ったら `adopt_face_probe` が採り直す。
+                    // **まだ聞いていないだけなので、「窓が分からない」は `info`**（A-18a の再レビュー是正 /
+                    // `context::budget_before_launch`。照会に失敗した `choose_budget` の `warn` と割る）。
+                    // 見張り番は `tests/upstream_launch.rs` の
+                    // `a_launching_body_face_says_the_unknown_window_at_info_not_warn`。
                     (
-                        context::choose_budget(explicit, None),
+                        context::budget_before_launch(explicit, body),
                         upstream::UpstreamProbe::unanswered(),
                     )
                 } else {
-                    context::resolve_budget(explicit, &llm).await
+                    context::resolve_budget(explicit, &llm, body).await
                 }
             },
             async {
@@ -1335,6 +1353,12 @@ impl App {
                 }
             },
         );
+
+        // **送るサンプラの値を面ごとに言う**（ADR-0058 §決定3 / 作業単位 A-16）。差し替え口から読むので、
+        // 本文と裏方がそれぞれ実際に送る値になる（`sub` 面が無ければ裏方は本文の複製 —— 同じ値）。
+        // **本文の面の思考の量と返答の上限も同じ行で言う**（ADR-0059 §決定1・2 / 作業単位 A-18a）——
+        // 返答の上限は組んだ予算の余白（窓が小さくて既定へ戻したかも）なので、予算が決まった後に言う。
+        context::report_samplers(&faces, body, budget, "startup");
 
         // **実測由来の定数が名乗るモデルと、いま上流が応答するモデルを突き合わせる**
         // （ADR-0033 §決定1 / 作業単位 E-2）。**報告するだけで、起動は止めない**
@@ -1457,10 +1481,7 @@ impl App {
         let refresh_source = Some(main_face.clone());
 
         // **値と「明示か」を一緒に器へ渡す**（`context::Chosen` / 作業単位 A-13a-1）。
-        let budget = match explicit {
-            Some(_) => context::Chosen::explicit(budget),
-            None => context::Chosen::measured(budget),
-        };
+        // **本文の予算は `choose_budget` が「明示か」と落とし所の窓の印を付けて返す**（A-18a のレビュー是正）。
         let sub_context = match sub_explicit {
             Some(_) => context::Chosen::explicit(sub_context),
             None => context::Chosen::measured(sub_context),
@@ -1511,6 +1532,7 @@ impl App {
                 sub_refresh_source,
                 upstream_facts,
                 check_at_start,
+                body,
             },
             launching,
         )
@@ -1540,6 +1562,7 @@ impl App {
             sub_refresh_source,
             upstream_facts,
             check_at_start,
+            body,
         } = resolved;
 
         // --- ここから: 失敗しても閉じるものが無い区間。新しい構築はこの中に足す。 ---
@@ -1828,7 +1851,9 @@ impl App {
             sub_refresh_source,
             upstream_facts,
             check_at_start,
-        );
+        )
+        // **本文の面の思考の量と返答の上限も同じ器へ**（ADR-0059 / 作業単位 A-18a）。
+        .with_body(body);
 
         // **抽出器が読む先は、引き直しが書く先そのもの**（`Arc` の複製）。
         // **`SharedSubContext` を新しく作る道はここには無い**（`context` の private）。
@@ -1931,12 +1956,11 @@ impl App {
         // **器の「明示か」も本番の入口と同じく事実どおりに付ける**（レビュー是正）——
         // この入口では引き直しが走らないので今は効かないが、印が事実と食い違う器を作らない。
         let profile_context = config.profile_context();
-        let explicit = context::explicit_main_budget(config.context_budget(), profile_context.main);
-        let budget = context::choose_budget(explicit, None);
-        let budget = match explicit {
-            Some(_) => context::Chosen::explicit(budget),
-            None => context::Chosen::measured(budget),
-        };
+        let body = profile_context.body;
+        let explicit =
+            context::explicit_main_budget(config.context_budget(), profile_context.main, body);
+        // **`choose_budget` が「明示か」（と落とし所の窓の印）を付けて返す**（A-18a のレビュー是正）。
+        let budget = context::choose_budget(explicit, None, body);
         // **サブモデルのコンテキスト長も照会できない**（同じ理由——引く先が無い）。
         // 通るのは「引けなかった」経路で、抽出の上限は落とし所になる。
         let sub_context = context::choose_sub_context(profile_context.sub, None);
@@ -1969,6 +1993,7 @@ impl App {
                 upstream_facts,
                 // **照会先が無い**ので、起動の直後にも照会しない。
                 check_at_start: context::CheckAtStart::NONE,
+                body,
             },
             // **注入の入口は1つも起こさない。** 上流そのものがモックである。
             Launching::none(),

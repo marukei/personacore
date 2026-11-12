@@ -334,6 +334,8 @@ async fn a_turn_after_a_promise_proposes_it_and_adopting_puts_it_in_the_prompt()
         assert_eq!(request["model"], SUB_MODEL);
         assert_eq!(request["max_tokens"], 320);
         assert!((request["temperature"].as_f64().expect("温度") - 0.8).abs() < 1e-6);
+        // **裏方は思考させない**（ADR-0059 §決定1）。
+        assert_eq!(request["reasoning_effort"], "none");
     }
 
     // **提案中は本文に載らない**（3往復目の本文の依頼に中身が無い）。

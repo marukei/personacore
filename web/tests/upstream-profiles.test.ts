@@ -1029,9 +1029,9 @@ describe("保存の失敗を読み分ける", () => {
     expect(describeSaveFailure(invalid("sub", "model"), false).kind).toBe("form");
   });
 
-  it("欄の無い鍵（`allow_key_over_plain_http` / `sampling`）を名指した 422 は、全体に出す（ADR-0058 §決定6）", () => {
-    for (const key of ["allow_key_over_plain_http", "sampling"] as const) {
-      // **前提: どちらも写し元の鍵ではある**（知らない鍵だから全体に出た、ではない）。
+  it("欄の無い鍵（`allow_key_over_plain_http` / `sampling` / `response_tokens`）を名指した 422 は、全体に出す（ADR-0058 §決定6 / ADR-0059 §決定5）", () => {
+    for (const key of ["allow_key_over_plain_http", "sampling", "response_tokens"] as const) {
+      // **前提: 3つとも写し元の鍵ではある**（知らない鍵だから全体に出た、ではない）。
       expect(FACE_KEYS as readonly string[]).toContain(key);
       expect(EDITABLE_FACE_KEYS as readonly string[]).not.toContain(key);
       for (const face of ["main", "sub"] as const) {

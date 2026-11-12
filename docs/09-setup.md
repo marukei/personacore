@@ -102,7 +102,8 @@
 * **上流が LM Studio 以外** —— ~~**通しで動かしたことがまだ無い。**~~
   **半分は歩いた**（2026-09-17 に訂正）。**`llama serve`（llama.cpp）を抽出の上流にした走行は、
   測定 `C-12` / `C-16` / `C-17` で延べ 12 走ある**（[ADR-0037](adr/0037-extraction-quality-is-a-bet-on-the-model.md) の C-12 / C-17 の節）。
-  **上の §上流の表は、`llama serve` に対して満たされている** —— 一覧・実効コンテキスト長・`reasoning_effort` の抑止（作業単位 `G-3b` / `G-7` / `G-10`）。
+  **上の §上流の表は、`llama serve` に対して満たされている** —— 一覧・実効コンテキスト長・`reasoning_effort` の抑止（作業単位 `G-3b` / `G-7` / `G-10`。
+  抑止は既定で、A-18a から本文の面に `"low"` を書けば本文の要求だけが思考を頼む —— [ADR-0059](adr/0059-thinking-and-response-room-in-the-upstream-profile.md) §決定1）。
   ~~**⚠ 歩いていないのは本文側である。**~~ **→ 歩いた**（2026-09-17 / `C-18` と `C-19`）。
   **`llama serve` を本文と抽出の両方の上流にして、3つのモデル（ministral / 公式 Qwen / 無検閲 Qwen）で 34 ターンずつ会話を通した。**
   **どれも成立する。差は癖**（地の文の有無・Markdown・引用符）で、数は [06-roadmap.md](06-roadmap.md) の `C-19` の行と

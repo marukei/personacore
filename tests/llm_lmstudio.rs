@@ -466,6 +466,51 @@ async fn both_call_shapes_ask_the_upstream_not_to_think() {
     }
 }
 
+/// **要求が思考の量を載せたら、どちらの呼び方でもその値が上流へ出る**
+/// （[ADR-0059](../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md) §決定1 / 作業単位 A-18a）。
+///
+/// 上の `both_call_shapes_ask_the_upstream_not_to_think` が既定の腕（要求が上書きを持たない＝裏方の形）で、
+/// これは書いた面の腕（本文の経路の形）。**`post` が要求の上書きを捨てて別の本文を組む実装は、この層でしか見えない。**
+/// 期待値は `"low"` を直に書く。
+#[tokio::test]
+async fn both_call_shapes_carry_the_requested_reasoning_effort() {
+    let thinking = ChatRequest {
+        reasoning_effort: Some(personacore::llm::ReasoningEffort::Low),
+        ..request()
+    };
+    let plain = mock_server(
+        ResponseTemplate::new(200)
+            .set_body_raw(completion_body("はい", "stop"), "application/json"),
+    )
+    .await;
+    client_for(&plain.uri())
+        .complete(&thinking)
+        .await
+        .expect("正常な応答を解釈できること");
+    let streaming = sse_server(format!("{}data: [DONE]\n\n", sse_delta("こん"))).await;
+    let mut chat_stream = client_for(&streaming.uri())
+        .stream(&thinking)
+        .await
+        .expect("ストリームを開けること");
+    drain(&mut chat_stream).await;
+
+    for (label, server) in [("非ストリーミング", &plain), ("ストリーミング", &streaming)]
+    {
+        let requests = server
+            .received_requests()
+            .await
+            .expect("記録が有効であること");
+        assert_eq!(requests.len(), 1, "{label}: 上流へは1回だけ投げること");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("送信本文が JSON であること");
+        assert_eq!(
+            sent["reasoning_effort"],
+            serde_json::json!("low"),
+            "{label}: 要求が載せた思考の量を送ること: {sent}"
+        );
+    }
+}
+
 /// **上流へ出た HTTP 本文に、サンプラー5欄が綴りどおりに載る**
 /// （ADR-0038 §決定2 / 作業単位 A-7c。`presence_penalty` は A-14 で足した）。
 ///
@@ -588,6 +633,7 @@ async fn both_call_shapes_carry_the_requested_temperature_on_the_wire() {
         messages: vec![ChatMessage::user("こんにちは")],
         temperature: Some(temperature),
         max_tokens: None,
+        reasoning_effort: None,
     };
 
     // 非ストリーミング（裏方の抽出・変容が通る形）。

@@ -66,7 +66,7 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 
 use super::AppState;
-use super::config::{BindAddr, FaceSettings, ProfileContext};
+use super::config::{BindAddr, BodyFace, FaceSettings, ProfileContext};
 use super::context::{Candidate, FaceClient};
 use super::error::{ApiError, ErrorBody};
 use super::launch::{Armed, FaceState, LaunchPlan, Supervisor};
@@ -286,6 +286,14 @@ impl Switcher {
 /// **宛先・綴りが同じで `sampling` だけが違うプロファイルへ切り替えても、値は切り替え先に追従する。**
 /// 比べなければ「触らない」になり、**前の値のまま送り続ける**（同じ量子化で値だけを変えて比べる使い方で、
 /// 比べたつもりの2つの腕が同じ値で走る）。見張り番は `tests/server_profile_sampling.rs` の腕5。
+///
+/// # 本文の面の思考の量と返答の上限も比べる（ADR-0059 §決定4 の腕4 / 作業単位 A-18a）
+///
+/// **宛先・綴りが同じで `reasoning_effort` / `response_tokens` だけが違うプロファイルへ切り替えても、
+/// 値（と予算の余白）は切り替え先に追従する。** 比べなければ「触らない」になり、本文の予算の器
+/// （`context::SharedBudget`）を差し替えないので、**前の思考の量・前の上限のまま送り続ける。**
+/// **本文の面だけが値を持つ**（裏方の面は常に既定 —— [`BodyFace::default`]）。
+/// 見張り番は `tests/server_profile_thinking.rs` の腕4と、`tests::a_face_whose_body_settings_alone_change_is_touched`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
     endpoint: String,
@@ -294,10 +302,11 @@ struct Target {
     api_key: Option<ApiKey>,
     allow_key_over_plain_http: bool,
     sampling: Sampling,
+    body: BodyFace,
 }
 
 impl Target {
-    fn of_client(client: &FaceClient, context_tokens: Option<u32>) -> Self {
+    fn of_client(client: &FaceClient, context_tokens: Option<u32>, body: BodyFace) -> Self {
         Self {
             endpoint: client.endpoint(),
             model: client.model(),
@@ -305,10 +314,11 @@ impl Target {
             api_key: client.api_key(),
             allow_key_over_plain_http: client.key_over_plain_http_allowed(),
             sampling: client.sampling(),
+            body,
         }
     }
 
-    fn of_candidate(candidate: &Candidate, context_tokens: Option<u32>) -> Self {
+    fn of_candidate(candidate: &Candidate, context_tokens: Option<u32>, body: BodyFace) -> Self {
         Self {
             endpoint: candidate.endpoint().to_owned(),
             model: candidate.model().to_owned(),
@@ -316,7 +326,16 @@ impl Target {
             api_key: candidate.api_key().cloned(),
             allow_key_over_plain_http: candidate.key_over_plain_http_allowed(),
             sampling: candidate.sampling(),
+            body,
         }
+    }
+}
+
+/// **その面が持つ本文の面の値**（本文の面だけが値を持ち、裏方の面は常に既定 / [`Target`] の doc）。
+fn body_of(face: ModelFace, body: BodyFace) -> BodyFace {
+    match face {
+        ModelFace::Main => body,
+        ModelFace::Sub => BodyFace::default(),
     }
 }
 
@@ -493,13 +512,17 @@ fn prepare(
     // **面に書いたコンテキスト長**（ADR-0054 §決定1）。**起動時と同じ検証を通す**
     // （`AppConfig::with_profile_context` と同じ関数）——読み込みで検証済みなので、ここで落ちるのは
     // 規則が2つに割れたときだけ。
-    let profile_context = ProfileContext::of(&profile.settings()).map_err(|err| {
-        tracing::warn!(
-            error = %err,
-            "差し替え先の上流プロファイルの context_tokens が使えません（差し替えていません）"
-        );
-        ApiError::upstream_profile_unusable()
-    })?;
+    //
+    // **本文の面の返答の上限が起動時の `PERSONACORE_CONTEXT_TOKENS` に収まるかも、ここで見る**
+    // （ADR-0059 §決定2 —— 面に窓が無いプロファイルでは、読み込みは環境変数を見ていない）。
+    let profile_context = ProfileContext::of(&profile.settings(), armed.sinks.environment())
+        .map_err(|err| {
+            tracing::warn!(
+                error = %err,
+                "差し替え先の上流プロファイルの context_tokens / response_tokens が使えません（差し替えていません）"
+            );
+            ApiError::upstream_profile_unusable()
+        })?;
     let next_context = |face: ModelFace| armed.sinks.next_explicit_tokens(face, profile_context);
 
     let next_sub = sub_written.as_ref().map_or_else(
@@ -510,14 +533,32 @@ fn prepare(
             api_key: main.api_key().cloned(),
             allow_key_over_plain_http: main.key_over_plain_http_allowed(),
             sampling: main.sampling(),
+            // **`sub` 面が無くても、本文の面の値は裏方へ写さない**（ADR-0059 §決定1）。
+            body: body_of(ModelFace::Sub, profile_context.body),
         },
-        |candidate| Target::of_candidate(candidate, next_context(ModelFace::Sub)),
+        |candidate| {
+            Target::of_candidate(
+                candidate,
+                next_context(ModelFace::Sub),
+                body_of(ModelFace::Sub, profile_context.body),
+            )
+        },
     );
 
-    let current =
-        FACES.map(|face| Target::of_client(clients.face(face), armed.sinks.explicit_tokens(face)));
+    // **本文の面の値は、いまの本文の予算の器から**（ADR-0059 / [`Target`] の doc）。
+    let current = FACES.map(|face| {
+        Target::of_client(
+            clients.face(face),
+            armed.sinks.explicit_tokens(face),
+            body_of(face, armed.sinks.body()),
+        )
+    });
     let next = [
-        Target::of_candidate(&main, next_context(ModelFace::Main)),
+        Target::of_candidate(
+            &main,
+            next_context(ModelFace::Main),
+            body_of(ModelFace::Main, profile_context.body),
+        ),
         next_sub,
     ];
     // **起こすのを待っている面**（ADR-0055 / 作業単位 F-10a / [`plan_switch`] の doc）。
@@ -610,10 +651,6 @@ async fn execute(supervisor: &mut Supervisor, armed: &Armed, prepared: Prepared)
         }
     }
 
-    // **送るサンプラの値を面ごとに言う**（ADR-0058 §決定3）。触らなかった面も言う —— 切り替えの後に
-    // 何で送るかを、ログの1か所で読めるように。
-    super::context::report_samplers(&armed.clients, SWITCH_OCCASION);
-
     // 3. **起こす。** 載るのは背景で待つ（番人は起こした場で付く）。
     supervisor.start_more(&plan.start);
 
@@ -631,6 +668,20 @@ async fn execute(supervisor: &mut Supervisor, armed: &Armed, prepared: Prepared)
             armed.sinks.adopt(face, &probe);
         }
     }
+
+    // **送るサンプラの値を面ごとに言う**（ADR-0058 §決定3）。触らなかった面も言う —— 切り替えの後に
+    // 何で送るかを、ログの1か所で読めるように。
+    // **本文の面の思考の量と返答の上限も同じ行で言う**（ADR-0059 §決定1・2）。
+    //
+    // **言うのは外の上流を測り直した後**（A-18a のレビュー是正）—— 差し替えた直後の器は、窓がまだ分からないので
+    // 返答の上限が既定の 1024 になっている（`context::install_face`）。測り直した後なら、外の上流では次の本文が
+    // 実際に使う上限を言える。起こす上流はまだ載っていないので、窓が分からないまま（`window_unknown`）言う。
+    super::context::report_samplers(
+        &armed.clients,
+        armed.sinks.body(),
+        armed.sinks.main_budget(),
+        SWITCH_OCCASION,
+    );
 }
 
 // ----------------------------------------------------------------------
@@ -777,6 +828,58 @@ mod tests {
             api_key: None,
             allow_key_over_plain_http: false,
             sampling: Sampling::default(),
+            body: BodyFace::default(),
+        }
+    }
+
+    /// **宛先・綴りが同じで、本文の面の思考の量か返答の上限だけが変わった面は触る**
+    /// （ADR-0059 §決定4 の腕4 / 作業単位 A-18a）。
+    ///
+    /// **本文の面だけ**を変えて見る —— 裏方の面は同じまま触らない。**対照**: 同じ値なら触らない。
+    /// 値は既定（`none` / 1024）と違える（2048・1536）。思考の量と上限を別々に変える腕を置く
+    /// （片方だけを比べる実装を、もう片方の腕が赤にする）。
+    #[test]
+    fn a_face_whose_body_settings_alone_change_is_touched() {
+        use crate::llm::ReasoningEffort;
+        let body = |effort: Option<ReasoningEffort>, room: Option<u32>| Target {
+            body: BodyFace {
+                reasoning_effort: effort,
+                response_tokens: room,
+            },
+            ..target("http://127.0.0.1:1/v1/chat/completions", "main")
+        };
+        let sub = target("http://127.0.0.1:2/v1/chat/completions", "sub");
+        let low = Some(ReasoningEffort::Low);
+        for (before, after, touched) in [
+            (body(None, None), body(low, None), true),
+            (body(low, None), body(None, None), true),
+            (body(None, None), body(None, Some(2048)), true),
+            (body(None, Some(2048)), body(None, Some(1536)), true),
+            (body(low, Some(2048)), body(None, None), true),
+            (body(low, Some(2048)), body(low, Some(2048)), false),
+            (body(None, None), body(None, None), false),
+        ] {
+            let plan = plan_switch(
+                &[],
+                &[],
+                &[before.clone(), sub.clone()],
+                &[after.clone(), sub.clone()],
+                [false, false],
+            );
+            assert_eq!(
+                plan.touch,
+                [
+                    if touched {
+                        Touch::External
+                    } else {
+                        Touch::Untouched
+                    },
+                    Touch::Untouched,
+                ],
+                "{:?} → {:?}",
+                before.body,
+                after.body
+            );
         }
     }
 

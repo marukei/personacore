@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use common::install_global_log;
+use common::{has_field, install_global_log};
 use personacore::server::{
     App, AppConfig, BindAddr, DEFAULT_LOG_FILTER, ENV_PORT, LaunchPlan, LaunchTiming, PortSource,
     Startup, UpstreamProfiles, overlay_profile, parse_profiles,
@@ -631,6 +631,69 @@ async fn the_face_we_are_about_to_start_is_not_asked_at_startup() {
     serving.stop().await;
     let _ = squatter.kill().await;
     let _ = sub_squatter.kill().await;
+}
+
+/// **窓が分からないので返答の上限を既定にしたと言う行**（`server::context::RESPONSE_UNKNOWN_WINDOW_LINE` の写し）。
+const RESPONSE_UNKNOWN_WINDOW_LINE: &str =
+    "上流のコンテキスト長が分からないので、窓が分かるまで返答の上限を既定にします";
+
+/// **起こす本文の面で起動したときの「窓が分からない」の行は `info`**（ADR-0059 §決定2 / A-18a の再レビュー是正）。
+///
+/// その面はまだ載っていないので聞いていない —— 照会に失敗したのではない。**`warn` にすると、起こす上流で
+/// 起動するたびに警告が1本出る。** 本当に照会が失敗した起動（外の上流が答えない）の `warn` は
+/// `tests/server_profile_thinking.rs` の腕8 が見る。
+///
+/// **行の帰属は、同じ行の `response_tokens_written` の値で引く**（このバイナリの他の腕は返答の上限を書かないので、
+/// この行を出さない。値も既定・他の腕と違える）。
+#[tokio::test]
+async fn a_launching_body_face_says_the_unknown_window_at_info_not_warn() {
+    const WRITTEN: u32 = 2_345;
+    let log = install_global_log(DEFAULT_LOG_FILTER);
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作れること");
+    fake_llama_on_path();
+    let gguf = fake_gguf(dir.path(), "planted-unknown-window.gguf");
+    let upstream_port = free_port();
+    let port = free_port();
+
+    let (profiles, _) = read(
+        &serde_json::json!({
+            "planted": {
+                "main": {
+                    "endpoint": format!("http://{LAUNCH_HOST}:{upstream_port}"),
+                    "model": "planted-unknown-window-id",
+                    "gguf": gguf,
+                    "response_tokens": WRITTEN,
+                },
+                "sub": {
+                    "endpoint": format!("http://127.0.0.1:{}", free_port()),
+                    "model": "planted-sub-model-id",
+                }
+            }
+        })
+        .to_string(),
+    );
+    let (config, plan) = config_of(&profiles, "planted", dir.path(), port);
+    let settings = profiles.select("planted").expect("在ること").settings();
+    let config = config
+        .with_profile_context(&settings)
+        .expect("書いた値を載せられること");
+
+    let mut serving = serve(config, plan);
+    wait_for_state(port, "main", "ready").await;
+    serving.stop().await;
+
+    let output = log.contents();
+    let written = format!("response_tokens_written={WRITTEN}");
+    let said: Vec<&str> = output
+        .lines()
+        .filter(|line| line.contains(RESPONSE_UNKNOWN_WINDOW_LINE) && has_field(line, &written))
+        .collect();
+    assert_eq!(said.len(), 1, "起動で1本だけ言うこと: {said:?}");
+    assert!(
+        said[0].contains("INFO") && !said[0].contains("WARN"),
+        "まだ聞いていないだけなので info: {}",
+        said[0]
+    );
 }
 
 /// **止めるのは、控えた子だけ。**

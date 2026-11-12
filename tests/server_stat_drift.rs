@@ -45,7 +45,7 @@ use personacore::domain::{
 };
 use personacore::server::{
     App, AppConfig, BackgroundProbe, BindAddr, ENV_DRIFT_FORM, ENV_DRIFT_NOTE, ENV_LLM_ENDPOINT,
-    ENV_MAIN_MODEL, ENV_STAT_DRIFT, ENV_SUB_MODEL,
+    ENV_MAIN_MODEL, ENV_STAT_DRIFT, ENV_SUB_MODEL, overlay_profile, parse_profiles,
 };
 use personacore::store::Store;
 use serde_json::{Value, json};
@@ -287,6 +287,32 @@ impl Harness {
         drift_form: Option<&str>,
         knobs: &[(&str, &str)],
     ) -> Self {
+        Self::start_profiled(stat_drift, drift_form, knobs, None).await
+    }
+
+    /// **1往復で1段動く `K`** を与え、**本文の面に `extra` を書いた上流プロファイル**（`sub` 面なし）で、
+    /// 本番の入口で起動する（ADR-0059 / 作業単位 A-18a）。
+    ///
+    /// プロファイルは `main` と同じ段で載せる（`overlay_profile` → `with_profile_context` → `with_profile_keys` →
+    /// `with_profile_sampling`）。**`sub` 面を書かない** —— 裏方（抽出・変容）は本文のクライアントの複製で走る
+    /// （本文の面の値が裏方へ写る形を見たいので）。
+    async fn start_moving_with_main_face(stat_drift: Option<&str>, extra: Value) -> Self {
+        Self::start_profiled(
+            stat_drift,
+            None,
+            &[(personacore::server::ENV_DRIFT_STEP_COST, "0.06")],
+            Some(extra),
+        )
+        .await
+    }
+
+    /// **起動の本体。** `main_extra` があれば、本文の面にそれを書いた上流プロファイル（`sub` 面なし）を重ねる。
+    async fn start_profiled(
+        stat_drift: Option<&str>,
+        drift_form: Option<&str>,
+        knobs: &[(&str, &str)],
+        main_extra: Option<Value>,
+    ) -> Self {
         let upstream = MockServer::start().await;
 
         // **3種の依頼を、中身で振り分けて別々の答えを返す。**
@@ -336,12 +362,31 @@ impl Harness {
         for (key, value) in knobs {
             env.push((key, (*value).to_owned()));
         }
-        let config = AppConfig::from_lookup(|key| {
+        let lookup = |key: &str| {
             env.iter()
                 .find(|(name, _)| *name == key)
                 .map(|(_, value)| value.clone())
-        })
-        .expect("設定を組み立てられること")
+        };
+        let config = match main_extra {
+            None => AppConfig::from_lookup(lookup).expect("設定を組み立てられること"),
+            Some(extra) => {
+                let mut main = json!({ "endpoint": endpoint, "model": MAIN_MODEL });
+                if let (Some(main), Some(extra)) = (main.as_object_mut(), extra.as_object()) {
+                    for (key, value) in extra {
+                        main.insert(key.clone(), value.clone());
+                    }
+                }
+                let profiles = parse_profiles(&json!({ "p": { "main": main } }).to_string(), None)
+                    .expect("植えたプロファイルが読めること");
+                let settings = profiles.select("p").expect("在ること").settings();
+                AppConfig::from_lookup(overlay_profile(&settings, lookup))
+                    .expect("設定を組み立てられること")
+                    .with_profile_context(&settings)
+                    .expect("書いた値を載せられること")
+                    .with_profile_keys(&settings)
+                    .with_profile_sampling(&settings)
+            }
+        }
         .with_bind(BindAddr::loopback(0))
         .with_database_path(&db_path);
 
@@ -714,13 +759,18 @@ async fn the_stat_drift_switch_reaches_the_upstream_through_the_real_bind() {
 /// （`[(Main,…),(Extraction,…),(Drift,…)]` はどう並べ替えても同じ値の列になる）。
 /// CLAUDE.md の最頻の穴——「**フィクスチャが2つの値を同値にすると、その取り違えは検出できない**」。
 ///
-/// **いまは実害ゼロ。** `llm::request::RequestPolicy` は**全経路で同一の `const`** なので、
-/// 取り違えようがない（取り違えても出力が変わらない）。
+/// **A-18a までは実害ゼロだった。** `llm::request::RequestPolicy` は**全経路で同一の `const`** だったので、
+/// 取り違えようがなかった（取り違えても出力が変わらない）。
 ///
 /// **⚠ 問題になるのは C-13**（[ADR-0038](adr/0038-what-personacore-requires-of-an-upstream.md) §決定2）。
 /// **サンプラーを経路ごとに違う値で持たせた瞬間、取り違えが観測可能な欠陥になる。**
 /// **そのときは、経路ごとに違う値をフィクスチャに入れないと、この1本は帰属を見張らない。**
 /// **`assert_ne!` を置くだけでは足りない**——足すべきなのは「**経路ごとに違う値**」そのもの。
+///
+/// **⚠ A-18a でその日が来た**（[ADR-0059](../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md)
+/// §決定1 —— 本文の経路だけが、本文の面に書いた `reasoning_effort` を載せる）。**この1本は「何も書いていない面」の
+/// 既定の腕として残す**（3経路とも `none`）。**帰属（本文に `low`・裏方に `none`）は
+/// [`each_path_sends_its_own_reasoning_effort`] が、経路ごとに違う値で見る。**
 #[tokio::test]
 async fn all_three_paths_ask_the_upstream_not_to_think() {
     let server = Harness::start_moving(Some("on")).await;
@@ -741,6 +791,49 @@ async fn all_three_paths_ask_the_upstream_not_to_think() {
             (Kind::Drift, Some("none")),
         ],
         "3経路とも思考を切ること: {requests:?}"
+    );
+
+    server.stop().await;
+}
+
+/// **3つの経路が、それぞれ自分の思考の量を送る —— 本文は本文の面に書いた `low`、抽出と変容は `none`**
+/// （[ADR-0059](../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md) §決定1・§決定4 の腕2 /
+/// 作業単位 A-18a）。
+///
+/// [`all_three_paths_ask_the_upstream_not_to_think`] を割った「書いた面」の腕。**形は
+/// [`each_path_sends_its_own_temperature`] に倣う**（経路の名前と値を対にして並べる）。
+///
+/// # `sub` 面の無い構成で見る
+///
+/// **プロファイルは本文の面だけ**を書く —— 裏方は本文のクライアントの複製（同じ宛先・同じモデル・同じ面の設定）で
+/// 走る。**本文の思考の量を面の設定に載せる実装は、ここで抽出と変容が `low` になって赤になる**
+/// （ADR-0059 §却下した選択肢 —— 抽出の予算 320 を思考で使い切る）。逆に、本文の経路が載せ忘れる実装は本文が `none` になって赤。
+///
+/// **期待値は実装の定数から作らない**（`"low"` / `"none"` を手で書く）。
+#[tokio::test]
+async fn each_path_sends_its_own_reasoning_effort() {
+    let server = Harness::start_moving_with_main_face(
+        Some("on"),
+        json!({ "sampling": { "reasoning_effort": "low" } }),
+    )
+    .await;
+    server.chat().await;
+
+    let requests = server.wait_for_upstream(3).await;
+    assert_eq!(requests.len(), 3, "本文・抽出・変容で3往復であること");
+
+    let seen: Vec<(Kind, Option<&str>)> = requests
+        .iter()
+        .map(|request| (kind_of(request), request["reasoning_effort"].as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (Kind::Main, Some("low")),
+            (Kind::Extraction, Some("none")),
+            (Kind::Drift, Some("none")),
+        ],
+        "本文は本文の面の値を、裏方は none を送ること: {requests:?}"
     );
 
     server.stop().await;
