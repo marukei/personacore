@@ -4,6 +4,7 @@
   **→ 2026-08-29 に測って値が決まった / C-13。§決定2 の「⚠ 測った結果」から読むこと**）
 - 日付: 2026-08-28
 - **⚠ 2026-11-10: §決定2 の「つまみにしない」を [ADR-0058](0058-sampling-values-in-the-upstream-profile.md) が改めた。** 上流プロファイルの面に `sampling.repeat_penalty` を書ける。書かない面は今の1組のまま。値は personacore が持って明示で送るので、§決定2 の目的（再現・観測）は変わらない
+- **⚠ 2026-11-12: §決定3 の「`reasoning_effort: "none"` を全経路で常に送る」を、本文の経路について [ADR-0059](0059-thinking-and-response-room-in-the-upstream-profile.md) が改めた。** 上流プロファイルの `main` 面に `sampling.reasoning_effort`（`none` / `low`）を書くと、本文の要求だけがその値を送る。裏方は今も常に `none`（§決定3 の理由はそのまま当てはまる）
 - 関連: [ADR-0036](0036-the-range-of-machines-is-a-constraint.md)（**決定4 が継ぎ目を置いた。この ADR はその続き**）/
   [ADR-0029](0029-language-as-a-matched-bundle.md)（**束の形の先例**）/
   [ADR-0033](0033-measured-constants-name-what-they-were-measured-on.md)（**定数が測った相手を名乗る**）/

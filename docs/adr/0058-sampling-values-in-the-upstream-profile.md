@@ -2,6 +2,7 @@
 
 - 状態: **採用**（2026-11-10 / 利用者の決定。作業単位 A-16）
 - 日付: 2026-11-10
+- **⚠ 2026-11-12: §決定1 を [ADR-0059](0059-thinking-and-response-room-in-the-upstream-profile.md) が改めた。** 面の `sampling` に `reasoning_effort` を書ける（`main` 面だけ。§決定1 が「サンプラではないので対象外」としていた点を改める）。この欄には `sub` 面の規則（`sub` 面が無ければ `main` の値を裏方にも使う）を当てはめない
 - 関連: [ADR-0038](0038-what-personacore-requires-of-an-upstream.md)（§決定2 の「つまみにしない」を改める）/
   [ADR-0036](0036-the-range-of-machines-is-a-constraint.md)（§決定3 のつまみの条件、§決定4 の上流固有の漏れ）/
   [ADR-0042](0042-the-executable-owns-the-upstream-it-starts.md)（§決定1 の面の鍵、§決定4 の差し替え、§決定8 の画面の編集）/

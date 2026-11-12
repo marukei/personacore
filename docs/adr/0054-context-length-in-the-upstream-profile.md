@@ -2,6 +2,7 @@
 
 - 状態: **採用**（2026-11-01 / C-21 の当たりを受けて、利用者と司令塔が決めた。作業単位 A-13a-1・A-13a-2）
 - 日付: 2026-11-01
+- **⚠ 2026-11-12: §決定1 の「応答の余白（1024）以下は止める」検証を [ADR-0059](0059-thinking-and-response-room-in-the-upstream-profile.md) が改めた。** `main` 面に `response_tokens` を書いたときは、検証の下限がその値に追従する
 - 関連: [ADR-0013](0013-context-budget-layers.md)（予算の3層）/
   [ADR-0020](0020-context-length-requery.md)（引き直し）/
   [ADR-0036](0036-the-range-of-machines-is-a-constraint.md)（つまみにする条件）/
