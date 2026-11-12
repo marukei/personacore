@@ -272,15 +272,11 @@ request is also rejected with 400; personacore does not fall back to an earlier 
 
 The prompt is: a system message built from the character's display name, persona,
 attributes, non-zero personality stats, active promises and rules (see
-[Promises and rules](#promises-and-rules)) and output-format instruction
-(`output_format_instruction`, when set), then the recent history of this conversation from
-the database, then your last `user` message. Memories **about the user** (selected to fit
-the budget; memories about the character itself are not used in the chat prompt, see
-[Memories](#memories)) are not in the system message: they are placed in front of the text
-of your last `user` message, followed by a fixed separator line. This prefix is sent with
-that request only. It is not stored, so it never appears on earlier messages when the
-history is read back; the stored message is the text you sent. When no memory is
-selected, the last message is exactly your text. After the fixed part (name, persona, attributes, stats,
+[Promises and rules](#promises-and-rules)), memories **about the user** (selected to fit the
+budget; memories about the character itself are not used in the chat prompt, see
+[Memories](#memories)) and output-format instruction (`output_format_instruction`, when
+set), then the recent history of this conversation from the database, then the text of
+your last `user` message. After the fixed part (name, persona, attributes, stats,
 instructions) and the reply reserve, the latest exchange of the conversation is kept if
 it fits; then the active promises and rules are taken, and if they do not all fit, the
 oldest are left out. The room left after that is shared between memories and history,

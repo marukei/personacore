@@ -898,113 +898,6 @@ async fn a_turn_is_parsed_persisted_and_carried_into_the_next_prompt() {
     server.stop().await;
 }
 
-/// **想起した記憶の前置きは、送る最新の発言にだけ付く。保存にも、次のターンの履歴にも出ない**
-/// （ADR-0061 §決定1 / 作業単位 A-15）。
-///
-/// # なぜ記憶を入れて回すのか
-///
-/// 記憶が0件なら前置きは出ないので、送った本文と保存した原文が同じになる。そのままでは
-/// 「保存（`TurnSink` に渡す発言）に、送る本文の末尾を使う」変更が緑を通る。記憶を1件入れて、
-/// **送った末尾の発言と、保存した原文が違う**状態を作ってから、保存と読み戻しが原文であることを見る。
-///
-/// # 見ているもの
-///
-/// 1. 1回目に送った末尾の発言は「前置き（記憶の引用行を含む）・改行・原文」で、system に記憶は無い。
-/// 2. 保存した利用者の発言は原文（前置きを含まない。抽出もこの原文を読む）。
-/// 3. 2回目の履歴に読み戻された1回目の発言は原文（過去のターンに記憶が付かない）。
-///    前置きは2回目の末尾の発言にだけ付く。
-#[tokio::test]
-async fn the_recalled_memory_precedes_only_the_sent_message_and_never_the_stored_one() {
-    /// 利用者についての記憶。**どの発言・応答とも部分文字列を共有しない。**
-    const MEMORY: &str = "黒猫のコーヒーと暮らしている";
-
-    let server = TestServer::start(MockLlm::replying_each(&[FIRST_REPLY, SECOND_REPLY])).await;
-    server.seed("aoi", "葵").await;
-    let character = server
-        .store
-        .find_character_by_handle(&name("aoi"))
-        .await
-        .expect("検索できること")
-        .expect("作ったキャラクターが引けること");
-    server
-        .store
-        .add_memory(
-            character.id,
-            &NewMemory {
-                subject: Subject::User,
-                content: MemoryContent::parse(MEMORY).expect("正当な本文であること"),
-                category: None,
-            },
-        )
-        .await
-        .expect("記憶を追加できること");
-
-    // --- 1回目 ---
-    let (status, first) = server.chat(&request_of("aoi", FIRST_USER)).await;
-    assert_eq!(status, StatusCode::OK, "{first}");
-    let session = session_id_of(&first, "aoi");
-
-    let sent = server.llm.last_request();
-    assert_eq!(
-        sent.messages.len(),
-        2,
-        "前提: 1回目は [システム, 今回の発言] の2件であること"
-    );
-    assert!(
-        !sent.messages[0].content.contains(MEMORY),
-        "記憶が system に載った: {}",
-        sent.messages[0].content
-    );
-    let latest = &sent.messages[1].content;
-    assert_eq!(sent.messages[1].role, ChatRole::User);
-    assert!(
-        latest.contains(&format!("> - {MEMORY}")),
-        "前提: 記憶が前置きの引用行として載ること: {latest}"
-    );
-    assert!(
-        latest.ends_with(&format!("\n{FIRST_USER}")) && latest != FIRST_USER,
-        "末尾の発言は前置き・改行・原文の順: {latest}"
-    );
-
-    let saved = server.saved_messages("aoi", session).await;
-    assert_eq!(saved.len(), 2, "往復の2件が保存されること: {saved:?}");
-    assert_eq!(saved[0].role, Role::User);
-    assert_eq!(
-        saved[0].raw_content, FIRST_USER,
-        "保存する発言はクライアントの原文（前置きを含めない）"
-    );
-
-    // --- 2回目。**1回目が着地したセッション id を明示する。** ---
-    let (status, second) = server
-        .chat(&request_of(&format!("aoi@{session}"), SECOND_USER))
-        .await;
-    assert_eq!(status, StatusCode::OK, "{second}");
-
-    let sent = server.llm.last_request();
-    assert_eq!(
-        sent.messages.len(),
-        4,
-        "[システム, 1回目の発言, 1回目の応答, 今回の発言] の4件: {:?}",
-        sent.messages
-    );
-    assert_eq!(
-        sent.messages[1].content, FIRST_USER,
-        "履歴に読み戻した発言は原文（過去のターンに記憶が付かない）"
-    );
-    assert_eq!(sent.messages[2].content, FIRST_REPLY);
-    let latest = &sent.messages[3].content;
-    assert!(
-        latest.contains(&format!("> - {MEMORY}")) && latest.ends_with(&format!("\n{SECOND_USER}")),
-        "前置きは今回の発言にだけ付く: {latest}"
-    );
-
-    let saved = server.saved_messages("aoi", session).await;
-    assert_eq!(saved.len(), 4, "往復が積み上がること: {saved:?}");
-    assert_eq!(saved[2].raw_content, SECOND_USER, "2回目の保存も原文");
-
-    server.stop().await;
-}
-
 /// **往復は「解決したセッション」に書かれる。最新セッションではない。**
 ///
 /// # なぜ既存のテストでは足りないのか
@@ -3205,11 +3098,9 @@ async fn character_attributes_reach_the_prompt_through_the_real_bind() {
     // **その節だけを切り出して見る。**
     //
     // **プロンプト全体で探さないこと。** 主語の小見出しは「# 属性」節と「# 記憶」節が
-    // **同じ定数を共有している**（12b）ので、送る本文の全体で探すと、属性の主語が片方に潰れても
-    // **記憶の側の小見出しで緑になる。** A-15 から「# 記憶」節は system ではなく最新の利用者の発言の
-    // 前置きに出る（ADR-0061）ので、system だけを見ている限りは記憶の小見出しと混ざらない。
-    // それでも節で切る形は残す —— 測定で悪ければ記憶を system へ戻す（ADR-0061 §決定5）ので、
-    // 戻した日に同じ穴が開く。
+    // **同じ定数を共有している**（12b）ので、属性の主語が片方に潰れても
+    // **記憶の側の小見出しで緑になる。** いまこの経路は新規セッションで記憶が 0 件なので
+    // 偽陽性にならないだけで、**記憶を1件でも足した瞬間に戻る。**
     let attribute_at = system
         .find("# 属性")
         .unwrap_or_else(|| panic!("属性の節が出ること: {system}"));
@@ -3425,36 +3316,28 @@ async fn a_superseded_memory_is_never_recalled_even_when_the_user_repeats_it() {
         .find(|request| request.url.path() == "/v1/chat/completions")
         .expect("上流へ中継していること");
     let body: Value = serde_json::from_slice(&forwarded.body).expect("JSON であること");
+    let system = body["messages"][0]["content"]
+        .as_str()
+        .expect("システムプロンプトが文字列であること");
+
+    assert!(
+        system.contains(CORRECTION),
+        "有効な記憶（訂正版）が載っていない:\n{system}"
+    );
+    // **発言そのものはシステムプロンプトには載らない**（別のメッセージ）ので、
+    // ここに誤りの本文があれば、それは記憶の節から来たものである。
+    assert!(
+        !system.contains(WRONG_MEMORY),
+        "上書き済みの記憶が想起へ戻っている:\n{system}"
+    );
+    // 前提: 発言の側には現に載っている（＝語が重なる状態を作れている）。
     let last = body["messages"]
         .as_array()
         .and_then(|messages| messages.last())
         .and_then(|message| message["content"].as_str())
         .expect("今回の発言が最後にあること");
-
-    // **記憶は最新の利用者の発言の前置きに載る**（ADR-0061 / 作業単位 A-15）。同じメッセージに
-    // 今回の発言（誤りの本文を含む）も載るので、**引用行（`> ` で始まる行）だけ**を見る ——
-    // 今回の発言は引用されないので、引用行に誤りの本文があれば、それは記憶の節から来たものである。
-    let quoted: Vec<&str> = last.lines().filter(|line| line.starts_with("> ")).collect();
     assert!(
-        quoted.iter().any(|line| line.contains(CORRECTION)),
-        "有効な記憶（訂正版）が載っていない:\n{last}"
-    );
-    assert!(
-        !quoted.iter().any(|line| line.contains(WRONG_MEMORY)),
-        "上書き済みの記憶が想起へ戻っている:\n{last}"
-    );
-    // 記憶は system には載らない（前置きへ移った）。
-    let system = body["messages"][0]["content"]
-        .as_str()
-        .expect("システムプロンプトが文字列であること");
-    assert!(
-        !system.contains(CORRECTION) && !system.contains(WRONG_MEMORY),
-        "記憶が system に載った:\n{system}"
-    );
-    // 前提: 発言の側には現に載っている（＝語が重なる状態を作れている）。
-    assert!(
-        last.lines()
-            .any(|line| !line.starts_with("> ") && line.contains(WRONG_MEMORY)),
+        last.contains(WRONG_MEMORY),
         "前提: 発言が誤りの本文を含んでいること: {last:?}"
     );
 

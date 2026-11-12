@@ -25,9 +25,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use personacore::domain::{
-    DisplayName, Handle, MemoryContent, Message, NewMemory, Persona, Role, Subject,
-};
+use personacore::domain::{DisplayName, Handle, Message, Persona, Role};
 use personacore::llm::{
     ChatChunk, ChatRequest, ChatStream, Completion, FinishReason, LlmClient, LlmError, LlmFuture,
     TokenUsage,
@@ -1032,112 +1030,6 @@ async fn a_relayed_turn_is_persisted_into_the_resolved_session_not_the_latest_on
     );
     assert_eq!(new[0].raw_content, NEW_USER);
     assert_eq!(new[1].raw_content, NEW_REPLY);
-
-    server.stop().await;
-}
-
-/// **中継の経路でも、想起した記憶の前置きは送る最新の発言にだけ付く。保存にも、次のターンの履歴にも出ない**
-/// （ADR-0061 §決定1 / 作業単位 A-15）。
-///
-/// 形は非ストリーミング側の `tests/server_chat.rs` の
-/// `the_recalled_memory_precedes_only_the_sent_message_and_never_the_stored_one` と同じ。
-/// **中継は保存の口（`TurnSink::new`）を非ストリーミングとは別の場所で作る**（`server::chat` の中継の枝）ので、
-/// そこへ送る本文の末尾を渡す変更は、非ストリーミング側の見張り番では止まらない。
-/// 記憶を1件入れて「送った末尾の発言」と「保存した原文」が違う状態を作ってから見る。
-#[tokio::test]
-async fn a_relayed_turn_sends_the_memory_preamble_but_stores_and_reads_back_the_original() {
-    /// 利用者についての記憶。**どの発言・応答とも部分文字列を共有しない。**
-    const MEMORY: &str = "黒猫のコーヒーと暮らしている";
-    const FIRST_USER: &str = "ただいま、葵";
-    const FIRST_REPLY: &str = "「おかえりなさい」 彼女は微笑んだ。";
-    const SECOND_USER: &str = "今日はいい天気だね";
-    const SECOND_REPLY: &str = "「そうね」 彼女は窓の外を見た。";
-
-    let server = TestServer::start(MockLlm::streaming_each(vec![
-        vec![chunk("「おかえりなさい」"), last_chunk(" 彼女は微笑んだ。")],
-        vec![chunk("「そうね」"), last_chunk(" 彼女は窓の外を見た。")],
-    ]))
-    .await;
-    server.seed("aoi", "葵").await;
-    let character = server
-        .store
-        .find_character_by_handle(&Handle::parse("aoi").expect("正当な名前であること"))
-        .await
-        .expect("検索できること")
-        .expect("作ったキャラクターが引けること");
-    server
-        .store
-        .add_memory(
-            character.id,
-            &NewMemory {
-                subject: Subject::User,
-                content: MemoryContent::parse(MEMORY).expect("正当な本文であること"),
-                category: None,
-            },
-        )
-        .await
-        .expect("記憶を追加できること");
-
-    // --- 1回目 ---
-    let session = relayed_session_id(&server, &streaming_request("aoi", FIRST_USER)).await;
-    let sent = server.llm.last_stream_request();
-    assert_eq!(
-        sent.messages.len(),
-        2,
-        "前提: 1回目は [システム, 今回の発言] の2件であること"
-    );
-    assert!(
-        !sent.messages[0].content.contains(MEMORY),
-        "記憶が system に載った: {}",
-        sent.messages[0].content
-    );
-    let latest = &sent.messages[1].content;
-    assert!(
-        latest.contains(&format!("> - {MEMORY}")),
-        "前提: 記憶が前置きの引用行として載ること: {latest}"
-    );
-    assert!(
-        latest.ends_with(&format!("\n{FIRST_USER}")) && latest != FIRST_USER,
-        "末尾の発言は前置き・改行・原文の順: {latest}"
-    );
-
-    let saved = server.saved_messages("aoi", session).await;
-    assert_eq!(saved.len(), 2, "往復の2件が保存されること: {saved:?}");
-    assert_eq!(saved[0].role, Role::User);
-    assert_eq!(
-        saved[0].raw_content, FIRST_USER,
-        "保存する発言はクライアントの原文（前置きを含めない）"
-    );
-
-    // --- 2回目。**1回目が着地したセッション id を明示する。** ---
-    let second = relayed_session_id(
-        &server,
-        &streaming_request(&format!("aoi@{session}"), SECOND_USER),
-    )
-    .await;
-    assert_eq!(second, session, "前提: 同じセッションに着地すること");
-    let sent = server.llm.last_stream_request();
-    assert_eq!(
-        sent.messages.len(),
-        4,
-        "[システム, 1回目の発言, 1回目の応答, 今回の発言] の4件: {:?}",
-        sent.messages
-    );
-    assert_eq!(
-        sent.messages[1].content, FIRST_USER,
-        "履歴に読み戻した発言は原文（過去のターンに記憶が付かない）"
-    );
-    assert_eq!(sent.messages[2].content, FIRST_REPLY);
-    let latest = &sent.messages[3].content;
-    assert!(
-        latest.contains(&format!("> - {MEMORY}")) && latest.ends_with(&format!("\n{SECOND_USER}")),
-        "前置きは今回の発言にだけ付く: {latest}"
-    );
-
-    let saved = server.saved_messages("aoi", session).await;
-    assert_eq!(saved.len(), 4, "往復が積み上がること: {saved:?}");
-    assert_eq!(saved[2].raw_content, SECOND_USER, "2回目の保存も原文");
-    assert_eq!(saved[3].raw_content, SECOND_REPLY);
 
     server.stop().await;
 }
