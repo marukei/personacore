@@ -938,6 +938,26 @@ impl LoadSinks {
             ModelFace::Sub => profile.sub.map(super::extract::SubContext::tokens),
         }
     }
+
+    /// **いまの本文の面の値**（思考の量と返答の上限 / ADR-0059 / 作業単位 A-18a）。`super::switch` が新旧を比べる。
+    ///
+    /// **裏方の面にはこの値が無い**（比べる側は既定と比べる —— `switch::Target` の doc）。
+    pub(in crate::server) fn body(&self) -> super::config::BodyFace {
+        self.budget.body()
+    }
+
+    /// **いまの本文の予算と、落とし所の窓の印**（切り替えの後に送る値を言う / `context::report_samplers`）。
+    pub(in crate::server) fn main_budget(
+        &self,
+    ) -> super::context::Chosen<crate::prompt::TokenBudget> {
+        self.budget.current()
+    }
+
+    /// **起動時の `PERSONACORE_CONTEXT_TOKENS`**（切り替え先の返答の上限が収まるかを確かめる /
+    /// `config::ProfileContext::of` / ADR-0059 §決定2）。
+    pub(in crate::server) const fn environment(&self) -> Option<crate::prompt::TokenBudget> {
+        self.environment
+    }
 }
 
 // ----------------------------------------------------------------------

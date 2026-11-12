@@ -1332,6 +1332,130 @@ async fn a_hand_written_sampling_survives_a_save_from_the_screen() {
     server.stop().await;
 }
 
+/// **手で書いた本文の返答の上限（`response_tokens`）と思考の量は、画面から保存しても残る**
+/// （[ADR-0059](../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md) §決定5 / 作業単位 A-18a）。
+///
+/// 前例 [`a_hand_written_sampling_survives_a_save_from_the_screen`] と同じ形（`endpoint` と `model` を変えた保存でも残る）。
+///
+/// | 回 | 依頼 | 結果 |
+/// |---|---|---|
+/// | 1 | `response_tokens` を載せる | **400**（依頼の型は知らない欄を拒む）。ファイルは触らない |
+/// | 2 | 窓（`context_tokens`）を上限（3000）以下の 2048 にする | **422 `context_tokens_unusable`・鍵 `context_tokens`**（窓の検証が面の上限に追従する）。ファイルは触らない |
+/// | 3 | 宛先とモデルを直す（窓は 8192） | 200。**上限 3000 と `sampling.reasoning_effort` が残る** |
+///
+/// **一覧は値を書いたファイルでも読める**（`response_tokens` は [`FACE_KEYS`] の鍵）。
+///
+/// [`FACE_KEYS`]: personacore::server::FACE_KEYS
+#[tokio::test]
+async fn a_hand_written_response_room_survives_a_save_from_the_screen() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let source = json!({
+        "thinking": {
+            "main": { "endpoint": "http://127.0.0.1:47951", "model": "thinking-main",
+                      "response_tokens": 3000, "sampling": { "reasoning_effort": "low" } }
+        }
+    });
+    let path = write_by_hand(dir.path(), &source);
+    let before = std::fs::read(&path).expect("読めること");
+    let server = serve(dir.path(), |s| s.with_editable_profiles_file(path.clone())).await;
+    let listing = list(server.port).await;
+    assert_eq!(
+        profile_named(&listing, "thinking")["main"]["model"],
+        json!("thinking-main"),
+        "前提: 値を書いたファイルが一覧に載ること: {listing}"
+    );
+
+    // **1. 依頼に `response_tokens` を載せると断る。**
+    let mut smuggled = face("http://127.0.0.1:47951", "thinking-main", None, None, None);
+    smuggled["response_tokens"] = json!(4096);
+    let (status, refused) = save(
+        server.port,
+        "thinking",
+        &json!({ "revision": listing["revision"], "main": smuggled }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "依頼の response_tokens を受け付けた: {refused}"
+    );
+
+    // **2. 窓を上限以下へ縮める保存は、窓の欄で断る。**
+    let narrow = windowed(
+        face("http://127.0.0.1:47951", "thinking-main", None, None, None),
+        2048,
+    );
+    let (status, refused) = save(
+        server.port,
+        "thinking",
+        &json!({ "revision": listing["revision"], "main": narrow }),
+    )
+    .await;
+    assert_eq!(status, 422, "上限以下の窓を受け付けた: {refused}");
+    assert_eq!(
+        (
+            &refused["error"]["code"],
+            &refused["error"]["reason"],
+            &refused["error"]["face"],
+            &refused["error"]["key"],
+        ),
+        (
+            &json!("upstream_profile_invalid"),
+            &json!("context_tokens_unusable"),
+            &json!("main"),
+            &json!("context_tokens")
+        ),
+        "窓の欄に理由を結びつけること: {refused}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("読めること"),
+        before,
+        "断った保存でファイルが変わった"
+    );
+
+    // **3. 宛先とモデルを直す**（窓は上限より大きい 8192）。
+    let main = windowed(
+        face(
+            "http://127.0.0.1:47959",
+            "thinking-main-2",
+            None,
+            None,
+            None,
+        ),
+        8192,
+    );
+    let (status, saved) = save(
+        server.port,
+        "thinking",
+        &json!({ "revision": listing["revision"], "main": main }),
+    )
+    .await;
+    assert_eq!(status, 200, "{saved}");
+    let disk: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("読めること")).expect("JSON");
+    assert_eq!(
+        (
+            &disk["thinking"]["main"]["endpoint"],
+            &disk["thinking"]["main"]["model"],
+            &disk["thinking"]["main"]["context_tokens"],
+        ),
+        (
+            &json!("http://127.0.0.1:47959"),
+            &json!("thinking-main-2"),
+            &json!(8192)
+        ),
+        "前提: 依頼どおりに保存されたこと: {disk}"
+    );
+    assert_eq!(
+        (
+            &disk["thinking"]["main"]["response_tokens"],
+            &disk["thinking"]["main"]["sampling"],
+        ),
+        (&json!(3000), &json!({ "reasoning_effort": "low" })),
+        "手で書いた上限か思考の量が消えた: {disk}"
+    );
+    server.stop().await;
+}
+
 /// **依頼の承認（`allow_key_over_plain_http`）は「送らない＝今の規則 / `true`＝承認する / `false`＝外す」**
 /// （作業単位 A-13b-3 / ADR-0056 §決定5）。**一覧はその面に書いた承認を返す。**
 ///

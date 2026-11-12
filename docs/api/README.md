@@ -201,7 +201,7 @@ itself. It is served with `--no-ui` too, because it is part of the API, not of t
 carries the API version:
 
 ```
-x-personacore-api-version: 1.7
+x-personacore-api-version: 1.8
 ```
 
 That includes errors, 404 and 405 responses, the event stream and `/openapi.json`.
@@ -256,15 +256,15 @@ itself. From the request it uses only these fields:
 | `model` | Selects the character and conversation (above) |
 | `messages` | **Only the last message whose `role` is exactly `user` is used**, and its `content` must be a string. The content of every other message is not used: all `system` messages, all `assistant` messages, and earlier `user` messages. Every element must still be an object with a string `role`; otherwise the whole request is rejected with 400 (`invalid_body`) |
 | `temperature` | Passed to the upstream as is |
-| `max_tokens` | Used as an upper bound, capped at the fixed reply reserve (currently 1024 tokens; a larger value is silently lowered to it). `0` is rejected. It must be a non-negative integer (`-1` is rejected with 400) |
+| `max_tokens` | Used as an upper bound, capped at the reply reserve (1024 tokens unless the upstream profile sets `response_tokens` on its chat side; a larger value is silently lowered to it). When absent, the reply reserve is sent. `0` is rejected. It must be a non-negative integer (`-1` is rejected with 400) |
 | `stream` | `true` streams; absent or `false` does not |
 
 Everything else (`top_p`, `stop`, `presence_penalty`, `n`, `tools`,
 `max_completion_tokens`, ...) is accepted and ignored; unknown fields do not cause an
 error. In particular `max_completion_tokens` has **no effect**; only `max_tokens` is
 read. personacore sends its own fixed sampling settings upstream so that results are
-reproducible (an upstream profile can replace the repetition penalty; see
-[Upstream inference servers](#upstream-inference-servers)).
+reproducible (an upstream profile can replace the repetition penalty, and can let the
+chat side think; see [Upstream inference servers](#upstream-inference-servers)).
 
 If there is no `user` message the request is rejected with 400. If the last `user`
 message has non-string content (for example the multi-part array used for images), the
@@ -559,22 +559,47 @@ what it says).
 The profile API carries this field on each side of a profile: `GET /admin/upstream/profiles`
 lists it (`null` when not written), and `PUT /admin/upstream/profiles/{name}` accepts it
 (omit it or send `null` to leave it unwritten, which removes it from the file). An integer
-from 0 to 2^64−1 that is not larger than the response reserve (1024 tokens), or does not fit
-in 32 bits, is refused with 422 `upstream_profile_invalid`, reason `context_tokens_unusable`,
+from 0 to 2^64−1 that is not larger than the response reserve (1024 tokens, or the side's
+`response_tokens` when that is larger; see below), or does not fit in 32 bits, is refused with 422 `upstream_profile_invalid`, reason `context_tokens_unusable`,
 before anything is written. A value that is not a non-negative integer, or is larger than
 2^64−1, cannot be read as a request and is refused with 400.
 
 A profile can also change the repetition penalty personacore sends to an upstream
 (`"sampling": { "repeat_penalty": 1.0 }` on a side in `upstreams.json`). Only the value
 written replaces personacore's default (1.1); a side without `sampling` sends exactly what
-it sent before. `repeat_penalty` is the only key accepted (the other samplers, such as
-`top_k`, are refused by name, reason `unknown_sampling_key`), and it must be a number from
+it sent before. `repeat_penalty` is the only sampler accepted (the other samplers, such as
+`top_k`, are refused by name, reason `unknown_sampling_key`; `reasoning_effort`, which is not
+a sampler, is described below), and it must be a number from
 0.5 to 2 (otherwise reason `sampling_unusable`); both are checked when the profiles are
 read. If a profile has no background side (`sub`), the chat side's value is used for
 background work too; a background side without `sampling` uses the default. The value
 follows the profile when you switch. The profile API does not carry this field: it is not
 listed, a save request that sends it is refused with 400, and a save keeps the value already
 written for that profile and side, even when the endpoint or model changes.
+
+The chat side (`main`) of a profile can also let the upstream think, and give the reply
+more room (`"sampling": { "reasoning_effort": "low" }` and `"response_tokens": 2048` in
+`upstreams.json`). `reasoning_effort` accepts `"none"` (the default, sent when nothing is
+written) and `"low"` only; any other value is refused when the profiles are read (reason
+`sampling_unusable`). It is sent only with chat requests: background work always sends
+`"none"`, even when the profile has no background side. `response_tokens` is a positive
+integer that fits in 32 bits (otherwise reason `response_tokens_unusable`); it becomes the reply reserve of chat
+requests (the cap on `max_tokens`, and the room kept out of the prompt budget) instead of
+1024, while background work keeps its own limits. It must be smaller than the explicit
+context length (`context_tokens` on the same side, otherwise reason
+`context_tokens_unusable`; or `PERSONACORE_CONTEXT_TOKENS`, otherwise the profile is
+refused at startup and when you switch to it). When the context length is only known from
+asking the upstream and is not larger than `response_tokens`, personacore falls back to
+1024 and logs a warning; a reported context length of 1024 or less is still not used, even
+when `response_tokens` is smaller. While the context length is not known (the upstream did
+not answer, or a switch has not asked it yet), personacore uses 1024 instead of
+`response_tokens`, and goes back to `response_tokens` once the context length is known.
+Both keys may only be written on the chat side; written on the
+background side (`sub`), the profile is refused (reason `main_face_only`). Both follow the
+profile when you switch, and the startup and switch log says what is sent (whether the
+upstream actually thought is not something personacore can see). Like `sampling`, the
+profile API does not carry `response_tokens`: it is not listed, a save request that sends it
+is refused with 400, and a save keeps the value already written for that profile and side.
 
 A profile can also carry a key for each upstream (`api_key` in `upstreams.json`) for
 upstreams that require one. personacore then sends `Authorization: Bearer <key>` with
@@ -817,7 +842,7 @@ header.
 
 ## Versioning and compatibility
 
-The current API version is `1.7`.
+The current API version is `1.8`.
 
 The API version is kept separately from the application version and is stated in the
 OpenAPI document (`info.version`) and in the `X-Personacore-Api-Version` header. The
@@ -853,6 +878,19 @@ segment (such as `v1`) into the paths under `/admin`.
   working; requests that reached personacore some other way (for example through another
   host name) may start to be refused within `1.x`. The `Host` / `Origin` checks were added
   this way.
+
+Changes in `1.8` (from `1.7`): a new key `response_tokens` on the chat side of an upstream
+profile, and `reasoning_effort` inside its `sampling` (see
+[Upstream inference servers](#upstream-inference-servers)). A problem in the profile list
+(`ProblemView`) can name the `key` value `response_tokens` and the `reason` values
+`response_tokens_unusable` and `main_face_only`. The specification adds these values to the
+`enum` of both `ProblemView` and `ProfileInvalidDetail`, but a save does not report them:
+a save copies the value already written in the file, and a file whose value is not valid is
+refused with 422 `upstream_profiles_unreadable`. A save that makes `context_tokens` not
+larger than the side's `response_tokens` is refused with reason `context_tokens_unusable`,
+as before. The profile list and the save request did not change. With `response_tokens`
+written on the chat side, the cap on a chat request's `max_tokens` is that value instead of
+1024; a profile without it behaves as before.
 
 Changes in `1.7` (from `1.6`): a new key `sampling` on each side of an upstream profile
 (see [Upstream inference servers](#upstream-inference-servers)). A problem in the profile

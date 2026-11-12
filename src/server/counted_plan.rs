@@ -93,7 +93,7 @@ use super::extract::{EXTRACTION_RESPONSE_TOKENS, SubContext};
 use super::seal::{Outcome, PartsTally, Seal, SentPlan, TurnSeal, UncountableMemory};
 use super::upstream::UpstreamFacts;
 use crate::domain::DriftForm;
-use crate::llm::{ChatRequest, LlmClient, TokenCount};
+use crate::llm::{ChatRequest, LlmClient, ReasoningEffort, TokenCount};
 use crate::prompt::{
     BudgetPlan, BuiltPrompt, CountedParts, PromptError, PromptInput, TokenBudget,
     build_prompt_quiet, parts_to_count,
@@ -399,6 +399,11 @@ pub(super) struct Turn<'a> {
     pub(super) streaming: bool,
     pub(super) temperature: Option<f32>,
     pub(super) max_tokens: u32,
+    /// **本文の面に書いた思考の量**（入口で予算と一緒に1回だけ読んだもの / ADR-0059 §決定1 / 作業単位 A-18a）。
+    ///
+    /// **封をする本文と送る本文の両方に載る**（[`Self::request_for`] が1つの本文を作り、封もそれで数える ——
+    /// チャットテンプレートの出力が変わるので、封は同じ値で作る / ADR-0052）。
+    pub(super) reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// 組み上がった1ターン。**`request` は封をしたものか、バイト数の計画そのもの。**
@@ -415,6 +420,7 @@ impl Turn<'_> {
             messages: built.messages.clone(),
             temperature: self.temperature,
             max_tokens: Some(self.max_tokens),
+            reasoning_effort: self.reasoning_effort,
         }
     }
 
@@ -958,6 +964,7 @@ mod tests {
             streaming: false,
             temperature: Some(0.5),
             max_tokens: 700,
+            reasoning_effort: None,
         }
     }
 
@@ -1000,6 +1007,43 @@ mod tests {
             llm.sealed.lock().expect("ロックを取れること").as_slice(),
             std::slice::from_ref(&planned.request),
             "送る本文に封をしたこと（「数えられない」を覚えるため）"
+        );
+    }
+
+    /// **本文の面の思考の量は、送る本文と封をする本文の両方に載る**（ADR-0059 §決定1 / 作業単位 A-18a）。
+    ///
+    /// 封は送る本文そのもので数える（チャットテンプレートの出力が思考の有無で変わる / ADR-0052）。
+    /// **対照**: 既定の [`turn`] は `None` のまま（上の腕の `planned.request` に `None` が載っている）。
+    #[tokio::test]
+    async fn the_reasoning_effort_rides_on_both_the_sent_and_the_sealed_request() {
+        use crate::llm::ReasoningEffort;
+
+        let character = character();
+        let input = input(&character);
+        let llm = Parts::new(|_| Ok(TokenCount::Uncountable));
+        let (uncountable, parts) = (UncountableMemory::default(), PartMemory::default());
+        let generation = generation(0);
+        let thinking = Turn {
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..turn(
+                &llm,
+                &uncountable,
+                &parts,
+                &generation,
+                WindowSharing::SameUpstream,
+            )
+        };
+        let planned = plan_turn(&thinking, &input).await.expect("組めること");
+
+        assert_eq!(
+            planned.request.reasoning_effort,
+            Some(ReasoningEffort::Low),
+            "送る本文が本文の面の思考の量を持たない"
+        );
+        assert_eq!(
+            llm.sealed.lock().expect("ロックを取れること").as_slice(),
+            std::slice::from_ref(&planned.request),
+            "封をした本文が送る本文と違う（思考の量を落とした？）"
         );
     }
 

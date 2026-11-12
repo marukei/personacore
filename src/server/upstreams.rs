@@ -38,7 +38,7 @@
 //!
 //! **`start.ps1` の後に足した鍵は [`FACE_KEYS`] の `command`（ADR-0042 §決定1）・
 //! `context_tokens`（ADR-0054 §決定1）・`api_key`（ADR-0056 §決定1）・`allow_key_over_plain_http`
-//! （ADR-0056 §決定5）・`sampling`（ADR-0058 §決定1）。**
+//! （ADR-0056 §決定5）・`sampling`（ADR-0058 §決定1）・`response_tokens`（ADR-0059 §決定2）。**
 //! 「モデルの置き場所が変わる」のと同じ理由で、**実行ファイルの置き場所も変わる。**
 //!
 //! | 規則（`api_key` / 作業単位 A-13b-1） | なぜ |
@@ -65,7 +65,7 @@ use serde_json::Value as JsonValue;
 
 use super::config::{ENV_LLM_ENDPOINT, ENV_MAIN_MODEL, ENV_SUB_LLM_ENDPOINT, ENV_SUB_MODEL};
 use crate::llm::{ApiKey, endpoint_for_log, endpoint_has_userinfo};
-use crate::llm::{RepeatPenalty, Sampling};
+use crate::llm::{ReasoningEffort, RepeatPenalty, Sampling};
 
 /// 上流プロファイルの既定のファイル名。**DB と同じディレクトリに置く**（ADR-0042 §決定1）。
 ///
@@ -78,7 +78,8 @@ pub const FACE_NAMES: [&str; 2] = ["main", "sub"];
 /// 面の中で使える鍵。**これ以外は綴りを挙げて止める。**
 ///
 /// **`command` は ADR-0042 §決定1、`context_tokens` は ADR-0054 §決定1、`api_key` と
-/// `allow_key_over_plain_http` は ADR-0056、`sampling` は ADR-0058 で足した**（それ以外は `F-9` のまま）。
+/// `allow_key_over_plain_http` は ADR-0056、`sampling` は ADR-0058、`response_tokens` は ADR-0059 で足した**
+/// （それ以外は `F-9` のまま）。
 ///
 /// # ⚠ この一覧は3つの権威を兼ねる
 ///
@@ -116,7 +117,15 @@ pub const FACE_NAMES: [&str; 2] = ["main", "sub"];
 /// **`endpoint` や `model` を変えた保存でも落とさない**（知らせずに消えるほうが、知らせずに残るより見つけにくい。
 /// 残した値は起動と切り替えのログに出る —— ADR-0058 §決定3）。
 /// 画面の写し（`web/src/lib/upstreamProfiles.ts`）は `FACE_KEYS` に足し、`EDITABLE_FACE_KEYS` からは除く。
-pub const FACE_KEYS: [&str; 9] = [
+///
+/// # `response_tokens` も画面の欄より先に入った（作業単位 A-18a / ADR-0059 §決定5）
+///
+/// **上の「画面が追いつくまで足さない」の4つ目の例外。** 扱いは `sampling` とまったく同じ ——
+/// 画面の編集はこの欄を持たず（一覧は値を返さず、依頼は送れない）、保存は**いまのファイルの、同じ名前・同じ面の値を残す**
+/// （`profile_editor` の `FaceEdit::to_value`。`endpoint` や `model` を変えた保存でも落とさない）。
+/// **書けるのは `main` 面だけ**（`sub` 面に書けば読み込みが [`ShapeReason::MainFaceOnly`] で止める）。
+/// 画面の写しは `FACE_KEYS` に足し、`EDITABLE_FACE_KEYS` からは除く。画面の欄は marukei/personacore#36 で追いつく。
+pub const FACE_KEYS: [&str; 10] = [
     "endpoint",
     "model",
     "gguf",
@@ -126,6 +135,7 @@ pub const FACE_KEYS: [&str; 9] = [
     "api_key",
     "allow_key_over_plain_http",
     "sampling",
+    "response_tokens",
 ];
 
 /// **面に書けるサンプラの値の鍵**（ADR-0058 §決定1 / 作業単位 A-16。[`FACE_KEYS`] の9つ目）。値はオブジェクト。
@@ -133,12 +143,26 @@ pub const FACE_KEYS: [&str; 9] = [
 /// **綴りを写さず、[`FACE_KEYS`] から取る**（[`CONTEXT_TOKENS_KEY`] と同じ）。
 pub const SAMPLING_KEY: &str = FACE_KEYS[8];
 
-/// **[`SAMPLING_KEY`] の中で書ける鍵**（ADR-0058 §決定1）。**これ以外は綴りを挙げて止める。**
+/// **本文の返答の上限の鍵**（ADR-0059 §決定2 / 作業単位 A-18a。[`FACE_KEYS`] の10個目）。値は整数。
 ///
-/// **いまは `repeat_penalty` だけ。** サンプラの残りの4つ（`top_k` / `top_p` / `min_p` / `presence_penalty`）は、
+/// **`main` 面だけに書ける。** 本文の要求の応答の余白（予算）と `max_tokens` の天井になる（書かなければ 1024）。
+/// **綴りを写さず、[`FACE_KEYS`] から取る**（[`CONTEXT_TOKENS_KEY`] と同じ）。
+pub const RESPONSE_TOKENS_KEY: &str = FACE_KEYS[9];
+
+/// **[`SAMPLING_KEY`] の中で書ける鍵**（ADR-0058 §決定1 / ADR-0059 §決定1）。**これ以外は綴りを挙げて止める。**
+///
+/// **いまは `repeat_penalty` と `reasoning_effort`。** サンプラの残りの4つ（`top_k` / `top_p` / `min_p` / `presence_penalty`）は、
 /// 外すと壊れることを測ってから ADR-0058 に追記して足す —— それまでは知らない鍵として止める
 /// （書いたのに効かない値を作らない）。
-pub const SAMPLING_KEYS: [&str; 1] = ["repeat_penalty"];
+///
+/// **面で共通の一覧**（知らない鍵の判定はどちらの面でも同じ）。**`reasoning_effort` は `main` 面だけ**で、
+/// `sub` 面に書いたら知らない鍵とは別の理由（[`ShapeReason::MainFaceOnly`]）で止める（[`REASONING_EFFORT_KEY`]）。
+pub const SAMPLING_KEYS: [&str; 2] = ["repeat_penalty", "reasoning_effort"];
+
+/// **本文の面の思考の量の鍵**（[`SAMPLING_KEY`] の中 / ADR-0059 §決定1 / 作業単位 A-18a）。値は `"none"` / `"low"`。
+///
+/// **`main` 面だけに書ける**（裏方は常に `"none"` を送る）。**綴りを写さず、[`SAMPLING_KEYS`] から取る。**
+pub const REASONING_EFFORT_KEY: &str = SAMPLING_KEYS[1];
 
 /// **面に書ける上流への鍵の綴り**（ADR-0056 §決定1 / 作業単位 A-13b-1。[`FACE_KEYS`] の7つ目）。
 ///
@@ -389,7 +413,8 @@ pub enum ShapeReason {
     ApiKeyWithUserinfo,
     /// 真偽値であるべき値が真偽値でない（`allow_key_over_plain_http` / 作業単位 A-13b-2）。
     NotABoolean,
-    /// `sampling` が使えない（オブジェクトでない・`repeat_penalty` が数でないか範囲の外 / ADR-0058 §決定1）。
+    /// `sampling` が使えない（オブジェクトでない・`repeat_penalty` が数でないか範囲の外 / ADR-0058 §決定1・
+    /// `reasoning_effort` が `none` / `low` の外 / ADR-0059 §決定1）。
     ///
     /// **鍵（[`ProfileShape::key`]）は [`SAMPLING_KEY`]**（画面はこの欄を持たないので、理由は全体に出る）。
     SamplingUnusable,
@@ -397,11 +422,22 @@ pub enum ShapeReason {
     ///
     /// **まだ書けないサンプラの4つ（`top_k` 等）もここ。** 鍵は [`SAMPLING_KEY`]。
     UnknownSamplingKey,
+    /// `response_tokens` が使えない（整数でない・0・32 bit に収まらない / ADR-0059 §決定2）。
+    ///
+    /// **鍵（[`ProfileShape::key`]）は [`RESPONSE_TOKENS_KEY`]。** 面の `context_tokens` 以上のときは
+    /// [`Self::ContextTokensUnusable`]（窓の側の「余白以下は止める」が、その面の返答の上限に追従する）。
+    ResponseTokensUnusable,
+    /// **本文の面（`main`）にだけ書ける鍵を、裏方の面（`sub`）に書いた**（ADR-0059 §決定1・2 / 作業単位 A-18a）。
+    ///
+    /// `response_tokens`（鍵は [`RESPONSE_TOKENS_KEY`]）と `sampling.reasoning_effort`（鍵は [`SAMPLING_KEY`]）。
+    /// **知らない鍵（[`Self::UnknownKey`] / [`Self::UnknownSamplingKey`]）と区別する** —— 綴りは正しく、
+    /// 書いた面が違うだけなので、「知らない」と言うと直す先を取り違える。
+    MainFaceOnly,
 }
 
 impl ShapeReason {
     /// **全部の値。** 見張り番が回すための一覧。
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 22] = [
         Self::TopLevelNotObject,
         Self::ProfileNotObject,
         Self::UnknownFace,
@@ -422,6 +458,8 @@ impl ShapeReason {
         Self::NotABoolean,
         Self::SamplingUnusable,
         Self::UnknownSamplingKey,
+        Self::ResponseTokensUnusable,
+        Self::MainFaceOnly,
     ];
 
     /// **機械が読む綴り**（画面が分岐に使う）。
@@ -448,6 +486,8 @@ impl ShapeReason {
             Self::NotABoolean => "not_a_boolean",
             Self::SamplingUnusable => "sampling_unusable",
             Self::UnknownSamplingKey => "unknown_sampling_key",
+            Self::ResponseTokensUnusable => "response_tokens_unusable",
+            Self::MainFaceOnly => "main_face_only",
         }
     }
 
@@ -463,7 +503,7 @@ impl ShapeReason {
             Self::MissingMain => "main がありません（本文の上流は省けません）",
             Self::FaceNotObject => "面がオブジェクトではありません",
             Self::UnknownKey => {
-                "知らない鍵があります（使えるのは endpoint / model / gguf / args / command / context_tokens / api_key / allow_key_over_plain_http / sampling だけです）"
+                "知らない鍵があります（使えるのは endpoint / model / gguf / args / command / context_tokens / api_key / allow_key_over_plain_http / sampling / response_tokens だけです）"
             }
             Self::MissingKey => "要る鍵がありません",
             Self::NotAString => "文字列であるべき値が文字列ではありません",
@@ -492,10 +532,16 @@ impl ShapeReason {
             }
             Self::NotABoolean => "真偽値であるべき値が真偽値ではありません",
             Self::SamplingUnusable => {
-                "sampling が使えません（オブジェクトで書き、repeat_penalty は 0.5 以上 2 以下の数で書いてください）"
+                "sampling が使えません（オブジェクトで書き、repeat_penalty は 0.5 以上 2 以下の数、reasoning_effort は none / low で書いてください）"
             }
             Self::UnknownSamplingKey => {
-                "sampling に知らない鍵があります（書けるのは repeat_penalty だけです）"
+                "sampling に知らない鍵があります（書けるのは repeat_penalty / reasoning_effort だけです）"
+            }
+            Self::ResponseTokensUnusable => {
+                "response_tokens が使えません（1 以上の整数のトークン数で書いてください）"
+            }
+            Self::MainFaceOnly => {
+                "この鍵は本文の面（main）にだけ書けます（裏方の面（sub）には書けません）"
             }
         }
     }
@@ -670,9 +716,32 @@ pub struct ProfileFace {
     /// **書いたサンプラの値**（ADR-0058 §決定1 / [`SAMPLING_KEY`]）。**検証済み**（`llm::RepeatPenalty::parse`）。
     /// 書かなければ [`Sampling::default`]（何も置き換えない）。
     sampling: Sampling,
+    /// **書いた思考の量**（`sampling.reasoning_effort` / ADR-0059 §決定1）。**`main` 面だけ**（`sub` 面は読み込みが止める）。
+    ///
+    /// **[`Self::sampling`] には入れない** —— 面の設定は `sub` 面の無い構成で裏方へ写る（ADR-0059 §却下した選択肢）。
+    reasoning_effort: Option<ReasoningEffort>,
+    /// **書いた本文の返答の上限**（[`RESPONSE_TOKENS_KEY`] / ADR-0059 §決定2）。**`main` 面だけ。検証済み**（1 以上・
+    /// 面の `context_tokens` より小さい）。
+    response_tokens: Option<u32>,
 }
 
 impl ProfileFace {
+    /// **この面に書いた思考の量**（`sampling.reasoning_effort` / ADR-0059 §決定1）。書いていなければ `None`。
+    ///
+    /// **`main` 面だけが持ちうる**（`sub` 面に書いたファイルは読み込みで止まる）。
+    #[must_use]
+    pub const fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.reasoning_effort
+    }
+
+    /// **この面に書いた本文の返答の上限**（[`RESPONSE_TOKENS_KEY`] / ADR-0059 §決定2）。書いていなければ `None`（1024）。
+    ///
+    /// **`main` 面だけが持ちうる。**
+    #[must_use]
+    pub const fn response_tokens(&self) -> Option<u32> {
+        self.response_tokens
+    }
+
     /// **この面に書いたサンプラの値**（[`SAMPLING_KEY`] / ADR-0058 §決定1）。書いていなければ既定（何も置き換えない）。
     ///
     /// **`sub` 面を書いていないときに裏方が何を使うかは、ここではなく [`ProfileSettings::sub_sampling`] が言う。**
@@ -841,6 +910,10 @@ impl UpstreamProfile {
             sub_allow_key_over_plain_http: sub_allow,
             sampling: self.main.sampling,
             sub_sampling,
+            // **思考の量と返答の上限は本文の面だけのもの**（ADR-0059 §決定1・2）——`sub` 面の有無に関わらず
+            // 裏方へは写さない（裏方の側の欄を作らない）。
+            reasoning_effort: self.main.reasoning_effort,
+            response_tokens: self.main.response_tokens,
         }
     }
 }
@@ -877,9 +950,30 @@ pub struct ProfileSettings {
     sampling: Sampling,
     /// **裏方の面のサンプラの値**（`sub` 面が無ければ本文の値 / [`Self::sub_sampling`]）。
     sub_sampling: Sampling,
+    /// **本文の面の思考の量**（ADR-0059 §決定1）。**裏方の欄は無い**（裏方は常に `none`）。
+    reasoning_effort: Option<ReasoningEffort>,
+    /// **本文の面の返答の上限**（ADR-0059 §決定2）。**裏方の欄は無い**（裏方の上限は変えない）。
+    response_tokens: Option<u32>,
 }
 
 impl ProfileSettings {
+    /// **本文の面の思考の量**（`main` 面の `sampling.reasoning_effort` / ADR-0059 §決定1）。書いていなければ `None`。
+    ///
+    /// 渡し方は `AppConfig::with_profile_context`（本文の予算の器へ窓と一緒に入る。環境変数の口は無い）。
+    /// **`sub` 面が無くても裏方へは写さない**（[`Self::sub_sampling`] の規則はこの欄に当てはめない —— ADR-0059 §決定1）。
+    #[must_use]
+    pub const fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.reasoning_effort
+    }
+
+    /// **本文の面の返答の上限**（`main` 面の [`RESPONSE_TOKENS_KEY`] / ADR-0059 §決定2）。書いていなければ `None`（1024）。
+    ///
+    /// 渡し方は `AppConfig::with_profile_context`。**裏方の上限は変えない**（抽出 320 など）。
+    #[must_use]
+    pub const fn response_tokens(&self) -> Option<u32> {
+        self.response_tokens
+    }
+
     /// **本文の面のサンプラの値**（`main` 面の [`SAMPLING_KEY`] / ADR-0058 §決定1）。
     ///
     /// 渡し方は `AppConfig::with_profile_sampling`（環境変数の側には口が無い / ADR-0058 §却下した選択肢）。
@@ -1194,16 +1288,60 @@ fn parse_face(
         ));
     }
 
+    // **本文の返答の上限**（ADR-0059 §決定2）。**`main` 面だけ**——`sub` 面に書いたら、知らない鍵と区別して止める。
+    // 0 と、整数でない・32 bit に収まらない値も止める。窓との比べは下の `context_tokens`（と、面に窓が無ければ
+    // 環境変数の窓 —— `config::ProfileContext::of`）。
+    let response_tokens = match object.get(RESPONSE_TOKENS_KEY) {
+        None => None,
+        Some(_) if label != MAIN_FACE => {
+            return Err(main_face_only(
+                profile,
+                label,
+                RESPONSE_TOKENS_KEY,
+                RESPONSE_TOKENS_KEY,
+            ));
+        }
+        Some(raw) => {
+            let usable = raw
+                .as_u64()
+                .and_then(|tokens| u32::try_from(tokens).ok())
+                .filter(|tokens| *tokens > 0);
+            match usable {
+                Some(tokens) => Some(tokens),
+                None => {
+                    return Err(shape(
+                        Fault::key(
+                            ShapeReason::ResponseTokensUnusable,
+                            profile,
+                            label,
+                            RESPONSE_TOKENS_KEY,
+                        ),
+                        format!(
+                            "プロファイル '{profile}' の {label} の {RESPONSE_TOKENS_KEY} が使えません\
+                             （1 以上の整数のトークン数で書いてください）: {raw}"
+                        ),
+                    ));
+                }
+            }
+        }
+    };
+    let response_room =
+        response_tokens.unwrap_or(crate::prompt::TokenBudget::DEFAULT_RESPONSE_TOKENS);
+
     // **コンテキスト長**（ADR-0054 §決定1）。**`PERSONACORE_CONTEXT_TOKENS` と同じ規則**
     // （`config::context_budget_of`）——規則の写しをここに作らない。
     // **gguf の有無に関わらず書ける**（窓を答えない外の上流こそ、書く理由がある）。
+    //
+    // **「余白以下は止める」は、その面の返答の上限に追従する**（ADR-0059 §決定2）—— `response_tokens` を書いた面は、
+    // 窓がそれより大きいことも要る（`TokenBudget::new`。予算が組めない窓を読み込みで止める）。
     let context_tokens = match object.get(CONTEXT_TOKENS_KEY) {
         None => None,
         Some(raw) => {
             let usable = raw
                 .as_u64()
                 .and_then(|tokens| u32::try_from(tokens).ok())
-                .filter(|tokens| super::config::context_budget_of(*tokens).is_ok());
+                .filter(|tokens| super::config::context_budget_of(*tokens).is_ok())
+                .filter(|tokens| crate::prompt::TokenBudget::new(*tokens, response_room).is_ok());
             match usable {
                 Some(tokens) => Some(tokens),
                 None => {
@@ -1217,7 +1355,7 @@ fn parse_face(
                         format!(
                             "プロファイル '{profile}' の {label} の {CONTEXT_TOKENS_KEY} が使えません\
                              （応答の余白 {} より大きい整数のトークン数で書いてください）: {raw}",
-                            crate::prompt::TokenBudget::DEFAULT_RESPONSE_TOKENS
+                            response_room.max(crate::prompt::TokenBudget::DEFAULT_RESPONSE_TOKENS)
                         ),
                     ));
                 }
@@ -1278,7 +1416,7 @@ fn parse_face(
         }
     };
 
-    let sampling = parse_sampling(object, profile, label)?;
+    let (sampling, reasoning_effort) = parse_sampling(object, profile, label)?;
 
     let launch = match object.get("gguf") {
         None => None,
@@ -1373,7 +1511,32 @@ fn parse_face(
         api_key,
         allow_key_over_plain_http,
         sampling,
+        reasoning_effort,
+        response_tokens,
     })
+}
+
+/// **本文の面の綴り**（[`FACE_NAMES`] の1つ目。本文の面だけに書ける鍵の判定に使う）。
+const MAIN_FACE: &str = FACE_NAMES[0];
+
+/// **本文の面だけに書ける鍵を、裏方の面に書いた**（[`ShapeReason::MainFaceOnly`] / ADR-0059 §決定1・2）。
+///
+/// **知らない鍵とは別の文面にする** —— 綴りは正しく、書いた面が違うだけ。
+/// `key` は [`ProfileShape::key`] に載る面の鍵（[`FACE_KEYS`] の綴り）、`spelled` は文面で名指す綴り
+/// （`sampling` の中の鍵なら `sampling の reasoning_effort`）。
+fn main_face_only(
+    profile: &str,
+    label: &'static str,
+    key: &'static str,
+    spelled: &str,
+) -> ProfileError {
+    shape(
+        Fault::key(ShapeReason::MainFaceOnly, profile, label, key),
+        format!(
+            "プロファイル '{profile}' の {label} に {spelled} は書けません\
+             （本文の面（{MAIN_FACE}）にだけ書けます。裏方の面には書けません）"
+        ),
+    )
 }
 
 /// **面のサンプラの値を読む**（ADR-0058 §決定1 / 作業単位 A-16）。書いていなければ既定（何も置き換えない）。
@@ -1383,16 +1546,21 @@ fn parse_face(
 /// | オブジェクトでない | [`ShapeReason::SamplingUnusable`] |
 /// | 知らない鍵（[`SAMPLING_KEYS`] の外。まだ書けないサンプラの4つも） | [`ShapeReason::UnknownSamplingKey`]（**綴りを挙げる**） |
 /// | `repeat_penalty` が数でない・範囲の外（`llm::REPEAT_PENALTY_MIN` の表） | [`ShapeReason::SamplingUnusable`] |
+/// | **`sub` 面に `reasoning_effort`**（ADR-0059 §決定1） | [`ShapeReason::MainFaceOnly`]（**知らない鍵と区別する**） |
+/// | `reasoning_effort` が文字列でない・`none` / `low` の外 | [`ShapeReason::SamplingUnusable`]（**書ける綴りを挙げる**） |
 ///
 /// **`{}` は通す**（何も書いていないのと同じ）。**gguf の有無に関わらず書ける**（値はエンジン・モデル・量子化の組に付く）。
-/// 範囲の規則は `llm::RepeatPenalty::parse` が持つ —— ここに写しを作らない。
+/// 範囲の規則は `llm::RepeatPenalty::parse` が持つ —— ここに写しを作らない（思考の量の綴りは `llm::ReasoningEffort::parse`）。
+///
+/// **返り値の2つ目（思考の量）は [`Sampling`] に入れない** —— 面の設定は `sub` 面の無い構成で裏方へ写る
+/// （ADR-0059 §却下した選択肢）。本文の面の値として別に持つ（[`ProfileFace::reasoning_effort`]）。
 fn parse_sampling(
     object: &serde_json::Map<String, JsonValue>,
     profile: &str,
     label: &'static str,
-) -> Result<Sampling, ProfileError> {
+) -> Result<(Sampling, Option<ReasoningEffort>), ProfileError> {
     let Some(raw) = object.get(SAMPLING_KEY) else {
-        return Ok(Sampling::default());
+        return Ok((Sampling::default(), None));
     };
     let unusable = |detail: String| {
         shape(
@@ -1427,7 +1595,33 @@ fn parse_sampling(
         ));
     }
 
-    let [repeat_penalty_key] = SAMPLING_KEYS;
+    let [repeat_penalty_key, reasoning_effort_key] = SAMPLING_KEYS;
+    // **思考の量は本文の面だけ**（ADR-0059 §決定1）。**知らない鍵の判定の後に見る** —— 綴りが正しいことを
+    // 先に確かめてから、書いた面が違うと言う。
+    let reasoning_effort =
+        match fields.get(reasoning_effort_key) {
+            None => None,
+            Some(_) if label != MAIN_FACE => {
+                return Err(main_face_only(
+                    profile,
+                    label,
+                    SAMPLING_KEY,
+                    &format!("{SAMPLING_KEY} の {reasoning_effort_key}"),
+                ));
+            }
+            Some(value) => Some(value.as_str().and_then(ReasoningEffort::parse).ok_or_else(
+                || {
+                    let known: Vec<&str> = ReasoningEffort::ALL
+                        .iter()
+                        .map(|effort| effort.as_str())
+                        .collect();
+                    unusable(format!(
+                        "{reasoning_effort_key} に書けるのは {} だけです: {value}",
+                        known.join(" / ")
+                    ))
+                },
+            )?),
+        };
     let repeat_penalty =
         match fields.get(repeat_penalty_key) {
             None => None,
@@ -1441,7 +1635,10 @@ fn parse_sampling(
                 },
             )?),
         };
-    Ok(repeat_penalty.map_or_else(Sampling::default, Sampling::with_repeat_penalty))
+    Ok((
+        repeat_penalty.map_or_else(Sampling::default, Sampling::with_repeat_penalty),
+        reasoning_effort,
+    ))
 }
 
 /// **面の鍵を読む**（ADR-0056 §決定1・5 / 作業単位 A-13b-1・A-13b-2）。書いていなければ `None`。
@@ -2426,6 +2623,278 @@ mod tests {
                 .contains(&SAMPLING_KEYS.join(" / ")),
             "書ける鍵を案内すること"
         );
+        // **思考の量の綴りも、文面が言う**（ADR-0059 §決定1）。手で書いた綴りと突き合わせる。
+        assert!(
+            message.contains("reasoning_effort は none / low"),
+            "文面が思考の量の綴りを言っていない: {message}"
+        );
+        // **面の鍵の一覧も、文面が言う**（`UnknownKey` の文面は定数なので、鍵を足したら手で足す）。
+        assert!(
+            ShapeReason::UnknownKey
+                .message()
+                .contains(&FACE_KEYS.join(" / ")),
+            "知らない鍵の文面が、使える鍵を全部言っていない"
+        );
+    }
+
+    /// **面の1つ**（A-18a のテスト用。`extra` の鍵をそのまま足す）。
+    fn a18a_face(port: u16, model: &str, extra: &serde_json::Value) -> serde_json::Value {
+        let mut face = serde_json::json!({
+            "endpoint": format!("http://127.0.0.1:{port}"),
+            "model": model,
+        });
+        if let (Some(face), Some(extra)) = (face.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                face.insert(key.clone(), value.clone());
+            }
+        }
+        face
+    }
+
+    /// **本文の面は思考の量を読み、それを面の設定（`Sampling`）にも裏方にも写さない**
+    /// （ADR-0059 §決定1 / 作業単位 A-18a）。
+    ///
+    /// | プロファイル | 本文の面の思考の量 | 面の設定（本文・裏方） |
+    /// |---|---|---|
+    /// | `low`・`sub` 面なし | `Low` | **どちらも既定**（`sub` 面が無くても写さない —— ADR-0058 の `sub` 面の規則を当てはめない） |
+    /// | `none` を明示 | `Off`（書いた値として持つ） | 既定 |
+    /// | `repeat_penalty` と一緒に | `Low` | 罰だけが入る（片方が片方を消さない） |
+    /// | 書かない | `None` | 既定 |
+    #[test]
+    fn the_main_face_reads_its_reasoning_effort_and_never_puts_it_in_the_sampling() {
+        use crate::llm::{ReasoningEffort, RepeatPenalty, Sampling};
+
+        let source = serde_json::json!({
+            "low": { "main": a18a_face(1, "m", &serde_json::json!({
+                "sampling": { "reasoning_effort": "low" } })) },
+            "off": { "main": a18a_face(1, "m", &serde_json::json!({
+                "sampling": { "reasoning_effort": "none" } })) },
+            "both": { "main": a18a_face(1, "m", &serde_json::json!({
+                "sampling": { "repeat_penalty": 1.05, "reasoning_effort": "low" } })) },
+            "plain": { "main": a18a_face(1, "m", &serde_json::json!({})) },
+        })
+        .to_string();
+        let profiles = parse_profiles(&source, None).expect("読めること");
+        let penalty = Sampling::with_repeat_penalty(RepeatPenalty::parse(1.05).expect("範囲の中"));
+        for (name, effort, sampling) in [
+            ("low", Some(ReasoningEffort::Low), Sampling::default()),
+            ("off", Some(ReasoningEffort::Off), Sampling::default()),
+            ("both", Some(ReasoningEffort::Low), penalty),
+            ("plain", None, Sampling::default()),
+        ] {
+            let profile = profiles.select(name).expect("在ること");
+            let settings = profile.settings();
+            assert_eq!(profile.main().reasoning_effort(), effort, "{name} の面");
+            assert_eq!(settings.reasoning_effort(), effort, "{name} の設定");
+            assert_eq!(
+                (settings.sampling(), settings.sub_sampling()),
+                (sampling, sampling),
+                "{name}: 思考の量は面の設定に入らない（裏方へ写らない）"
+            );
+        }
+    }
+
+    /// **思考の量は `none` / `low` だけ。** それ以外は書ける綴りを挙げて止める（ADR-0059 §決定1）。
+    ///
+    /// 上流によって 500 になる `minimal` / `high`、大文字・前後の空白・空文字、文字列でない値を止める。
+    #[test]
+    fn a_reasoning_effort_outside_none_and_low_is_refused_with_the_known_spellings() {
+        for value in [
+            serde_json::json!("minimal"),
+            serde_json::json!("medium"),
+            serde_json::json!("high"),
+            serde_json::json!("Low"),
+            serde_json::json!(" low"),
+            serde_json::json!(""),
+            serde_json::json!(1),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(["low"]),
+        ] {
+            let source = serde_json::json!({ "p": { "main": a18a_face(1, "m", &serde_json::json!({
+                "sampling": { "reasoning_effort": value.clone() } })) } })
+            .to_string();
+            let err = parse_profiles(&source, None).expect_err(&value.to_string());
+            let shape = err.shape().expect("形の不正であること");
+            assert_eq!(
+                (shape.reason(), shape.face(), shape.key()),
+                (
+                    ShapeReason::SamplingUnusable,
+                    Some("main"),
+                    Some("sampling")
+                ),
+                "{value}"
+            );
+            let message = shape.to_string();
+            assert!(
+                message.contains("none / low"),
+                "書ける綴りを挙げること: {message}"
+            );
+            assert!(
+                message.contains(&value.to_string()),
+                "止めた値を言うこと: {message}"
+            );
+        }
+    }
+
+    /// **本文の面にだけ書ける鍵を裏方の面に書いたら、知らない鍵とは別の理由で止める**
+    /// （ADR-0059 §決定1・2 / 作業単位 A-18a）。
+    ///
+    /// `sub` の `sampling.reasoning_effort`（鍵は `sampling`）と `sub` の `response_tokens`（鍵は `response_tokens`）。
+    /// **対照**: 同じ値を `main` に書けば通る（綴りや値のせいで止まったのではない）。
+    #[test]
+    fn a_main_face_only_key_on_the_sub_face_is_refused_apart_from_an_unknown_key() {
+        for (extra, key, spelled) in [
+            (
+                serde_json::json!({ "sampling": { "reasoning_effort": "low" } }),
+                "sampling",
+                "reasoning_effort",
+            ),
+            (
+                serde_json::json!({ "sampling": { "reasoning_effort": "none" } }),
+                "sampling",
+                "reasoning_effort",
+            ),
+            (
+                serde_json::json!({ "response_tokens": 2048 }),
+                "response_tokens",
+                "response_tokens",
+            ),
+        ] {
+            let source = serde_json::json!({ "p": {
+                "main": a18a_face(1, "m", &serde_json::json!({})),
+                "sub": a18a_face(2, "s", &extra),
+            } })
+            .to_string();
+            let err = parse_profiles(&source, None).expect_err(&extra.to_string());
+            let shape = err.shape().expect("形の不正であること");
+            assert_eq!(
+                (shape.reason(), shape.face(), shape.key()),
+                (ShapeReason::MainFaceOnly, Some("sub"), Some(key)),
+                "{extra}"
+            );
+            let message = shape.to_string();
+            assert!(message.contains(spelled), "鍵を名指すこと: {message}");
+            assert!(
+                message.contains("main") && !message.contains("知らない鍵"),
+                "書ける面を案内し、知らない鍵とは言わないこと: {message}"
+            );
+
+            // **対照**: 本文の面なら通る。
+            let source = serde_json::json!({ "p": {
+                "main": a18a_face(1, "m", &extra),
+                "sub": a18a_face(2, "s", &serde_json::json!({})),
+            } })
+            .to_string();
+            parse_profiles(&source, None)
+                .unwrap_or_else(|err| panic!("本文の面なら通ること（{extra}）: {err:?}"));
+        }
+    }
+
+    /// **本文の面は返答の上限を読み、裏方の欄には写さない**（ADR-0059 §決定2 / 作業単位 A-18a）。
+    ///
+    /// 0・負・小数・文字列・`null`・真偽値・32 bit に収まらない値は止める（鍵は `response_tokens`）。
+    #[test]
+    fn the_main_face_reads_a_positive_response_tokens_and_refuses_the_rest() {
+        for (value, expected) in [
+            (serde_json::json!(2048), 2048),
+            (serde_json::json!(1), 1),
+            (serde_json::json!(u32::MAX), u32::MAX),
+        ] {
+            let source = serde_json::json!({ "p": { "main": a18a_face(1, "m", &serde_json::json!({
+                "response_tokens": value.clone() })) } })
+            .to_string();
+            let profiles =
+                parse_profiles(&source, None).unwrap_or_else(|err| panic!("{value}: {err:?}"));
+            let profile = profiles.select("p").expect("在ること");
+            assert_eq!(profile.main().response_tokens(), Some(expected), "{value}");
+            assert_eq!(
+                profile.settings().response_tokens(),
+                Some(expected),
+                "{value}"
+            );
+        }
+        let plain =
+            serde_json::json!({ "p": { "main": a18a_face(1, "m", &serde_json::json!({})) } })
+                .to_string();
+        assert_eq!(
+            parse_profiles(&plain, None)
+                .expect("読めること")
+                .select("p")
+                .expect("在ること")
+                .settings()
+                .response_tokens(),
+            None
+        );
+
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(2048.0),
+            serde_json::json!("2048"),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(u64::from(u32::MAX) + 1),
+        ] {
+            let source = serde_json::json!({ "p": { "main": a18a_face(1, "m", &serde_json::json!({
+                "response_tokens": value.clone() })) } })
+            .to_string();
+            let err = parse_profiles(&source, None).expect_err(&value.to_string());
+            let shape = err.shape().expect("形の不正であること");
+            assert_eq!(
+                (shape.reason(), shape.face(), shape.key()),
+                (
+                    ShapeReason::ResponseTokensUnusable,
+                    Some("main"),
+                    Some("response_tokens")
+                ),
+                "{value}"
+            );
+        }
+    }
+
+    /// **面の窓の「余白以下は止める」は、その面の返答の上限に追従する**（ADR-0059 §決定2 / 作業単位 A-18a）。
+    ///
+    /// **下限の 1024 は据え置く**（`config::context_budget_of` —— 同じ窓は `sub` 面が無ければ抽出の窓にもなる）。
+    /// 止めるときの鍵は `context_tokens`（窓の側の検証）で、文面は効いている余白を言う。
+    #[test]
+    fn the_windows_floor_follows_the_faces_response_tokens() {
+        for (window, room, usable) in [
+            (4096, Some(2048), true),
+            (2049, Some(2048), true),
+            (2048, Some(2048), false),
+            (3000, Some(4096), false),
+            (1025, Some(512), true),
+            (1024, Some(512), false),
+            (1025, None, true),
+            (1024, None, false),
+        ] {
+            let mut extra = serde_json::json!({ "context_tokens": window });
+            if let Some(room) = room {
+                extra["response_tokens"] = serde_json::json!(room);
+            }
+            let source =
+                serde_json::json!({ "p": { "main": a18a_face(1, "m", &extra) } }).to_string();
+            let read = parse_profiles(&source, None);
+            match (usable, read) {
+                (true, Ok(_)) => {}
+                (false, Err(err)) => {
+                    let shape = err.shape().expect("形の不正であること");
+                    assert_eq!(
+                        (shape.reason(), shape.key()),
+                        (ShapeReason::ContextTokensUnusable, Some("context_tokens")),
+                        "{window} / {room:?}"
+                    );
+                    let floor = room.unwrap_or(1024).max(1024);
+                    assert!(
+                        shape.to_string().contains(&floor.to_string()),
+                        "効いている余白（{floor}）を言うこと: {shape}"
+                    );
+                }
+                (usable, read) => panic!("{window} / {room:?}: 期待 {usable}、実際 {read:?}"),
+            }
+        }
     }
 
     /// **理由の綴りは互いに違い、文面は空でない**（画面が分岐と表示に使う）。

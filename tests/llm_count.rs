@@ -201,6 +201,55 @@ async fn the_seal_carries_the_same_body_as_the_chat_request() {
     );
 }
 
+/// **本文の経路が思考の量を載せた要求でも、封の本文はチャットの本文と同じ**
+/// （[ADR-0059](../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md) §決定1 の
+/// 「封は本文の要求と同じ値を載せた本文で作る」/ 作業単位 A-18a）。
+///
+/// 上の [`the_seal_carries_the_same_body_as_the_chat_request`] は既定の腕（要求が上書きを持たない）。
+/// **チャットテンプレートの出力は思考の有無で変わる**ので、封だけが既定の `none` で組まれると、数えた数が送った本文と
+/// 食い違う。比べるのは偽の上流が受け取ったバイト列で、**両方に `"reasoning_effort":"low"` が載っていること**も見る
+/// （両方とも落とした形が「同じ本文」で緑にならないように）。
+#[tokio::test]
+async fn the_seal_carries_the_reasoning_effort_the_chat_request_carries() {
+    let thinking = ChatRequest {
+        reasoning_effort: Some(personacore::llm::ReasoningEffort::Low),
+        ..request()
+    };
+    for streaming in [false, true] {
+        let server = llama_like(r#"{"tokens":[11,22,33,44]}"#).await;
+        let client = client_for(&server.uri());
+        let upstream: &dyn LlmClient = &client;
+
+        upstream
+            .count_request(&thinking, streaming)
+            .await
+            .expect("偽の上流は答えること");
+        if streaming {
+            drain(upstream.stream(&thinking).await.expect("中継が始まること")).await;
+        } else {
+            upstream.complete(&thinking).await.expect("補完が返ること");
+        }
+
+        let chat = bodies_to(&server, "/v1/chat/completions").await;
+        let sealed = bodies_to(&server, "/apply-template").await;
+        assert_eq!((chat.len(), sealed.len()), (1, 1), "streaming={streaming}");
+        assert_eq!(
+            String::from_utf8_lossy(&sealed[0]),
+            String::from_utf8_lossy(&chat[0]),
+            "封の本文がチャットの本文と違う（streaming={streaming}）"
+        );
+        for (label, body) in [("チャット", &chat[0]), ("封", &sealed[0])] {
+            let sent: serde_json::Value =
+                serde_json::from_slice(body).expect("本文が JSON であること");
+            assert_eq!(
+                sent["reasoning_effort"],
+                serde_json::json!("low"),
+                "{label}の本文が要求の思考の量を持たない（streaming={streaming}）: {sent}"
+            );
+        }
+    }
+}
+
 /// **文字列ごとの口は、渡した文字列だけを数える**（`/apply-template` を通らない）。
 #[tokio::test]
 async fn counting_a_text_tokenizes_exactly_that_text() {

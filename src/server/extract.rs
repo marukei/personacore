@@ -63,7 +63,7 @@ use crate::domain::{
     DriftForm, DriftNote, DriftTuning, MessageId, ResolvedDriftMode, SessionId, StatDriftMode,
     StatScale, strip_leaked_thinking,
 };
-use crate::llm::{ChatMessage, ChatRequest, FinishReason, LlmClient, SUB_LLM_TEMPERATURE};
+use crate::llm::{ChatMessage, ChatRequest, FinishReason, LlmClient};
 use crate::parse::extraction::{Completeness, DiscardCounts, parse_extraction};
 use crate::prompt::extraction::{
     ExampleStyle, ExtractionInput, ExtractionPrompt, build_extraction_prompt, example_echoes,
@@ -1432,14 +1432,13 @@ fn extraction_request(messages: Vec<ChatMessage>, limit: u32) -> Result<ChatRequ
         return Err(tokens);
     }
 
-    Ok(ChatRequest {
+    // **温度は明示する**（ADR-0038 §決定2 / 作業単位 A-7d）。**思考させない**（ADR-0059 §決定1）。
+    // **値の来歴と、変容と同じ値であることの意味は `llm::SUB_LLM_TEMPERATURE` の doc**（裏方の要求の口 /
+    // `llm::ChatRequest::background`）。
+    Ok(ChatRequest::background(
         messages,
-        // **温度は明示する**（ADR-0038 §決定2 / 作業単位 A-7d）。
-        // **値の来歴と、変容と同じ値であることの意味は `llm::SUB_LLM_TEMPERATURE` の doc。**
-        // **ここに数を書かない**（写すと、動いたときに片方が黙って古びる）。
-        temperature: Some(SUB_LLM_TEMPERATURE),
-        max_tokens: Some(EXTRACTION_RESPONSE_TOKENS),
-    })
+        EXTRACTION_RESPONSE_TOKENS,
+    ))
 }
 
 /// **実機で腕を比べる器具のための入口。テスト専用**（作業単位 21a）。

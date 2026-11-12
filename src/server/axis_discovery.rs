@@ -52,7 +52,7 @@ use crate::domain::{
     AxisDiscoveryMiss, AxisDiscoveryOutcome, AxisDiscoverySlots, StatAxis, axis_discovery_due,
     axis_name_clash, memories_since,
 };
-use crate::llm::{ChatRequest, LlmClient, SUB_LLM_TEMPERATURE};
+use crate::llm::{ChatRequest, LlmClient};
 use crate::parse::axis_candidate::{AxisCandidateReading, parse_axis_candidate};
 use crate::prompt::axis_discovery::{
     AxisDiscoveryInput, build_axis_discovery_prompt, request_tokens,
@@ -265,12 +265,8 @@ pub(in crate::server) async fn run_axis_discovery(
     let messages = prompt.into_messages();
     let prompt_tokens = request_tokens(&messages);
 
-    let request = ChatRequest {
-        messages,
-        // **温度は抽出・変容と同じ値**（`llm::SUB_LLM_TEMPERATURE` の doc。ここに数を書かない）。
-        temperature: Some(SUB_LLM_TEMPERATURE),
-        max_tokens: Some(response_tokens(job.sub_context)),
-    };
+    // **温度は抽出・変容と同じ値、思考させない**（裏方の要求の口 / `llm::ChatRequest::background`）。
+    let request = ChatRequest::background(messages, response_tokens(job.sub_context));
 
     let counts = Counts {
         fresh: fresh.len(),
@@ -1442,6 +1438,8 @@ mod tests {
             assert_eq!(request.temperature, Some(0.8));
             // **応答の上限は名前1行ぶん**（外の値で押さえる: 2 + 20×4 + 6 + 1）。
             assert_eq!(request.max_tokens, Some(89));
+            // **裏方は思考の量を上書きしない**（線は既定の `none` / ADR-0059 §決定1）。
+            assert_eq!(request.reasoning_effort, None);
         });
     }
 

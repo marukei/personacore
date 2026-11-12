@@ -63,7 +63,7 @@ use crate::domain::{
 };
 use crate::llm::{
     ApiKey, DEFAULT_ENDPOINT, DEFAULT_MAIN_MODEL, DEFAULT_SUB_MODEL, EndpointError, LmStudioConfig,
-    ModelId, ModelIdError, Sampling,
+    ModelId, ModelIdError, ReasoningEffort, Sampling,
 };
 use crate::prompt::TokenBudget;
 
@@ -809,6 +809,19 @@ pub enum ConfigError {
     #[error("コンテキスト長の指定が不正です")]
     ContextTokens,
 
+    /// **本文の面の返答の上限（`response_tokens`）が、明示のコンテキスト長に収まらない**
+    /// （ADR-0059 §決定2 / 作業単位 A-18a）。
+    ///
+    /// 面に `context_tokens` を書いていれば読み込み（`upstreams::parse_profiles`）が止めるので、ここへ来るのは
+    /// **面に窓が無く、`PERSONACORE_CONTEXT_TOKENS` が上限以下だったとき**（予算が組めない）。
+    /// [`Self::ContextTokens`] と同じく「明示設定の不正は起動時に落とす」側（切り替えでは断る）。
+    ///
+    /// **`response_tokens` が 0 の面もこれを返す**（[`ProfileContext::of`] の最初の検査）。本番では読み込み
+    /// （`upstreams::parse_profiles`）が 0 を止めるので到達しない —— `unwrap` で「検証済みのはず」に寄りかからない
+    /// ための腕である。
+    #[error("本文の返答の上限が、明示のコンテキスト長に収まりません")]
+    ResponseTokens,
+
     /// **打ち切りの天井が秒として読めない、または使えない値**（ADR-0035 §決定3 / B-6）。
     ///
     /// [`Self::ContextTokens`] と同じく「明示設定の不正は起動時に落とす」側。
@@ -886,12 +899,45 @@ pub enum ConfigError {
 /// **上流プロファイルの面に書いたコンテキスト長**（ADR-0054 §決定1 / [`AppConfig::with_profile_context`]）。
 ///
 /// **どちらも検証済みの型で持つ**（本文は予算、抽出は抽出の上限）。
+///
+/// **本文の面の思考の量と返答の上限も、ここで一緒に運ぶ**（`body` / ADR-0059 §決定1・2 / 作業単位 A-18a）——
+/// 起動と切り替えで、窓と同じ器（`context::SharedBudget`）へ同じ時に入るので。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(in crate::server) struct ProfileContext {
-    /// **本文の予算の明示。** [`ENV_CONTEXT_TOKENS`] に勝つ。
+    /// **本文の予算の明示。** [`ENV_CONTEXT_TOKENS`] に勝つ。**応答の余白は `body` の返答の上限**（書いていなければ 1024）。
     pub(in crate::server) main: Option<TokenBudget>,
     /// **抽出の上限の明示。**
     pub(in crate::server) sub: Option<SubContext>,
+    /// **本文の面だけが持つ値**（思考の量と返答の上限 / [`BodyFace`]）。
+    pub(in crate::server) body: BodyFace,
+}
+
+/// **本文の面だけが持つ、要求ごとの値**（[ADR-0059](../../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md)
+/// §決定1・2 / 作業単位 A-18a）。**既定は「何も書いていない」**（思考は `none`、返答の上限は 1024）。
+///
+/// # 面の設定（`llm::Sampling`）に入れない理由
+///
+/// `sub` 面の無い構成では、裏方のクライアントは本文のクライアントの複製（`LmStudioClient::with_model`）で、
+/// **面の設定は複製に写る。** ここに置いた値は**本文の予算の器（`context::SharedBudget`）だけが持ち**、
+/// 本文の経路だけが要求に載せる（思考の量は `llm::ChatRequest::reasoning_effort`、返答の上限は予算の余白と
+/// `max_tokens` の天井）。**裏方は抽出の上限の器（`SharedSubContext`）を読むので、構造として届かない。**
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::server) struct BodyFace {
+    /// **書いた思考の量**（`main` 面の `sampling.reasoning_effort`）。書いていなければ `None`（線は既定の `none`）。
+    pub(in crate::server) reasoning_effort: Option<ReasoningEffort>,
+    /// **書いた返答の上限**（`main` 面の `response_tokens`）。**検証済み**（1 以上）。書いていなければ `None`（1024）。
+    pub(in crate::server) response_tokens: Option<u32>,
+}
+
+impl BodyFace {
+    /// **使いたい応答の余白**（書いた上限、無ければ [`TokenBudget::DEFAULT_RESPONSE_TOKENS`]）。
+    ///
+    /// **窓に収まるとは限らない** —— 照会した窓が小さければ、予算を組む側（`context`）が既定に戻す（ADR-0059 §決定2）。
+    #[must_use]
+    pub(in crate::server) fn response_room(self) -> u32 {
+        self.response_tokens
+            .unwrap_or(TokenBudget::DEFAULT_RESPONSE_TOKENS)
+    }
 }
 
 impl ProfileContext {
@@ -902,11 +948,39 @@ impl ProfileContext {
     /// [`context_budget_of`] を通す——**`unwrap` で「検証済みのはず」に寄りかからない。**
     /// 抽出の側は抽出の上限としても成り立つかを見る（`extract::SubContext::new`。
     /// 予算の規則を通る値は必ず通る —— `the_profile_context_rule_admits_every_budget_as_an_extraction_limit`）。
-    pub(in crate::server) fn of(settings: &ProfileSettings) -> Result<Self, ConfigError> {
-        let main = settings
-            .context_tokens()
-            .map(context_budget_of)
-            .transpose()?;
+    ///
+    /// # 返答の上限は明示の窓に収まること（ADR-0059 §決定2 / 作業単位 A-18a）
+    ///
+    /// `environment` は起動時の `PERSONACORE_CONTEXT_TOKENS`（明示の窓の2番目の出どころ / ADR-0054 §決定2）。
+    /// **面に窓が無く環境変数の窓があるとき、本文の面の返答の上限がそれ以上なら [`ConfigError::ResponseTokens`]**
+    /// （予算が組めない）。面に窓があれば、読み込みが同じことを止めている（ここでも [`TokenBudget::new`] で確かめる）。
+    /// **照会した窓（明示が無い面）はここでは分からない** —— 予算を組む時に既定へ戻す（`context`）。
+    pub(in crate::server) fn of(
+        settings: &ProfileSettings,
+        environment: Option<TokenBudget>,
+    ) -> Result<Self, ConfigError> {
+        let body = BodyFace {
+            reasoning_effort: settings.reasoning_effort(),
+            response_tokens: settings.response_tokens(),
+        };
+        if body.response_tokens == Some(0) {
+            return Err(ConfigError::ResponseTokens);
+        }
+        let room = body.response_room();
+        let main = match settings.context_tokens() {
+            Some(tokens) => {
+                // **下限の規則は据え置く**（`context_budget_of` —— 同じ値は `sub` 面が無ければ抽出の窓にもなる）。
+                context_budget_of(tokens)?;
+                Some(TokenBudget::new(tokens, room).map_err(|_| ConfigError::ContextTokens)?)
+            }
+            None => None,
+        };
+        if main.is_none()
+            && let Some(environment) = environment
+            && TokenBudget::new(environment.context_tokens(), room).is_err()
+        {
+            return Err(ConfigError::ResponseTokens);
+        }
         let sub = match settings.sub_context_tokens() {
             Some(tokens) => {
                 context_budget_of(tokens)?;
@@ -914,7 +988,7 @@ impl ProfileContext {
             }
             None => None,
         };
-        Ok(Self { main, sub })
+        Ok(Self { main, sub, body })
     }
 }
 
@@ -1449,11 +1523,16 @@ impl AppConfig {
     ///
     /// **検証は読み込みと同じ規則でもう一度通す**（`ProfileContext::of` の doc）。
     ///
+    /// **本文の面の思考の量と返答の上限も、ここで載せる**（ADR-0059 §決定1・2 / 作業単位 A-18a）——
+    /// どちらも本文の予算の器へ窓と一緒に入る（`ProfileContext::body`）。**環境変数の口は無い。**
+    ///
     /// # Errors
     ///
-    /// 値が予算にならないとき（読み込みを通った値では起きない）。
+    /// 値が予算にならないとき（読み込みを通った値では起きない）。**本文の面の返答の上限が
+    /// [`ENV_CONTEXT_TOKENS`] の窓に収まらないとき**（面に窓が無いとき / [`ConfigError::ResponseTokens`]）——
+    /// これは読み込みでは分からない（環境変数を見ない）ので、ここで止まる。
     pub fn with_profile_context(mut self, settings: &ProfileSettings) -> Result<Self, ConfigError> {
-        self.profile_context = ProfileContext::of(settings)?;
+        self.profile_context = ProfileContext::of(settings, self.context_budget)?;
         Ok(self)
     }
 
@@ -1953,8 +2032,11 @@ fn parse_stat_drift(raw: &str) -> Result<StatDriftMode, ConfigError> {
 
 /// 明示設定のコンテキスト長を予算に変える。**純粋関数。**
 ///
-/// 生成用の余白は既定のまま据え置き、コンテキスト全体だけを差し替える
-/// （余白まで設定で動かすと「応答が途中で切れる」設定が作れてしまう）。
+/// **環境変数は窓だけを動かす**（生成用の余白は既定の 1024 のまま。余白の環境変数の口は作らない）。
+/// **余白を動かせるのは、上流プロファイルの本文の面の `response_tokens` だけ**
+/// （[ADR-0059](../../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md) §決定2）。
+/// 「応答が途中で切れる設定が作れてしまう」は、そちらの検証（窓以上は止める —— [`ProfileContext::of`]）と、
+/// 上限を高めに置く指針で受ける（同 §決定2）。
 fn parse_context_budget(raw: &str) -> Result<TokenBudget, ConfigError> {
     let tokens: u32 = raw.trim().parse().map_err(|_| ConfigError::ContextTokens)?;
     context_budget_of(tokens)
@@ -1966,6 +2048,11 @@ fn parse_context_budget(raw: &str) -> Result<TokenBudget, ConfigError> {
 /// （ADR-0054 §決定1）が同じ規則を通る**——規則の写しを `upstreams` に作らない。
 ///
 /// 0 も、余白（1024）以下も、ここで `BudgetError` になって落ちる。
+///
+/// **面に `response_tokens` を書いたときは、この下限に加えて「窓はその上限より大きい」も要る**
+/// （ADR-0059 §決定2 —— [`ProfileContext::of`] と `upstreams::parse_profiles` が [`TokenBudget::new`] で見る）。
+/// **この関数の下限（1024）は返答の上限に追従させない** —— `sub` 面の無いプロファイルでは同じ窓が抽出の窓にも
+/// なり（`ProfileSettings::sub_context_tokens`）、抽出の側はこの関数の規則を前提にしている。
 pub(in crate::server) fn context_budget_of(tokens: u32) -> Result<TokenBudget, ConfigError> {
     TokenBudget::new(tokens, TokenBudget::DEFAULT_RESPONSE_TOKENS)
         .map_err(|_| ConfigError::ContextTokens)
@@ -3117,6 +3204,79 @@ mod tests {
         );
     }
 
+    /// **本文の面の思考の量と返答の上限は、窓と一緒に載り、上限は明示の窓に収まらなければ止める**
+    /// （ADR-0059 §決定2 / 作業単位 A-18a）。
+    ///
+    /// | プロファイル | 環境変数の窓 | 結果 |
+    /// |---|---|---|
+    /// | 窓なし・上限 3000 | なし | 通る（照会した窓は予算を組む時に見る） |
+    /// | 窓なし・上限 3000 | 12288 | 通る。**明示の予算は無い**（窓は環境変数の欄に残る） |
+    /// | 窓なし・上限 3000 | 3001 | 通る（ぎりぎり大きい） |
+    /// | 窓なし・上限 3000 | 3000 / 2048 | **[`ConfigError::ResponseTokens`]**（予算が組めない） |
+    /// | 窓 8192・上限 3000 | 2048 | 通る。**面の窓が勝つ**ので環境変数は見ない。明示の予算の余白は 3000 |
+    /// | 何も書かない | 2048 | 通る（既定の 1024 は環境変数の窓より小さい） |
+    ///
+    /// 値は既定（1024・`none`）と違える。
+    #[test]
+    fn the_body_face_rides_with_the_profile_context_and_its_room_must_fit_the_explicit_window() {
+        let profiles = super::super::upstreams::parse_profiles(
+            r#"{ "thinking": { "main": { "endpoint": "http://127.0.0.1:1", "model": "m", "response_tokens": 3000,
+                                          "sampling": { "reasoning_effort": "low" } } },
+                 "windowed": { "main": { "endpoint": "http://127.0.0.1:1", "model": "m", "response_tokens": 3000,
+                                          "context_tokens": 8192 } },
+                 "plain":    { "main": { "endpoint": "http://127.0.0.1:1", "model": "m" } } }"#,
+            None,
+        )
+        .expect("読めること");
+        let thinking = BodyFace {
+            reasoning_effort: Some(ReasoningEffort::Low),
+            response_tokens: Some(3000),
+        };
+        let windowed = BodyFace {
+            reasoning_effort: None,
+            response_tokens: Some(3000),
+        };
+
+        for (name, environment, expected) in [
+            ("thinking", None, Some((thinking, None))),
+            ("thinking", Some("12288"), Some((thinking, None))),
+            ("thinking", Some("3001"), Some((thinking, None))),
+            ("thinking", Some("3000"), None),
+            ("thinking", Some("2048"), None),
+            (
+                "windowed",
+                Some("2048"),
+                Some((windowed, Some((8192, 3000)))),
+            ),
+            ("plain", Some("2048"), Some((BodyFace::default(), None))),
+        ] {
+            let settings = profiles.select(name).expect("在ること").settings();
+            let pairs: Vec<(&str, &str)> = environment
+                .map(|value| vec![(ENV_CONTEXT_TOKENS, value)])
+                .unwrap_or_default();
+            let loaded = config_of(&pairs)
+                .expect("組めること")
+                .with_profile_context(&settings);
+            match (expected, loaded) {
+                (Some((body, main)), Ok(config)) => {
+                    let context = config.profile_context();
+                    assert_eq!(context.body, body, "{name} / {environment:?}");
+                    assert_eq!(
+                        context
+                            .main
+                            .map(|budget| (budget.context_tokens(), budget.response_tokens())),
+                        main,
+                        "{name} / {environment:?}"
+                    );
+                }
+                (None, Err(ConfigError::ResponseTokens)) => {}
+                (expected, loaded) => {
+                    panic!("{name} / {environment:?}: 期待 {expected:?}、実際 {loaded:?}")
+                }
+            }
+        }
+    }
+
     /// 不正なエンドポイント・モデル識別子は**起動時に**落とす。
     #[test]
     fn rejects_a_malformed_upstream() {
@@ -3187,7 +3347,7 @@ mod tests {
     #[test]
     fn config_errors_are_distinguishable() {
         /// バリアントの総数。**`all` に足し忘れたらここで落ちる。**
-        const VARIANTS: usize = 13;
+        const VARIANTS: usize = 14;
 
         /// **`match` なので、バリアントが増えた日にコンパイルできなくなる。**
         ///
@@ -3201,6 +3361,7 @@ mod tests {
                 ConfigError::Endpoint(_) => "endpoint",
                 ConfigError::Model(_) => "model",
                 ConfigError::ContextTokens => "context_tokens",
+                ConfigError::ResponseTokens => "response_tokens",
                 ConfigError::LlmIdleTimeout => "llm_idle_timeout",
                 ConfigError::StatDrift => "stat_drift",
                 ConfigError::DriftForm => "drift_form",
@@ -3218,6 +3379,7 @@ mod tests {
             ConfigError::Endpoint(EndpointError::Empty),
             ConfigError::Model(ModelIdError::Empty),
             ConfigError::ContextTokens,
+            ConfigError::ResponseTokens,
             ConfigError::LlmIdleTimeout,
             ConfigError::StatDrift,
             ConfigError::DriftForm,

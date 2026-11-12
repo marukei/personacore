@@ -115,7 +115,7 @@ use crate::domain::{
     DriftAxisLedger, DriftDelta, DriftDiscardReason, DriftForm, DriftLedger, DriftNote, DriftScore,
     DriftScoring, DriftTuning, DriftVote, StatAlloc, StatAxis, StatDriftMode, apply_drift,
 };
-use crate::llm::{ChatRequest, LlmClient, SUB_LLM_TEMPERATURE};
+use crate::llm::{ChatRequest, LlmClient};
 use crate::parse::drift::{parse_drift, parse_drift_all_report};
 // **打ち切りの語彙は抽出と共有する**（作業単位 B-1）。
 // 言っているのは封筒のこと（「上流が最後まで書いたか」）で、
@@ -570,15 +570,12 @@ pub(in crate::server) async fn run_drift(
         return;
     }
 
-    let request = ChatRequest {
-        messages,
-        // **温度は明示する**（ADR-0038 §決定2 / 作業単位 A-7d。抽出と同じ値）。
-        // **値の来歴と、抽出と同じ値であることの意味は `llm::SUB_LLM_TEMPERATURE` の doc。**
-        // **ここに数を書かない**（写すと、動いたときに片方が黙って古びる）。
-        temperature: Some(SUB_LLM_TEMPERATURE),
-        // **上限は形と軸の本数から出す**（全軸採点は N 行返る / ADR-0027 §12）。
-        max_tokens: Some(drift_response_tokens(form, axes, job.sub_context)),
-    };
+    // **温度は明示する**（ADR-0038 §決定2 / 作業単位 A-7d。抽出と同じ値）。**思考させない**（ADR-0059 §決定1）。
+    // **値の来歴と、抽出と同じ値であることの意味は `llm::SUB_LLM_TEMPERATURE` の doc**（裏方の要求の口 /
+    // `llm::ChatRequest::background`）。
+    // **上限は形と軸の本数から出す**（全軸採点は N 行返る / ADR-0027 §12）。
+    let request =
+        ChatRequest::background(messages, drift_response_tokens(form, axes, job.sub_context));
 
     // **トランザクションの外で通信する**（CLAUDE.md 絶対制約）。
     // このモジュールはそもそもトランザクションを張らない。

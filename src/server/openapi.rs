@@ -151,7 +151,17 @@ const STABILITY_EXTENSION: &str = "x-personacore-stability";
 /// ファイルに書いてある値を写すだけなので、保存の 422 `upstream_profile_invalid` には出ない（ファイルの
 /// `sampling` が不正なら 422 `upstream_profiles_unreadable`）。応答の `enum` に値を足しただけなので小さい側。プロファイルの一覧と
 /// 保存の依頼の形は変えていない（依頼は `sampling` を受け付けず、保存はいまのファイルの値を残す）。
-pub const API_VERSION: &str = "1.7";
+///
+/// **`1.8`**（作業単位 A-18a / ADR-0059 §決定5）: 上流プロファイルの本文の面の鍵 `response_tokens` が入り、
+/// 仕様書の `key` の `enum`（`ProfileInvalidDetail.key` / `ProblemView.key`）に値 `response_tokens`、`reason` の
+/// `enum` に値 `response_tokens_unusable` / `main_face_only` が増えた（`sampling` の中に `reasoning_effort` も書けるように
+/// なったが、仕様書の形には現れない）。**これらを名指すのはプロファイルの一覧の `ProblemView` だけ** —— 保存は
+/// ファイルに書いてある値を写すだけなので、保存の 422 `upstream_profile_invalid` には出ない（ファイルの値が不正なら
+/// 422 `upstream_profiles_unreadable`。画面から窓を上限以下へ縮めた保存は、今までどおり `context_tokens_unusable`）。
+/// 応答の `enum` に値を足しただけなので小さい側（`1.7` と同じ扱い）。プロファイルの一覧と保存の依頼の形は変えていない。
+/// **振る舞いも変わった**: 本文の面にこの値を書いたプロファイルでは、本文の要求の `max_tokens` の天井（クライアントの
+/// `max_tokens` を切り下げる値）が 1024 から面の値になる。書かない面は今までどおり。
+pub const API_VERSION: &str = "1.8";
 
 /// **ルータに届いた要求への全部の応答に付ける、API の版のヘッダの名前**
 /// （HTTP では大文字小文字を区別しない。仕様書の `headers` の鍵もこの綴り）。
@@ -1736,7 +1746,7 @@ mod tests {
                 vec![json!("stop"), json!("length"), Value::Null],
             ),
             // **面の鍵**（作業単位 A-13a-2 で `context_tokens`、A-13b-1 で `api_key`、
-            // A-13b-2 で `allow_key_over_plain_http`、A-16 で `sampling` が入った。
+            // A-13b-2 で `allow_key_over_plain_http`、A-16 で `sampling`、A-18a で `response_tokens` が入った。
             // 画面は保存の 422 の `key` をこの綴りで欄に結びつける）。
             (
                 "ProfileInvalidDetail",
@@ -1751,6 +1761,7 @@ mod tests {
                     json!("api_key"),
                     json!("allow_key_over_plain_http"),
                     json!("sampling"),
+                    json!("response_tokens"),
                     Value::Null,
                 ],
             ),

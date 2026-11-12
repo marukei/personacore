@@ -511,6 +511,11 @@ pub(super) fn redact_key(body: &str, key: Option<&ApiKey>) -> String {
 /// **最後に残っていた「観測できない上流の既定」が消えた**）。
 /// **⚠ `None` が残るのは「クライアントが `temperature` を送ってこなかった本文の回」だけ**
 /// （未決 / [`SUB_LLM_TEMPERATURE`] の doc）。
+///
+/// **⚠ `reasoning_effort` がここに在るのも、経路ごとに値が違うから**である
+/// （[ADR-0059](../../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md) §決定1 / 作業単位 A-18a）。
+/// **本文の経路だけが、本文の面に書いた値を載せる。裏方の経路は常に `None`**（＝[`RequestPolicy::PERSONACORE`] の
+/// `"none"`）。`temperature` と違い、**線の上の欄は [`RequestPolicy`] の側にある**（置き換えるのは `wire_request`）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatRequest {
     /// 送るメッセージ列。並び順がそのまま文脈になる。
@@ -519,6 +524,16 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     /// 生成トークンの上限。未指定なら上流の既定。
     pub max_tokens: Option<u32>,
+    /// **思考の量の上書き**（ADR-0059 §決定1 / 作業単位 A-18a）。**本文の経路だけが載せる。**
+    ///
+    /// `None` なら [`RequestPolicy::PERSONACORE`] の `"none"` のまま送る（**裏方の経路は常に `None`**）。
+    /// `Some` なら、線の上の `reasoning_effort` の欄だけをこの値に置き換える（**欄の位置は同じ** ——
+    /// `RequestPolicy` を `flatten` で載せる位置。重複キーにならない）。
+    ///
+    /// **面の設定（`Sampling` / `LmStudioConfig`）に載せないのは意図的**（ADR-0059 §却下した選択肢）——
+    /// `sub` 面の無い構成では裏方のクライアントが本文のクライアントの複製なので、面の設定に載せると本文の思考が
+    /// 裏方へ写る（抽出の予算 320 を思考で使い切る）。
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl ChatRequest {
@@ -528,7 +543,61 @@ impl ChatRequest {
             messages,
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
         }
+    }
+
+    /// **裏方（抽出・変容・提案・軸の発見・軸の試行）の要求を作る唯一の口**（A-18a のレビュー是正）。
+    ///
+    /// **温度は [`SUB_LLM_TEMPERATURE`]、思考の量は上書きしない（線は既定の `"none"`）**。応答の上限だけが経路ごとに違う。
+    /// 5か所で欄を直書きしていたのをここにまとめた —— **裏方の経路が思考の量を持てる形を、呼び出し側に書かせない**
+    /// （ADR-0059 §決定1: 裏方は常に `"none"`）。思考の量を載せるのは本文の経路だけで、それは欄を直に組む。
+    #[must_use]
+    pub fn background(messages: Vec<ChatMessage>, max_tokens: u32) -> Self {
+        Self {
+            messages,
+            temperature: Some(SUB_LLM_TEMPERATURE),
+            max_tokens: Some(max_tokens),
+            reasoning_effort: None,
+        }
+    }
+}
+
+/// **本文の面に書ける思考の量**（[ADR-0059](../../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md)
+/// §決定1 / 作業単位 A-18a）。**線の綴りは `"none"` / `"low"`。**
+///
+/// # 書けるのは2つだけ
+///
+/// **測ったのはこの2つだけ**で、ほかの値は上流によって 500 になる（ADR-0038 §決定3 の G-6 の表で `minimal` / `high`）。
+/// 測ってから ADR に追記して足す。**綴りから作る口は [`Self::parse`] だけ**で、知らない綴りは `None`
+/// （読み込みが名前を挙げて止める —— `server::upstreams`）。
+///
+/// **`None` という名前の値を作らない**（`Option::None` と取り違える）。線の `"none"` は [`Self::Off`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    /// **思考させない**（線の綴りは `"none"`。personacore の既定 —— [`RequestPolicy::PERSONACORE`]）。
+    Off,
+    /// **少し思考させる**（線の綴りは `"low"`）。
+    Low,
+}
+
+impl ReasoningEffort {
+    /// **全部の値**（読み込みの文面が綴りを並べる）。
+    pub const ALL: [Self; 2] = [Self::Off, Self::Low];
+
+    /// **線と面の綴り。**
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "none",
+            Self::Low => "low",
+        }
+    }
+
+    /// **綴りから作る。綴りは完全一致**（大文字小文字も前後の空白も畳まない —— 線に載る綴りそのもの）。
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|effort| effort.as_str() == raw)
     }
 }
 
@@ -538,12 +607,13 @@ impl ChatRequest {
 ///
 /// # なぜ [`RequestPolicy`] に載せないのか
 ///
-/// **あれは全経路で同じ1つ**で、**本文の経路はクライアントの依頼の値をそのまま通す**
+/// **あれの既定は全経路で同じ1つ**（本文の経路が要求ごとに上書きするのは `reasoning_effort` だけ / ADR-0059 §決定1）で、
+/// **本文の経路はクライアントの依頼の値をそのまま通す**
 /// （[`ChatRequest::temperature`]）。**あそこへ載せると経路差になる**うえ、
 /// **[`WireRequest`] と同じ名前なので重複キーがそのまま線に乗る**
 /// （`#[serde(flatten)]` はマップ直列化 / 見張り番は
 /// `the_wire_bytes_carry_each_top_level_key_exactly_once`）。
-/// **だから欄は1つのままにして、値を入れる側**（`server::extract` / `server::drift`）**が持つ。**
+/// **だから欄は1つのままにして、値を入れる側**（裏方の要求の口 [`ChatRequest::background`]）**が持つ。**
 ///
 /// # 値の来歴 —— **今日の実効の既定そのもの**（C-13 の実測 / 2026-08-29）
 ///
@@ -631,6 +701,10 @@ const fn role_to_wire(role: ChatRole) -> &'static str {
 /// （抽出の応答上限は `server::extract::EXTRACTION_RESPONSE_TOKENS`）ので、
 /// **上流に思考させたくない**——それはどのモデルを載せていても変わらない。
 ///
+/// **⚠ 「設定でも分岐しない」は既定の1組の話である。** 上流プロファイルの面に書いた値は、この1組の上に重なる ——
+/// `repeat_penalty` は面のクライアントが（ADR-0058 / [`RequestPolicy::overridden_by`]）、`reasoning_effort` は
+/// 本文の経路の要求が（ADR-0059 §決定1 / [`RequestPolicy::thinking`]）。**裏方が思考させない立場は変わらない。**
+///
 /// **⚠ 値を書かないのは意図的。** `server::extract` には**似た綴りの定数が3つ**あり
 /// （`MEASURED_MAX_EXTRACTION_RESPONSE_TOKENS` /
 /// `QUEUE_SAFE_MAX_EXTRACTION_RESPONSE_TOKENS` / `EXTRACTION_RESPONSE_TOKENS`）、
@@ -697,13 +771,19 @@ const fn role_to_wire(role: ChatRole) -> &'static str {
 /// **⚠ `Eq` を derive しない。** `top_p` / `min_p` / `repeat_penalty` は `f32` なので、
 /// `Eq` があるとそもそも欄を足せない（A-7b で実測）。比較する相手も居ない。
 ///
-/// **⚠ 「経路ごとに違う値」は、この形のままでは持てない。**
+/// **⚠ 「経路ごとに違う値」は、この形のままでは持てない**（A-18a まで。下の段落が `reasoning_effort` の例外を書く）。
 /// ここは全経路で同じ1つの定数で、経路差が要るなら
 /// `wire_request` の引数として受け取る形へ変えることになる。
 /// **その前に「経路と値の取り違えを見る見張り番」が要る** ——
-/// いまの `tests/server_stat_drift.rs` の `all_three_paths_ask_the_upstream_not_to_think` は
+/// `tests/server_stat_drift.rs` の `all_three_paths_ask_the_upstream_not_to_think` は
 /// **3経路に同じ値を期待している**ので、取り違えを見ていない
 /// （[ADR-0038](../../docs/adr/0038-what-personacore-requires-of-an-upstream.md) §決定3 の表）。
+///
+/// **⚠ A-18a で `reasoning_effort` がその形になった**（[ADR-0059](../../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md)
+/// §決定1）。**値の出どころは要求の側**（[`ChatRequest::reasoning_effort`]。本文の経路だけが載せる）で、
+/// `wire_request` が [`Self::thinking`] で重ねる。**取り違えの見張り番は同じファイルの
+/// `each_path_sends_its_own_reasoning_effort`**（本文の面に `low` を書き、本文に `low`・抽出と変容に `none` を
+/// 経路の名前と対にして見る）。既定の腕は `all_three_paths_ask_the_upstream_not_to_think` のまま。
 ///
 /// **⚠ 作法だけは A-7d が先に作った。** `temperature` は**経路ごとに違う値**になったので、
 /// **同じファイルの `each_path_sends_its_own_temperature` が
@@ -755,6 +835,13 @@ pub(super) struct RequestPolicy {
     /// **標準が何を定めているかと、なぜ格下げしないかは
     /// [ADR-0038](../../docs/adr/0038-what-personacore-requires-of-an-upstream.md) §決定3 の
     /// 「測っていないこと」に書いてある。ここに写さない**（上の ⚠ と同じ理由）。
+    ///
+    /// # 本文の経路だけが上書きする（ADR-0059 §決定1 / 作業単位 A-18a）
+    ///
+    /// **既定は `"none"` のまま。** 本文の面に `reasoning_effort` を書いたプロファイルでは、本文の経路が
+    /// [`ChatRequest::reasoning_effort`] に載せ、[`RequestPolicy::thinking`] がこの欄の値だけを置き換える
+    /// （思考を切ったままでは長い会話で返答が縮んで戻らない上流があった —— ADR-0059 §背景）。
+    /// **裏方は今も常に `"none"`**（裏方の予算はトークン単位で小さい —— 上の理由はそのまま当てはまる）。
     reasoning_effort: &'static str,
 
     /// **上位 K 個からしか選ばない。**
@@ -847,10 +934,14 @@ pub(super) struct RequestPolicy {
 }
 
 impl RequestPolicy {
-    /// personacore の立場。**全経路で同じ1つ。**
+    /// personacore の立場。**既定は全経路で同じ1つ。本文の経路だけが `reasoning_effort` を要求ごとに上書きする**
+    /// （[ADR-0059](../../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md) §決定1 / 作業単位 A-18a ——
+    /// [`ChatRequest::reasoning_effort`] を [`Self::thinking`] で重ねる）。
     ///
-    /// **⚠ 経路ごとに変えないこと。** 変えるなら、先に
-    /// 「経路と値の取り違えを見る見張り番」が要る（この型の doc）。
+    /// **⚠ ほかの欄を経路ごとに変えないこと。** 変えるなら、先に
+    /// 「経路と値の取り違えを見る見張り番」が要る（この型の doc）。`reasoning_effort` の帰属の見張り番は
+    /// `tests/server_stat_drift.rs` の `each_path_sends_its_own_reasoning_effort`（本文の面に `"low"` を書き、
+    /// 本文・抽出・変容の値を経路の名前と対にして並べる）。
     ///
     /// # 面に書いた値は、この1組の上に重なる（ADR-0058 / 作業単位 A-16）
     ///
@@ -881,6 +972,23 @@ impl RequestPolicy {
         Self {
             repeat_penalty,
             ..self
+        }
+    }
+
+    /// **本文の経路が要求に載せた思考の量で置き換えた1組**（ADR-0059 §決定1 / 作業単位 A-18a）。
+    ///
+    /// **`None`（裏方の経路と、本文の面に書いていない回）なら1ビットも変えない** —— 書かない面の要求の
+    /// バイト列は変わらない（見張り番は `tests::the_wire_bytes_spell_the_request_exactly` が既定のまま通ること）。
+    /// **置き換えるのは欄の値だけで、欄の位置は同じ**（`flatten` の中）—— 重複キーにならない
+    /// （`tests::the_wire_bytes_carry_each_top_level_key_exactly_once`）。
+    #[must_use]
+    const fn thinking(self, effort: Option<ReasoningEffort>) -> Self {
+        match effort {
+            Some(effort) => Self {
+                reasoning_effort: effort.as_str(),
+                ..self
+            },
+            None => self,
         }
     }
 }
@@ -1132,6 +1240,12 @@ struct WireMessage<'a> {
 ///
 /// **`sampling` は、そのクライアントの面に書いた値**（`LmStudioConfig` が持つ）。書いた欄だけが
 /// [`RequestPolicy::PERSONACORE`] を置き換える。**何も書いていなければ、本文は1バイトも変わらない。**
+///
+/// # 本文の経路の思考の量（ADR-0059 §決定1 / 作業単位 A-18a）
+///
+/// **[`ChatRequest::reasoning_effort`] があるときだけ、`reasoning_effort` の欄の値をそれに置き換える。**
+/// 値の出どころは要求の側（本文の経路だけが載せる）で、`sampling`（面の設定）ではない ——
+/// `sub` 面の無い構成で、本文の思考を裏方へ写さないため。
 pub(super) fn wire_request<'a>(
     model: &'a ModelId,
     request: &'a ChatRequest,
@@ -1152,7 +1266,10 @@ pub(super) fn wire_request<'a>(
         // **条件を付けない。** 本文・抽出・変容の3経路はどれもここを通るので、
         // ここに書けば1経路だけ欠けることが起こらない（A-7b の狙い）。
         // **面に書いた値は、ここで置き換える**（ADR-0058 / 経路ではなくクライアントの面に付く値）。
-        policy: RequestPolicy::PERSONACORE.overridden_by(sampling),
+        // **思考の量は要求の側から重ねる**（ADR-0059 §決定1 —— 本文の経路だけが載せる。裏方は常に `None`）。
+        policy: RequestPolicy::PERSONACORE
+            .overridden_by(sampling)
+            .thinking(request.reasoning_effort),
         stream_options: stream.then_some(StreamOptions {
             include_usage: true,
         }),
@@ -1693,6 +1810,7 @@ mod tests {
             messages: vec![ChatMessage::user("こんにちは")],
             temperature: Some(0.5),
             max_tokens: None,
+            reasoning_effort: None,
         };
         let written = to_wire_with(
             &request,
@@ -1976,8 +2094,20 @@ mod tests {
                     messages: vec![ChatMessage::system("ペルソナ"), ChatMessage::user("x")],
                     temperature: Some(0.5),
                     max_tokens: Some(512),
+                    reasoning_effort: None,
                 },
                 &["temperature", "max_tokens"][..],
+            ),
+            // **本文の経路が思考の量を載せた回**（ADR-0059 §決定1 / 作業単位 A-18a）。**欄は増えない** ——
+            // `reasoning_effort` は `always` の1つで、値だけが置き換わる（`WireRequest` 側に同じ名前の欄を
+            // 足す実装はここで赤になる）。
+            (
+                "本文の思考の上書きあり",
+                ChatRequest {
+                    reasoning_effort: Some(ReasoningEffort::Low),
+                    ..ChatRequest::new(vec![ChatMessage::user("x")])
+                },
+                &[][..],
             ),
         ];
 
@@ -2065,6 +2195,7 @@ mod tests {
             ],
             temperature: Some(0.5),
             max_tokens: Some(512),
+            reasoning_effort: None,
         };
 
         assert_eq!(
@@ -2106,6 +2237,7 @@ mod tests {
                     messages: vec![ChatMessage::system("ペルソナ"), ChatMessage::user("x")],
                     temperature: Some(0.5),
                     max_tokens: Some(512),
+                    reasoning_effort: None,
                 },
             ),
         ];
@@ -2159,6 +2291,7 @@ mod tests {
                     messages: vec![ChatMessage::system("ペルソナ"), ChatMessage::user("x")],
                     temperature: Some(0.5),
                     max_tokens: Some(512),
+                    reasoning_effort: None,
                 },
             ),
         ];
@@ -2189,14 +2322,17 @@ mod tests {
         }
     }
 
-    /// **思考を切る欄は、どんな要求にも必ず載る**（ADR-0038 §決定3）。
+    /// **思考を切る欄は、どんな要求にも必ず載る**（ADR-0038 §決定3）。**要求が上書きを持たなければ `none`。**
     ///
     /// 思考モデルは既定で予算を全部思考に使い、`content` が 0 文字になる
     /// （personacore からは「応答が空でした」/ docs/archive/04-environment-lm-studio.md の実測）。
-    /// **この欄はモデルにも経路にも依存しない**ので、`wire_request` の分岐の
+    /// **この欄はモデルに依存しない**ので、`wire_request` の分岐の
     /// 外側に置いてある。ここで見ているのは「外側にあること」そのもの ——
     /// **ストリーミングの別・サンプラーの有無・メッセージの有無のどれを変えても
     /// 同じ値が載る**ことを、同じ1本で押さえる。
+    ///
+    /// **これは既定の腕**（ADR-0059 §決定1 / 作業単位 A-18a で、本文の経路だけが値を上書きできるようになった）。
+    /// 書いた面の腕は [`a_reasoning_effort_override_replaces_only_that_field_on_the_wire`]。
     #[test]
     fn wire_request_always_asks_for_no_reasoning() {
         let cases = [
@@ -2208,6 +2344,7 @@ mod tests {
                     messages: vec![ChatMessage::system("ペルソナ"), ChatMessage::user("x")],
                     temperature: Some(0.5),
                     max_tokens: Some(512),
+                    reasoning_effort: None,
                 },
             ),
         ];
@@ -2221,6 +2358,89 @@ mod tests {
                     "{label} / stream={stream} で思考を切ること: {body}"
                 );
             }
+        }
+    }
+
+    /// **本文の経路が載せた思考の量だけが、線の上の同じ位置で置き換わる**
+    /// （[ADR-0059](../../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md) §決定1 / 作業単位 A-18a）。
+    ///
+    /// [`wire_request_always_asks_for_no_reasoning`] が「上書きが無ければ `none`」の腕で、これは「書いた面」の腕。
+    ///
+    /// **期待値は手で書いたバイト列**（[`the_wire_bytes_spell_the_request_exactly`] と同じ形）。欄の位置が
+    /// `RequestPolicy` の中から動けば（`WireRequest` の最上位へ移す・末尾へ足す）バイト列が変わって赤になる。
+    ///
+    /// | 腕 | 期待 |
+    /// |---|---|
+    /// | `Some(Low)`・非ストリーミング | `"reasoning_effort":"low"`（手で書いた全体） |
+    /// | `Some(Low)`・ストリーミング | 同じ位置に `"low"`（ストリーミングの分岐の外側にあること） |
+    /// | `None` | 上の綴りの `"low"` を `"none"` に替えたものと同じ（**違うのはその1欄だけ**） |
+    /// | `Some(Off)` | `None` と1バイトも違わない（書かない面と同じ綴り） |
+    /// | `Some(Low)` ＋ 面の `repeat_penalty` | 両方が置き換わる（片方がもう片方を消さない） |
+    #[test]
+    fn a_reasoning_effort_override_replaces_only_that_field_on_the_wire() {
+        let plain = ChatRequest {
+            messages: vec![ChatMessage::user("こんにちは")],
+            temperature: Some(0.5),
+            max_tokens: None,
+            reasoning_effort: None,
+        };
+        let low = ChatRequest {
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..plain.clone()
+        };
+        let off = ChatRequest {
+            reasoning_effort: Some(ReasoningEffort::Off),
+            ..plain.clone()
+        };
+
+        let written = to_wire(&low, false);
+        assert_eq!(
+            written,
+            concat!(
+                r#"{"model":"ministral-3-14b-instruct-2512","#,
+                r#""messages":[{"role":"user","content":"こんにちは"}],"#,
+                r#""stream":false,"reasoning_effort":"low","#,
+                r#""top_k":40,"top_p":0.95,"min_p":0.05,"repeat_penalty":1.1,"#,
+                r#""presence_penalty":0.0,"temperature":0.5}"#,
+            )
+        );
+        assert!(
+            to_wire(&low, true).contains(r#""stream":true,"reasoning_effort":"low","#),
+            "ストリーミングでも同じ位置に載ること: {}",
+            to_wire(&low, true)
+        );
+        // **対照**: 上書きが無ければ既定の `none` —— 違うのはその1欄だけ。
+        assert_eq!(
+            to_wire(&plain, false),
+            written.replace(
+                r#""reasoning_effort":"low""#,
+                r#""reasoning_effort":"none""#
+            )
+        );
+        // **明示の `none` は、書かない面と同じバイト列。**
+        assert_eq!(to_wire(&off, false), to_wire(&plain, false));
+        // **面のサンプラの値と重なっても、両方が置き換わる。**
+        let both = to_wire_with(&low, false, Sampling::with_repeat_penalty(penalty(1.05)));
+        assert_eq!(
+            both,
+            written.replace(r#""repeat_penalty":1.1"#, r#""repeat_penalty":1.05"#)
+        );
+    }
+
+    /// **思考の量の綴り**（ADR-0059 §決定1）。**書けるのは `none` と `low` だけ**で、綴りは完全一致。
+    ///
+    /// **期待値は手で書く**（`ReasoningEffort::ALL` から作らない）。上流によって 500 になる `minimal` / `high` と、
+    /// 大文字・前後の空白・空文字は止める（線に載る綴りを畳まない）。
+    #[test]
+    fn a_reasoning_effort_admits_exactly_none_and_low() {
+        assert_eq!(ReasoningEffort::parse("none"), Some(ReasoningEffort::Off));
+        assert_eq!(ReasoningEffort::parse("low"), Some(ReasoningEffort::Low));
+        assert_eq!(ReasoningEffort::Off.as_str(), "none");
+        assert_eq!(ReasoningEffort::Low.as_str(), "low");
+        for raw in [
+            "", "None", "NONE", "Low", "LOW", " low", "low ", "minimal", "medium", "high", "off",
+        ] {
+            assert_eq!(ReasoningEffort::parse(raw), None, "{raw:?} は止めること");
         }
     }
 
@@ -2276,6 +2496,7 @@ mod tests {
             // f32 → f64 の変換で誤差が出ない値を使う（0.8 は二進で割り切れない）。
             temperature: Some(0.5),
             max_tokens: Some(512),
+            reasoning_effort: None,
         };
         let body = to_value(&request, true);
         assert_eq!(body["temperature"], json!(0.5));
@@ -2311,6 +2532,7 @@ mod tests {
             messages: vec![ChatMessage::user("x")],
             temperature: Some(SUB_LLM_TEMPERATURE),
             max_tokens: Some(320),
+            reasoning_effort: None,
         };
         let wire = to_wire(&request, false);
 
@@ -2318,6 +2540,26 @@ mod tests {
             wire.ends_with(r#""temperature":0.8,"max_tokens":320}"#),
             "線には 0.8 の綴りで乗ること（to_value を経由すると 0.800000011920929 になる）: {wire}"
         );
+    }
+
+    /// **裏方の要求の口は、温度 0.8・渡した上限・思考の量の上書きなしで組む**（A-18a のレビュー是正 /
+    /// [`ChatRequest::background`]）。**線では `"reasoning_effort":"none"`** —— 期待値は手で書く。
+    ///
+    /// **どの経路がこの口を通るか**は見えない（各経路の単体と `tests/server_profile_thinking.rs` の腕2が持つ）。
+    #[test]
+    fn the_background_request_sends_no_thinking_and_the_sub_temperature() {
+        let request = ChatRequest::background(vec![ChatMessage::user("x")], 77);
+        assert_eq!(
+            (
+                request.temperature,
+                request.max_tokens,
+                request.reasoning_effort
+            ),
+            (Some(0.8), Some(77), None)
+        );
+        let body = to_value(&request, false);
+        assert_eq!(body["reasoning_effort"], json!("none"));
+        assert_eq!(body["max_tokens"], json!(77));
     }
 
     /// メッセージが空でも組み立てられる（拒否は上流の仕事。ここで panic しない）。

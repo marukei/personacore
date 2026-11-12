@@ -357,6 +357,7 @@ fn written_face(value: &Value, face: &'static str) -> Result<WrittenFace, Unrepr
     // **承認（`allow_key_over_plain_http`）は書いた値を写す**（作業単位 A-13b-3。A-13b-2 の間は画面の形に欄が無く、写さなかった）。
     // **サンプラの値（`sampling`）は写さない**（ADR-0058 §決定6 / 作業単位 A-16 —— 画面はこの欄を持たない。
     // 形は読み込み（`parse_profiles`）が検証済み。保存は `FaceEdit::to_value` がいまのファイルから残す）。
+    // **本文の返答の上限（`response_tokens`）も同じ**（ADR-0059 §決定5 / 作業単位 A-18a）。
     let [
         endpoint,
         model,
@@ -367,6 +368,7 @@ fn written_face(value: &Value, face: &'static str) -> Result<WrittenFace, Unrepr
         api_key,
         allow_key_over_plain_http,
         _sampling,
+        _response_tokens,
     ] = FACE_KEYS;
     let required = |key: &'static str| {
         object
@@ -502,6 +504,7 @@ impl WrittenFace {
     /// **鍵（`api_key`）を書いていない面も、A-13b-1 の前と同じバイト列になる**（同じ理由で鍵を足さない）。
     /// **承認（`allow_key_over_plain_http`）はここでは書かない**（[`FaceEdit::to_value`] が依頼といまのファイルから決める）。
     /// **サンプラの値（`sampling`）も書かない**（同じく [`FaceEdit::to_value`] がいまのファイルから残す / ADR-0058 §決定6）。
+    /// **本文の返答の上限（`response_tokens`）も書かない**（同じ / ADR-0059 §決定5）。
     fn to_value(&self) -> Value {
         let [
             endpoint,
@@ -513,6 +516,7 @@ impl WrittenFace {
             api_key,
             _allow_key_over_plain_http,
             _sampling,
+            _response_tokens,
         ] = FACE_KEYS;
         let mut object = Map::new();
         object.insert(endpoint.to_owned(), Value::from(self.endpoint.as_str()));
@@ -572,6 +576,15 @@ impl FaceEdit {
     /// （値が合わなくなるかもしれないが、知らせずに消えるほうが、知らせずに残るより見つけにくい。残した値は
     /// 起動と切り替えのログに出る）。**別の名前・別の面の値は見ない**（値はエンジン・モデル・量子化の組に付く）。
     /// 見張り番は `tests/upstream_profile_editor.rs` の `a_hand_written_sampling_survives_a_save_from_the_screen`。
+    ///
+    /// # 本文の返答の上限（`response_tokens` / ADR-0059 §決定5 / 作業単位 A-18a）
+    ///
+    /// **`sampling` とまったく同じ規則**（依頼はこの欄を持たない・いまのファイルの同じ名前・同じ面の値を残す・
+    /// `endpoint` や `model` が変わっても落とさない）。**窓（`context_tokens`）を画面から小さくして上限以下にした保存は、
+    /// 保存の前の検証が `context_tokens` の欄で断る**（窓の「余白以下は止める」がその面の上限に追従する）。
+    /// 見張り番は `tests/upstream_profile_editor.rs` の `a_hand_written_response_room_survives_a_save_from_the_screen`
+    /// と、このモジュールの単体の `a_written_response_room_is_kept_from_the_same_name_and_face`・
+    /// `a_face_without_response_tokens_is_written_byte_for_byte_as_before`。
     fn to_value(&self, current: Option<&Map<String, Value>>) -> Value {
         let mut value = self.face.to_value();
         let key = match &self.key {
@@ -599,9 +612,19 @@ impl FaceEdit {
         let sampling = current
             .and_then(|face| face.get(super::upstreams::SAMPLING_KEY))
             .cloned();
+        // **本文の返答の上限も、サンプラの値と同じ規則で残す**（ADR-0059 §決定5 / 作業単位 A-18a）。
+        let response_tokens = current
+            .and_then(|face| face.get(super::upstreams::RESPONSE_TOKENS_KEY))
+            .cloned();
         if let Value::Object(object) = &mut value {
             if let Some(sampling) = sampling {
                 object.insert(super::upstreams::SAMPLING_KEY.to_owned(), sampling);
+            }
+            if let Some(response_tokens) = response_tokens {
+                object.insert(
+                    super::upstreams::RESPONSE_TOKENS_KEY.to_owned(),
+                    response_tokens,
+                );
             }
             if let Some(key) = key {
                 object.insert(super::upstreams::API_KEY_KEY.to_owned(), key);
@@ -2289,6 +2312,96 @@ mod tests {
                 "    \"sub\": {\n",
                 "      \"endpoint\": \"http://127.0.0.1:44003\",\n",
                 "      \"model\": \"only-sub\"\n",
+                "    }\n",
+                "  }\n",
+                "}\n",
+            )
+        );
+    }
+
+    /// **手で書いた本文の返答の上限（`response_tokens`）は、画面から別の欄を直して保存しても残る**
+    /// （ADR-0059 §決定5 / 作業単位 A-18a）。`endpoint` と `model` を変えた面でも残る（`sampling` と同じ規則）。
+    ///
+    /// **値を名前ごとに違える**（2048 / 3072）—— 別の名前から写す実装を赤にする。新しい名前には生えない。
+    /// 本文の面の思考の量（`sampling.reasoning_effort`）は `sampling` ごと残る（同じ欄の中なので、別に規則を持たない）。
+    #[test]
+    fn a_written_response_room_is_kept_from_the_same_name_and_face() {
+        let current = r#"{
+            "thinking": { "main": { "endpoint": "http://127.0.0.1:45101", "model": "thinking-main",
+                                     "response_tokens": 2048, "sampling": { "reasoning_effort": "low" } } },
+            "other":    { "main": { "endpoint": "http://127.0.0.1:45103", "model": "other-main",
+                                     "response_tokens": 3072 } } }"#;
+        let thinking = edit(face("http://127.0.0.1:45109", "thinking-main-2"), None);
+        let written =
+            apply_edit(Some(current), "thinking", &thinking, None).expect("保存できること");
+        let after: Value = serde_json::from_str(&written).expect("JSON");
+        assert_eq!(
+            (
+                &after["thinking"]["main"]["endpoint"],
+                &after["thinking"]["main"]["model"],
+            ),
+            (
+                &Value::from("http://127.0.0.1:45109"),
+                &Value::from("thinking-main-2")
+            ),
+            "前提: 依頼どおりに保存されたこと: {after}"
+        );
+        assert_eq!(
+            (
+                &after["thinking"]["main"]["response_tokens"],
+                &after["thinking"]["main"]["sampling"],
+                &after["other"]["main"]["response_tokens"],
+            ),
+            (
+                &Value::from(2048),
+                &serde_json::json!({ "reasoning_effort": "low" }),
+                &Value::from(3072),
+            ),
+            "同じ名前・同じ面の値が消えた／他の名前が動いた: {after}"
+        );
+
+        let fresh = edit(face("http://127.0.0.1:45106", "fresh-main"), None);
+        let written = apply_edit(Some(current), "fresh", &fresh, None).expect("保存できること");
+        let after: Value = serde_json::from_str(&written).expect("JSON");
+        assert_eq!(
+            after["fresh"]["main"].get("response_tokens"),
+            None,
+            "新しい名前に他の名前の値が写った: {after}"
+        );
+    }
+
+    /// **`response_tokens` を書いていない面は、A-18a の前と1バイトも違わない形で書く**（ADR-0059 §決定5 の対照）。
+    ///
+    /// いまのファイルの**本文の面には値がある**（3000）—— 裏方の面へ写す実装も、ここで赤になる。
+    /// **期待値は直書き**（検査対象の関数から作らない）。本文の面は値ごと残る。
+    #[test]
+    fn a_face_without_response_tokens_is_written_byte_for_byte_as_before() {
+        let current = r#"{ "only": {
+            "main": { "endpoint": "http://127.0.0.1:44101", "model": "only-main", "response_tokens": 3000 },
+            "sub":  { "endpoint": "http://127.0.0.1:44102", "model": "only-sub" } } }"#;
+        let written = apply_edit(
+            Some(current),
+            "only",
+            &edit(
+                face("http://127.0.0.1:44101", "only-main"),
+                Some(face("http://127.0.0.1:44103", "only-sub-2")),
+            ),
+            None,
+        )
+        .expect("書けること");
+        assert_eq!(
+            written,
+            concat!(
+                "{\n",
+                "  \"only\": {\n",
+                "    \"main\": {\n",
+                "      \"endpoint\": \"http://127.0.0.1:44101\",\n",
+                "      \"model\": \"only-main\",\n",
+                "      \"response_tokens\": 3000\n",
+                "    },\n",
+                "    \"sub\": {\n",
+                "      \"endpoint\": \"http://127.0.0.1:44103\",\n",
+                "      \"model\": \"only-sub-2\"\n",
                 "    }\n",
                 "  }\n",
                 "}\n",

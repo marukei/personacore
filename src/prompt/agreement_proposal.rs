@@ -33,8 +33,10 @@
 //!
 //! **温度とそれ以外のサンプラ**（温度 0.8・`top_k 40`・`top_p 0.95`・`min_p 0.05`・`repeat_penalty 1.1`・
 //! `reasoning_effort none`）は `pc.py` の `TEMPERATURE` / `POLICY` と同じ値で、**裏方の温度
-//! `llm::SUB_LLM_TEMPERATURE` と、全経路に載る `llm::RequestPolicy::PERSONACORE` がそのまま送る**
-//! （写しを作らない）。
+//! `llm::SUB_LLM_TEMPERATURE` と、全経路に載る既定の `llm::RequestPolicy::PERSONACORE` がそのまま送る**
+//! （写しを作らない）。**提案は裏方なので、本文の面に `reasoning_effort` を書いても `none` のまま**
+//! （本文の経路だけが上書きする / ADR-0059 §決定1）。上流プロファイルの面の `repeat_penalty`（ADR-0058）は、
+//! 裏方の面の値（`sub` 面が無ければ本文の面の値）で置き換わる。
 //! **⚠ A-14 で1欄ずれた** —— 本番は `presence_penalty 0` も送るが、`pc.py` の `POLICY` は
 //! 5キーでこの欄を送っていない。**測定の上流（llama-server）の既定は 0 なので、
 //! 実効の差は無いはずである。**

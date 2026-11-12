@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
+use super::config::BodyFace;
 use super::extract::SubContext;
 use super::upstream::{
     CheckOutcome, UpstreamCheck, UpstreamFacts, UpstreamObservation, UpstreamProbe,
@@ -38,7 +39,7 @@ use super::upstream::{
 };
 use crate::llm::{
     ApiKey, ChatRequest, ChatStream, Completion, LlmClient, LlmError, LlmFuture, LmStudioClient,
-    ModelId, Sampling, TokenCount,
+    ModelId, ReasoningEffort, Sampling, TokenCount,
 };
 use crate::measured::ModelFace;
 use crate::prompt::TokenBudget;
@@ -91,10 +92,13 @@ use crate::prompt::TokenBudget;
 /// > **未ロードの回に一覧まで捨てる変異を赤にしていたのは、
 /// > `two_upstreams_are_each_judged_against_their_own_catalogue` ただ1本**
 /// > （レビュアーが実測 / `m19`）。**名指しと、実際に赤にしている者が違っていた。**
+///
+/// **`body` は本文の面に書いた値**（返答の上限が予算の余白になる / ADR-0059 §決定2 —— [`choose_budget`]）。
 pub(crate) async fn resolve_budget(
     explicit: Option<TokenBudget>,
     upstream: &LmStudioClient,
-) -> (TokenBudget, UpstreamProbe) {
+    body: BodyFace,
+) -> (Chosen<TokenBudget>, UpstreamProbe) {
     if explicit.is_some() {
         // **ここだけが「一度も聞いていない」**（照会を行わないので一覧も読み手も無い）。
         // **鍵を平文の `http://` で送る扱いは載せる**（作業単位 A-13b-2）—— IP アドレスの宛先は
@@ -103,7 +107,7 @@ pub(crate) async fn resolve_budget(
             key_over_plain_http: upstream.key_over_plain_http(),
             ..UpstreamProbe::unanswered()
         };
-        return (choose_budget(explicit, None), probe);
+        return (choose_budget(explicit, None, body), probe);
     }
 
     // **同じ1回の往復から3つ読む**（`resolve_sub_context` と同じ形）。
@@ -114,7 +118,7 @@ pub(crate) async fn resolve_budget(
         tracing::info!(error = %err, "上流へコンテキスト長を照会できませんでした");
     }
 
-    (choose_budget(None, probe.context_tokens), probe)
+    (choose_budget(None, probe.context_tokens, body), probe)
 }
 
 /// **上流への照会1回ぶん。** 一覧も読み手も捨てない（作業単位 G-3b）。
@@ -404,30 +408,71 @@ pub(crate) fn choose_sub_context(explicit: Option<SubContext>, queried: Option<u
 ///
 /// `queried` は上流が申告したコンテキスト長。予算として成立しない値
 /// （生成用の余白以下）はここで弾かれ、既定値へ落ちる。
-pub(crate) fn choose_budget(explicit: Option<TokenBudget>, queried: Option<u32>) -> TokenBudget {
+///
+/// # 応答の余白は本文の面の返答の上限（ADR-0059 §決定2 / 作業単位 A-18a）
+///
+/// **`body` の返答の上限（書いていなければ 1024）を余白にする**（[`budget_for_window`]）。上流から取れるのは
+/// コンテキスト全体の長さで、生成用に何を残すかは上流の都合ではない —— **決めるのは本文の面に書いた値**である。
+/// **照会した窓が上限以下なら、既定の 1024 に戻して `warn` を1本出す**（止めない）。
+/// **窓が分からない（照会に失敗した・照会した窓が予算にならない）ときは、落とし所の窓 8192 で既定の 1024 にする**
+/// （面の上限は使わない / [`unknown_window_budget`]）。
+/// 明示の予算（`explicit`）は、組んだ時点で面の上限が入っている（`config::ProfileContext::of` が検証済み）。
+///
+/// **返すのは値と「明示か」・落とし所の窓の印**（[`Chosen`]）—— 器へそのまま渡す。
+pub(crate) fn choose_budget(
+    explicit: Option<TokenBudget>,
+    queried: Option<u32>,
+    body: BodyFace,
+) -> Chosen<TokenBudget> {
+    choose_budget_on(explicit, queried, body, UnknownWindow::Unanswered)
+}
+
+/// **起こす上流で起動したときの本文の予算**（A-18a の再レビュー是正）。
+///
+/// **その面はまだ載っていないので聞いていない**（`App::bind` の `launching_main` の枝 / ADR-0042 §決定3）。
+/// 値は照会に失敗したときと同じ（明示があれば明示、無ければ落とし所の窓 8192 で既定の 1024）だが、
+/// **「窓が分からない」の行は `info`**（[`UnknownWindow::NotYetQueried`]）—— 切り替えの [`install_face`] と同じ扱い。
+/// 載ったら `adopt_face_probe` が窓を採り直す。本当に照会が失敗した起動（外の上流が答えない）は
+/// [`choose_budget`] を通り、今どおり `warn`。
+///
+/// **「取得できなかったため既定値を使います」の行は、ここでも `warn` のまま**（A-18a より前からの振る舞い。触っていない）。
+pub(crate) fn budget_before_launch(
+    explicit: Option<TokenBudget>,
+    body: BodyFace,
+) -> Chosen<TokenBudget> {
+    choose_budget_on(explicit, None, body, UnknownWindow::NotYetQueried)
+}
+
+/// [`choose_budget`] と [`budget_before_launch`] の本体。`occasion` は「窓が分からない」の行の段階だけを決める。
+fn choose_budget_on(
+    explicit: Option<TokenBudget>,
+    queried: Option<u32>,
+    body: BodyFace,
+    occasion: UnknownWindow,
+) -> Chosen<TokenBudget> {
     if let Some(budget) = explicit {
         tracing::info!(
             context_tokens = budget.context_tokens(),
             "コンテキスト長は明示設定を使います"
         );
-        return budget;
+        return Chosen::explicit(budget);
     }
 
-    // **`response_tokens` は既定のまま。** 上流から取れるのはコンテキスト全体の長さで、
-    // 生成用に何を残すかは上流の都合ではない。
-    let usable = queried
-        .and_then(|tokens| TokenBudget::new(tokens, TokenBudget::DEFAULT_RESPONSE_TOKENS).ok());
+    let wanted = body.response_room();
+    let usable = queried.and_then(|tokens| budget_for_window(tokens, wanted));
 
     match usable {
-        Some(budget) => {
+        Some(fitted) => {
+            let budget = fitted.report(wanted);
             tracing::info!(
                 context_tokens = budget.context_tokens(),
                 "上流の実コンテキスト長を使います"
             );
-            budget
+            Chosen::measured(budget)
         }
         None => {
-            let budget = TokenBudget::default();
+            let chosen = unknown_window_budget(body, occasion);
+            let budget = chosen.value();
             // **既定値へ落ちたことは必ず残す。** 黙って落ちると、実際の半分しか
             // 使っていない状態がエラーも出さずに続く（ADR-0013）。
             //
@@ -445,10 +490,130 @@ pub(crate) fn choose_budget(explicit: Option<TokenBudget>, queried: Option<u32>)
                     "上流のコンテキスト長を取得できなかったため既定値を使います"
                 ),
             }
-            budget
+            chosen
         }
     }
 }
+
+/// **窓に、本文の面の返答の上限で予算を組んだ結果**（[`budget_for_window`] / ADR-0059 §決定2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fitted {
+    /// 面の上限（書いていなければ既定の 1024）のまま組めた。
+    Wanted(TokenBudget),
+    /// **窓が面の上限以下だったので、既定の 1024 に戻して組んだ。**
+    FellBack(TokenBudget),
+}
+
+impl Fitted {
+    /// 組んだ予算（ログは出さない）。
+    const fn budget(self) -> TokenBudget {
+        match self {
+            Self::Wanted(budget) | Self::FellBack(budget) => budget,
+        }
+    }
+
+    /// **既定に戻したなら `warn` を1本出し**（[`RESPONSE_FALLBACK_LINE`]）、予算を返す。
+    ///
+    /// **黙って戻さない** —— 思考を入れた面では、短い上限で本文が切れうる（ADR-0059 §決定2）。
+    /// 戻した原因（窓の大きさ）を、書いた上限と並べて言う。
+    fn report(self, wanted: u32) -> TokenBudget {
+        match self {
+            Self::Wanted(budget) => budget,
+            Self::FellBack(budget) => {
+                tracing::warn!(
+                    context_tokens = budget.context_tokens(),
+                    response_tokens_written = wanted,
+                    response_tokens = budget.response_tokens(),
+                    "{RESPONSE_FALLBACK_LINE}"
+                );
+                budget
+            }
+        }
+    }
+}
+
+/// **返答の上限を既定に戻したと言う行**（[`Fitted::report`]）。テストがこの綴りで引く。
+pub(in crate::server) const RESPONSE_FALLBACK_LINE: &str =
+    "窓が本文の返答の上限以下なので、返答の上限を既定に戻します";
+
+/// **窓と、使いたい応答の余白から予算を組む。純粋関数**（ADR-0059 §決定2 / 作業単位 A-18a）。
+///
+/// | 窓 | 返り値 |
+/// |---|---|
+/// | 既定の 1024 以下 | `None`（予算にならない —— **`wanted` が 1024 未満でも**。呼び出し側が今までどおり扱う） |
+/// | 1024 より大きく、`wanted` より大きい | [`Fitted::Wanted`]（面の値のまま） |
+/// | 1024 より大きく、`wanted` 以下 | [`Fitted::FellBack`]（既定の 1024 に戻す） |
+///
+/// **`Some` になるのは、窓が 1024 より大きいときだけ**（`wanted` に依らない）。
+///
+/// # 下限 1024 を面の上限に追従させない（A-18a のレビュー是正）
+///
+/// **照会した窓が 1024 以下なら、面の上限が 1024 未満でも採らない。** この下限は「上流が読み込みの途中に答える
+/// 小さな窓」を予算にしない備えでもある（単体の `a_queried_value_that_cannot_become_a_budget_is_reported` の
+/// 「1024 をロード中」の想定）。面に小さな上限を書いただけでその備えが外れないように、窓の下限は既定の余白で据え置く。
+///
+/// **照会した窓だけがここへ来る**（起動の [`choose_budget`]・照会し直しの [`adopt_refreshed`]）—— 明示の窓は読み込みで
+/// 「上限より大きい」を確かめてあり（`config::ProfileContext::of`）、**窓が分からない（落とし所の窓 8192 を使う）
+/// ときは面の上限を使わない**ので、ここを通さず既定の予算にする（[`choose_budget`] / [`install_face`]）。
+/// **照会し直すたびに同じ判定をやり直す**ので、窓が戻れば面の値に戻る（[`adopt_refreshed`] が `wanted` を毎回
+/// この関数へ渡す）。
+pub(crate) fn budget_for_window(window: u32, wanted: u32) -> Option<Fitted> {
+    if window <= TokenBudget::DEFAULT_RESPONSE_TOKENS {
+        return None;
+    }
+    if let Ok(budget) = TokenBudget::new(window, wanted) {
+        return Some(Fitted::Wanted(budget));
+    }
+    TokenBudget::new(window, TokenBudget::DEFAULT_RESPONSE_TOKENS)
+        .ok()
+        .map(Fitted::FellBack)
+}
+
+/// **窓が分からない（落とし所の窓 8192 を使う）ときの本文の予算**（A-18a のレビュー是正）。
+///
+/// **面の返答の上限は使わず、既定の予算（8192・1024）にする。** 照会に失敗して落とし所の窓で組む面で大きな上限を
+/// 使うと、プロンプトの予算が縮んで削れない枠が収まらず `BudgetExhausted` になりうる（ADR-0059 §決定2 の
+/// 「高い側は遅くなるだけ」は窓が分かっている前提）。**面に上限を書いていれば1行言う**
+/// （[`RESPONSE_UNKNOWN_WINDOW_LINE`]。窓の不足の行 [`RESPONSE_FALLBACK_LINE`] とは別の文面）。
+/// 窓が分かったら（照会が成功したら）面の値に戻る（[`SharedBudget::adopt_window`]）。
+///
+/// | `occasion` | 段階 | 理由 |
+/// |---|---|---|
+/// | [`UnknownWindow::Unanswered`] | `warn` | 照会したが窓が取れなかった（起動 / [`choose_budget`]） |
+/// | [`UnknownWindow::NotYetQueried`] | `info` | まだ聞いていない —— 切り替えた直後（[`install_face`]。外の上流はその場で照会し直す）と、起こす上流での起動（[`budget_before_launch`]。載ったら採り直す） |
+fn unknown_window_budget(body: BodyFace, occasion: UnknownWindow) -> Chosen<TokenBudget> {
+    let budget = TokenBudget::default();
+    if body.response_room() != budget.response_tokens() {
+        match occasion {
+            UnknownWindow::Unanswered => tracing::warn!(
+                context_tokens = budget.context_tokens(),
+                response_tokens_written = body.response_room(),
+                response_tokens = budget.response_tokens(),
+                "{RESPONSE_UNKNOWN_WINDOW_LINE}"
+            ),
+            UnknownWindow::NotYetQueried => tracing::info!(
+                context_tokens = budget.context_tokens(),
+                response_tokens_written = body.response_room(),
+                response_tokens = budget.response_tokens(),
+                "{RESPONSE_UNKNOWN_WINDOW_LINE}"
+            ),
+        }
+    }
+    Chosen::fallback_window(budget)
+}
+
+/// **窓が分からない理由**（[`unknown_window_budget`] の言う段階を決める）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnknownWindow {
+    /// 照会したが、予算になる窓が取れなかった。
+    Unanswered,
+    /// まだ照会していない（切り替えた直後・起こす上流での起動）。
+    NotYetQueried,
+}
+
+/// **窓が分からないので返答の上限を既定にしたと言う行**（[`unknown_window_budget`]）。テストがこの綴りで引く。
+pub(in crate::server) const RESPONSE_UNKNOWN_WINDOW_LINE: &str =
+    "上流のコンテキスト長が分からないので、窓が分かるまで返答の上限を既定にします";
 
 /// **本文の予算の明示を決める**（ADR-0054 §決定2・3 / 作業単位 A-13a-1）。
 ///
@@ -463,9 +628,20 @@ pub(crate) fn choose_budget(explicit: Option<TokenBudget>, queried: Option<u32>)
 ///
 /// **`main.rs` の `warn_on_conflicts` には入れていない**——そちらは起動時にしか走らず、
 /// 切り替えで同じことを言う場所が要る。**言う場所を2つにしない。**
+///
+/// # 環境変数の窓にも、本文の面の返答の上限を余白として載せる（ADR-0059 §決定2 / 作業単位 A-18a）
+///
+/// `environment` は環境変数の窓と既定の余白（1024）で組んだ予算。**面に窓が無く環境変数の窓を使うときだけ、
+/// 余白を `body` の上限に組み直す。** 面に窓があれば `profile` をそのまま使い（組んだ時点で面の上限が入っている）、
+/// **環境変数の窓では組み直さない** —— 使わない予算を組み直すと、環境変数の窓が上限以下のとき「既定に戻します」と
+/// 事実と違う `warn` が出る（A-18a の再レビュー是正）。
+/// 面に窓が無く、環境変数の窓では組み直せない（上限が窓以上）組は `config::ProfileContext::of` が読み込み・切り替えの
+/// 検証で止めているので、ここでは来ない —— **来たら環境変数の予算のまま使い、`warn` を1本出す**
+/// （`unwrap` で「検証済みのはず」に寄りかからない）。
 pub(in crate::server) fn explicit_main_budget(
     environment: Option<TokenBudget>,
     profile: Option<TokenBudget>,
+    body: BodyFace,
 ) -> Option<TokenBudget> {
     if let (Some(from_environment), Some(from_profile)) = (environment, profile)
         && from_environment.context_tokens() != from_profile.context_tokens()
@@ -477,7 +653,21 @@ pub(in crate::server) fn explicit_main_budget(
             "{PROFILE_OVER_ENVIRONMENT}"
         );
     }
-    profile.or(environment)
+    if profile.is_some() {
+        return profile;
+    }
+    environment.map(|from_environment| {
+        TokenBudget::new(from_environment.context_tokens(), body.response_room()).unwrap_or_else(
+            |_| {
+                tracing::warn!(
+                    context_tokens = from_environment.context_tokens(),
+                    response_tokens_written = body.response_room(),
+                    "{RESPONSE_FALLBACK_LINE}"
+                );
+                from_environment
+            },
+        )
+    })
 }
 
 /// **プロファイルが環境変数に勝ったと言う行の本文**（`main.rs` の `warn_on_conflicts` と同じ文面）。
@@ -528,15 +718,40 @@ pub(crate) const REQUERY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 ///
 /// **値と印を同じ錠の中に置く**——別々の器にすると、切り替えが「明示の値と印」を書く途中に
 /// 引き直しの採用が挟まり、**明示の値を照会の答えで上書きする**窓ができる。
-/// **照会の答えを採る口（[`Self::adopt`]）は、印を同じ錠の中で見て断る。**
+/// **照会の答えを採る口（[`Self::adopt_window`]）は、印を同じ錠の中で見て断る。**
+///
+/// # 本文の面の値も同じ錠の中に置く（ADR-0059 §決定1・2 / 作業単位 A-18a）
+///
+/// **本文の面に書いた思考の量と返答の上限（[`BodyFace`]）も、この器が持つ。**
+///
+/// * **返答の上限は、照会し直すたびに要る** —— 照会した窓が上限以下なら予算は既定の 1024 に戻る（`warn`）が、
+///   窓が戻れば面の値に戻す（ADR-0059 §決定2）。いまの予算の余白（戻した後の 1024）からは面の値が読めないので、
+///   書いた値を器に残す。
+/// * **思考の量は、チャットの入口が予算と同じ1回の読みで取る**（[`Self::turn`]）——切り替えの途中で
+///   「新しい予算と古い思考の量」を組まない。
+/// * **裏方はこの器を読まない**（抽出の上限は [`SharedSubContext`]）ので、`sub` 面の無い構成でも本文の値が
+///   裏方へ写らない（ADR-0059 §却下した選択肢）。
 #[derive(Debug, Clone)]
-pub struct SharedBudget(Arc<RwLock<Held<TokenBudget>>>);
+pub struct SharedBudget(Arc<RwLock<MainHeld>>);
+
+/// **本文の器の中身**（予算と「明示か」と、本文の面の値 / [`SharedBudget`] の doc）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MainHeld {
+    budget: Held<TokenBudget>,
+    body: BodyFace,
+}
 
 /// **器の中身**（値と、それが明示かどうか）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Held<T> {
     value: T,
     explicit: bool,
+    /// **窓が分からず、落とし所の窓で組んだ値か**（ADR-0059 §決定2 / A-18a のレビュー是正）。
+    ///
+    /// **本文の器だけが読む**（送る値のログが、返答の上限を既定に戻した理由を「窓の不足」と「窓が分からない」で
+    /// 言い分ける / [`report_samplers`]）。抽出の器では常に `false`。照会で予算になる窓が分かったら外れる
+    /// （[`SharedBudget::adopt_window`]）。
+    fallback_window: bool,
 }
 
 /// **起動時・切り替え時に決めた値と、それが明示かどうか**（作業単位 A-13a-1）。
@@ -552,6 +767,7 @@ impl<T> Chosen<T> {
         Self(Held {
             value,
             explicit: true,
+            fallback_window: false,
         })
     }
 
@@ -560,6 +776,18 @@ impl<T> Chosen<T> {
         Self(Held {
             value,
             explicit: false,
+            fallback_window: false,
+        })
+    }
+
+    /// **窓が分からず、落とし所の窓で組んだ本文の予算**（照会の答えで差し替わる / [`Held::fallback_window`]）。
+    ///
+    /// **作るのは [`choose_budget`] と [`install_face`] の窓が分からない枝だけ。**
+    pub(in crate::server) const fn fallback_window(value: T) -> Self {
+        Self(Held {
+            value,
+            explicit: false,
+            fallback_window: true,
         })
     }
 }
@@ -568,6 +796,11 @@ impl<T: Copy> Chosen<T> {
     /// 値（起動ログに出す）。
     pub(in crate::server) const fn value(self) -> T {
         self.0.value
+    }
+
+    /// **窓が分からず、落とし所の窓で組んだ値か**（[`Held::fallback_window`]）。
+    pub(in crate::server) const fn on_fallback_window(self) -> bool {
+        self.0.fallback_window
     }
 }
 
@@ -592,12 +825,41 @@ impl SharedBudget {
     }
 
     /// **決めた値と「明示か」で作る**（作業単位 A-13a-1）。外から作れないのは [`Self::new`] と同じ。
+    ///
+    /// **本文の面の値は「何も書いていない」で始める**（起動で書いた値は [`PendingRefresh::with_body`] が入れる）。
     fn chosen(chosen: Chosen<TokenBudget>) -> Self {
-        Self(Arc::new(RwLock::new(chosen.0)))
+        Self(Arc::new(RwLock::new(MainHeld {
+            budget: chosen.0,
+            body: BodyFace::default(),
+        })))
+    }
+
+    fn read(&self) -> MainHeld {
+        *self.0.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn held(&self) -> Held<TokenBudget> {
-        *self.0.read().unwrap_or_else(PoisonError::into_inner)
+        self.read().budget
+    }
+
+    /// **本文の面に書いた値**（思考の量と返答の上限 / ADR-0059 / 作業単位 A-18a）。
+    ///
+    /// **予算の余白とは限らない** —— 照会した窓が上限以下なら、予算の余白は既定の 1024（[`budget_for_window`]）。
+    pub(in crate::server) fn body(&self) -> BodyFace {
+        self.read().body
+    }
+
+    /// **1ターンぶんの予算と思考の量を、1回の読みで取る**（`super::chat` の入口 / ADR-0059 §決定1）。
+    ///
+    /// 別々に読むと、間に切り替えが挟まった回だけ「切り替え先の予算と切り替え前の思考の量」で組む。
+    pub(in crate::server) fn turn(&self) -> (TokenBudget, Option<ReasoningEffort>) {
+        let held = self.read();
+        (held.budget.value, held.body.reasoning_effort)
+    }
+
+    /// **起動で決めた本文の面の値を入れる**（[`PendingRefresh::with_body`] だけが呼ぶ。予算は触らない）。
+    fn set_body(&self, body: BodyFace) {
+        self.0.write().unwrap_or_else(PoisonError::into_inner).body = body;
     }
 
     /// 現在の予算。**`TokenBudget` は `Copy` なので錠はその場で手放す。**
@@ -620,19 +882,46 @@ impl SharedBudget {
         held.explicit.then(|| held.value.context_tokens())
     }
 
-    /// **照会の答えを採る。明示なら書かない**（同じ錠の中で見る / この型の doc）。書いたら `true`。
-    fn adopt(&self, budget: TokenBudget) -> bool {
+    /// **照会の答え（窓）を採る。明示なら書かない**（同じ錠の中で見る / この型の doc）。予算を書いたら `true`。
+    ///
+    /// **いまの予算と本文の面の上限も同じ錠の中で読む**（[`adopt_refreshed`] へ渡す）—— 照会の最中に切り替えが
+    /// 挟まっても、切り替え先の面の上限で組む。
+    ///
+    /// **予算になる窓（1024 より大きい / [`budget_for_window`]）が分かったら、落とし所の窓の印を外す** ——
+    /// 予算が同じまま（採らない）でも外す（面の上限が窓以上で、落とし所と同じ既定の予算に戻る回）。
+    fn adopt_window(&self, queried: Option<u32>) -> bool {
         let mut held = self.0.write().unwrap_or_else(PoisonError::into_inner);
-        if held.explicit {
+        if held.budget.explicit {
             return false;
         }
-        held.value = budget;
-        true
+        let wanted = held.body.response_room();
+        let next = adopt_refreshed(held.budget.value, queried, wanted);
+        if queried.is_some_and(|tokens| budget_for_window(tokens, wanted).is_some()) {
+            held.budget.fallback_window = false;
+        }
+        match next {
+            Some(budget) => {
+                held.budget.value = budget;
+                true
+            }
+            None => false,
+        }
     }
 
-    /// **値と「明示か」を丸ごと差し替える**（切り替え / [`install_face`]）。
-    fn install(&self, chosen: Chosen<TokenBudget>) {
-        *self.0.write().unwrap_or_else(PoisonError::into_inner) = chosen.0;
+    /// **いまの予算と「明示か」・落とし所の窓の印**（切り替えの後に送る値を言う / [`report_samplers`]）。
+    pub(in crate::server) fn current(&self) -> Chosen<TokenBudget> {
+        Chosen(self.held())
+    }
+
+    /// **値と「明示か」と本文の面の値を丸ごと差し替える**（切り替え / [`install_face`]）。
+    ///
+    /// **本文の面の値も同じ錠の中で書く**（ADR-0059 §決定1・2）—— 切り替え先の予算と切り替え前の思考の量が
+    /// 1ターンに混ざらない（[`Self::turn`]）。
+    fn install(&self, chosen: Chosen<TokenBudget>, body: BodyFace) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = MainHeld {
+            budget: chosen.0,
+            body,
+        };
     }
 
     /// **テスト専用。** 引き直しが値を差し替えたのと同じ効果を外から起こす。
@@ -645,7 +934,11 @@ impl SharedBudget {
     /// **「明示か」は触らない**（値だけを差し替える）。
     #[cfg(any(test, feature = "testing"))]
     pub fn replace_for_tests(&self, budget: TokenBudget) {
-        self.0.write().unwrap_or_else(PoisonError::into_inner).value = budget;
+        self.0
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .budget
+            .value = budget;
     }
 
     /// **テスト専用。** いまの予算のコンテキスト長（`tests/server_profile_context.rs`）。
@@ -655,6 +948,16 @@ impl SharedBudget {
     #[must_use]
     pub fn tokens_for_tests(&self) -> u32 {
         self.get().context_tokens()
+    }
+
+    /// **テスト専用。** いまの予算の応答の余白（`tests/server_profile_thinking.rs` / ADR-0059 §決定2）。
+    ///
+    /// 本文の要求の `max_tokens` の天井と同じ値のはずだが、**予算そのものに効いたか**はこちらで見る
+    /// （`max_tokens` だけを面の値にして予算を 1024 のままにする実装を赤にする）。
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn response_tokens_for_tests(&self) -> u32 {
+        self.get().response_tokens()
     }
 }
 
@@ -725,7 +1028,7 @@ impl SharedSubContext {
         held.explicit.then(|| held.value.tokens())
     }
 
-    /// **照会の答えを採る。明示なら書かない**（[`SharedBudget::adopt`] と同じ）。書いたら `true`。
+    /// **照会の答えを採る。明示なら書かない**（[`SharedBudget::adopt_window`] と同じ）。書いたら `true`。
     fn adopt(&self, context: SubContext) -> bool {
         let mut held = self.0.write().unwrap_or_else(PoisonError::into_inner);
         if held.explicit {
@@ -1180,6 +1483,16 @@ impl PendingRefresh {
         }
     }
 
+    /// **起動時に選んだプロファイルの、本文の面の値を器へ入れる**（ADR-0059 §決定1・2 / 作業単位 A-18a）。
+    ///
+    /// **予算は触らない**（起動の予算は呼び出し側が同じ `body` で組んで [`Self::new`] へ渡している ——
+    /// [`choose_budget`]）。ここで入れた値を、引き直し（[`adopt_refreshed`]）とチャットの入口（[`SharedBudget::turn`]）が読む。
+    #[must_use]
+    pub(crate) fn with_body(self, body: BodyFace) -> Self {
+        self.budget.set_body(body);
+        self
+    }
+
     /// **照会の口**（作業単位 B-66 / `POST /admin/upstream/check`）。
     ///
     /// **背景タスクが使うのと同じ器・同じ照会先・同じ門**（`Arc` の複製）。`serve` が `spawn` の前に
@@ -1530,7 +1843,7 @@ fn spawn_refresh_every(
 /// > ADR-0020 §4 の根拠は「引いても予算は変わらないのに『変わった』と warn する記録が読み手を惑わす」で、
 /// > **予算に触れず warn も出さない照会はこれと衝突しない**（利用者と決めた / 2026-11-03）。
 ///
-/// **照会の最中に明示へ切り替わったら、採らない**——採用の口（[`SharedBudget::adopt`]）が
+/// **照会の最中に明示へ切り替わったら、採らない**——採用の口（[`SharedBudget::adopt_window`]）が
 /// 同じ錠の中で「明示か」を見て断る。**採るかどうかの検査は観測を書く錠の中で行う**
 /// （入口で読んだ「明示か」を持ち越さない）。
 async fn refresh_once(source: &FaceClient, budget: &SharedBudget, upstream: &SharedUpstream) {
@@ -1583,12 +1896,11 @@ async fn refresh_once(source: &FaceClient, budget: &SharedBudget, upstream: &Sha
         if budget.is_explicit() {
             return;
         }
-        if let Some(next) = adopt_refreshed(current, probe.context_tokens) {
-            // **新しい値は次のプロンプト組立から効く。** 組立中のものには遡らない
-            // （`chat` はリクエストの入口で1回だけ読む）。
-            // **明示なら書かない**（同じ錠の中で見る / [`SharedBudget::adopt`]）。
-            budget.adopt(next);
-        }
+        // **余白は本文の面の上限**（ADR-0059 §決定2 —— 窓が戻れば、既定に戻した余白も面の値に戻る）。
+        // **新しい値は次のプロンプト組立から効く。** 組立中のものには遡らない
+        // （`chat` はリクエストの入口で1回だけ読む）。
+        // **明示なら書かない**（同じ錠の中で見る / [`SharedBudget::adopt_window`]）。
+        budget.adopt_window(probe.context_tokens);
     });
     if !written {
         tracing::info!("引き直しの最中に本文の上流が差し替わったので、この答えは捨てます");
@@ -1931,21 +2243,85 @@ impl FaceClients {
 ///
 /// **小数は `Display` で出す**（`f32` の最短表記＝線の綴り / `llm::SentSamplers` の doc）。
 /// **言えるのは「送った値」まで**で、上流で効いた値ではない（効いた値の権威は上流の側の観測）。
-pub(in crate::server) fn report_samplers(clients: &FaceClients, occasion: &'static str) {
+///
+/// # 思考の量と、本文の返答の上限も言う（ADR-0059 §決定1・2 / 作業単位 A-18a）
+///
+/// **両方の面の行に `reasoning_effort`**（本文は本文の面に書いた値、無ければ `none`。**裏方は常に `none`**）。
+/// **本文の面の行にだけ `response_tokens`**（いまの予算の余白 —— 本文の要求の `max_tokens` の天井）と、
+/// `response_tokens_written`（面に書いた値。無ければ `None`）・`response_tokens_fallback`（既定へ戻したか）・
+/// `response_tokens_fallback_cause`（戻した理由。窓が上限以下 `window_too_small` か、窓が分からない `window_unknown` か。
+/// 戻していなければ `none` / [`response_fallback_of`]）。
+/// 本文の面に書いた `reasoning_effort` は `overridden` にも並ぶ。
+/// `body` と `budget` は本文の予算の器のいまの中身（起動では組んだ予算、切り替えでは差し替えて外の上流をその場で
+/// 照会し直した後の器 —— 起こす上流はまだ載っていないので、窓が分からないまま言う）。
+/// **これも「送る値」まで** —— 思考が上流で効いたかは言わない。
+pub(in crate::server) fn report_samplers(
+    clients: &FaceClients,
+    body: BodyFace,
+    budget: Chosen<TokenBudget>,
+    occasion: &'static str,
+) {
+    let (fallback, cause) = response_fallback_of(body, budget);
+    let budget = budget.value();
     for face in [ModelFace::Main, ModelFace::Sub] {
         let sampling = clients.face(face).sampling();
         let sent = sampling.sent_samplers();
-        tracing::info!(
-            upstream_face = %face.label(),
-            occasion,
-            top_k = sent.top_k(),
-            top_p = %sent.top_p(),
-            min_p = %sent.min_p(),
-            repeat_penalty = %sent.repeat_penalty(),
-            presence_penalty = %sent.presence_penalty(),
-            overridden = ?sampling.overridden(),
-            "{SAMPLERS_LINE}"
-        );
+        let mut overridden = sampling.overridden();
+        match face {
+            ModelFace::Main => {
+                let effort = body.reasoning_effort.unwrap_or(ReasoningEffort::Off);
+                if body.reasoning_effort.is_some() {
+                    overridden.push(crate::server::upstreams::REASONING_EFFORT_KEY);
+                }
+                tracing::info!(
+                    upstream_face = %face.label(),
+                    occasion,
+                    top_k = sent.top_k(),
+                    top_p = %sent.top_p(),
+                    min_p = %sent.min_p(),
+                    repeat_penalty = %sent.repeat_penalty(),
+                    presence_penalty = %sent.presence_penalty(),
+                    reasoning_effort = %effort.as_str(),
+                    response_tokens = budget.response_tokens(),
+                    response_tokens_written = ?body.response_tokens,
+                    response_tokens_fallback = fallback,
+                    response_tokens_fallback_cause = %cause,
+                    overridden = ?overridden,
+                    "{SAMPLERS_LINE}"
+                );
+            }
+            ModelFace::Sub => tracing::info!(
+                upstream_face = %face.label(),
+                occasion,
+                top_k = sent.top_k(),
+                top_p = %sent.top_p(),
+                min_p = %sent.min_p(),
+                repeat_penalty = %sent.repeat_penalty(),
+                presence_penalty = %sent.presence_penalty(),
+                // **裏方は常に既定**（ADR-0059 §決定1 —— 裏方の要求は思考の量を上書きしない）。
+                reasoning_effort = %ReasoningEffort::Off.as_str(),
+                overridden = ?overridden,
+                "{SAMPLERS_LINE}"
+            ),
+        }
+    }
+}
+
+/// **返答の上限を既定に戻したか、戻したならその理由**（[`report_samplers`] の `response_tokens_fallback` と
+/// `response_tokens_fallback_cause` / A-18a のレビュー是正）。**純粋関数。**
+///
+/// | 予算の余白 | 落とし所の窓か | 返り値 |
+/// |---|---|---|
+/// | 面の上限（書いていなければ 1024）と同じ | どちらでも | `(false, "none")` |
+/// | 違う | はい | `(true, "window_unknown")`（窓が分からないので既定にした） |
+/// | 違う | いいえ | `(true, "window_too_small")`（窓が上限以下なので既定に戻した） |
+fn response_fallback_of(body: BodyFace, budget: Chosen<TokenBudget>) -> (bool, &'static str) {
+    if budget.value().response_tokens() == body.response_room() {
+        (false, "none")
+    } else if budget.on_fallback_window() {
+        (true, "window_unknown")
+    } else {
+        (true, "window_too_small")
     }
 }
 
@@ -2027,7 +2403,7 @@ pub(in crate::server) async fn probe_face_while_loading(
 ///
 /// **「明示か」の側にはこの窓が無い**（作業単位 A-13a-1）——値と印は同じ錠の中で
 /// 丸ごと書き（[`SharedBudget::install`]）、引き直しの採用は同じ錠の中で印を見て断る
-/// （[`SharedBudget::adopt`]）。
+/// （[`SharedBudget::adopt_window`]）。
 ///
 /// # 明示の有無と値は、切り替え先に追従する（ADR-0054 §決定3 / 作業単位 A-13a-1）
 ///
@@ -2058,9 +2434,11 @@ pub(in crate::server) fn install_face(
     match face {
         ModelFace::Main => {
             let previous = budget.get();
-            match explicit_main_budget(environment, profile.main) {
+            // **本文の面の思考の量と返答の上限も、切り替え先の面のもの**（ADR-0059 §決定1・2）——予算と同じ錠の中で書く
+            // （[`SharedBudget::install`]）。切り替え前の値を持ち越さない（書いていない面なら既定に戻る）。
+            match explicit_main_budget(environment, profile.main, profile.body) {
                 Some(explicit) => {
-                    budget.install(Chosen::explicit(explicit));
+                    budget.install(Chosen::explicit(explicit), profile.body);
                     tracing::info!(
                         previous_context_tokens = previous.context_tokens(),
                         context_tokens = explicit.context_tokens(),
@@ -2068,11 +2446,16 @@ pub(in crate::server) fn install_face(
                     );
                 }
                 None => {
-                    let fallback = TokenBudget::default();
-                    budget.install(Chosen::measured(fallback));
+                    // **窓はまだ分からないので、落とし所の窓で既定の余白にする**（面の返答の上限は使わない /
+                    // [`unknown_window_budget`] / A-18a のレビュー是正）。器の面の値は切り替え先のものを入れる ——
+                    // 照会し直して窓が分かったら面の上限に戻る（外の上流は切り替えがその場で、起こす上流は載ったときに
+                    // [`adopt_face_probe`] が採る）。
+                    let fallback =
+                        unknown_window_budget(profile.body, UnknownWindow::NotYetQueried);
+                    budget.install(fallback, profile.body);
                     tracing::info!(
                         previous_context_tokens = previous.context_tokens(),
-                        context_tokens = fallback.context_tokens(),
+                        context_tokens = fallback.value().context_tokens(),
                         "本文の上流を差し替えたので、予算を既定値から測り直します"
                     );
                 }
@@ -2143,9 +2526,8 @@ pub(in crate::server) fn adopt_face_probe(
                 // **観測だけ書いて帰る。**
                 return;
             }
-            if let Some(next) = adopt_refreshed(budget.get(), probe.context_tokens) {
-                budget.adopt(next);
-            }
+            // **余白は本文の面の上限**（ADR-0059 §決定2 / [`adopt_refreshed`]）。
+            budget.adopt_window(probe.context_tokens);
         }
         ModelFace::Sub => {
             if sub_context.is_explicit() {
@@ -2198,35 +2580,65 @@ fn adopt_refreshed_sub(current: SubContext, queried: Option<u32>) -> Option<SubC
 /// | `queried` | 返り値 | ログ |
 /// |---|---|---|
 /// | `None`（照会に失敗） | `None`（現在値を保つ） | 呼び出し側が `info` |
-/// | 現在値と同じ | `None` | **出さない**（5分ごとに鳴らせない） |
+/// | 組んだ予算が現在値と同じ（窓が同じで予算にならない回も） | `None` | **出さない**（5分ごとに鳴らせない） |
 /// | 予算にならない | `None`（現在値を保つ） | `warn`（保ったことを告げる） |
-/// | 変わった | `Some(新しい予算)` | `warn`（前後の値を並べる） |
+/// | 窓が変わった | `Some(新しい予算)` | `warn`（前後の値を並べる） |
+/// | 窓は同じで余白だけが変わる（落とし所の窓と同じ窓が分かった回 / A-18a のレビュー是正） | `Some(新しい予算)` | `info`（前後の余白を並べる） |
 ///
 /// **黙って予算だけ変えない。** 変えると「昨日と同じ発言が今日は `BudgetExhausted`」の
 /// 理由が追えない。
-fn adopt_refreshed(current: TokenBudget, queried: Option<u32>) -> Option<TokenBudget> {
+///
+/// # 応答の余白は「いまの余白」ではなく、本文の面に書いた上限（ADR-0059 §決定2 / 作業単位 A-18a）
+///
+/// **`wanted` は本文の面の返答の上限**（[`SharedBudget::body`]。書いていなければ 1024）。**いまの予算の余白を
+/// 引き継がない** —— 小さい窓で既定の 1024 に戻した後、窓が戻ったら面の値に戻すため（[`budget_for_window`] が
+/// 毎回判定し直す。戻すときは `warn` を1本）。
+///
+/// **受容している穴（A-18a の再レビュー）:** 落とし所 (8192, 1024) の後に照会した窓がちょうど 8192 で、面の上限が
+/// 8192 以上だと、組んだ予算も (8192, 1024) で同じなので早期 return し、**窓の不足の行（[`RESPONSE_FALLBACK_LINE`]）は
+/// 出ない**（値は正しい。器の落とし所の印は [`SharedBudget::adopt_window`] が外す）。
+fn adopt_refreshed(current: TokenBudget, queried: Option<u32>, wanted: u32) -> Option<TokenBudget> {
     let tokens = queried?;
 
-    if tokens == current.context_tokens() {
+    // **同じかどうかは、窓の数ではなく組んだ予算で比べる**（A-18a のレビュー是正）—— 窓が分からず落とし所の窓
+    // 8192・既定の余白で組んだ後に、照会した窓が同じ 8192 だった回も、面の上限で組み直す。
+    let fitted = budget_for_window(tokens, wanted);
+    if tokens == current.context_tokens() && fitted.is_none_or(|fitted| fitted.budget() == current)
+    {
         return None;
     }
 
-    // **生成用の余白は現在の値を引き継ぐ。** 上流から取れるのはコンテキスト全体の
+    // **生成用の余白は本文の面の上限。** 上流から取れるのはコンテキスト全体の
     // 長さで、生成用に何を残すかは上流の都合ではない（`choose_budget` と同じ理屈）。
-    match TokenBudget::new(tokens, current.response_tokens()) {
-        Ok(next) => {
-            tracing::warn!(
-                previous_context_tokens = current.context_tokens(),
-                context_tokens = next.context_tokens(),
-                "上流のコンテキスト長が変わりました。次のプロンプト組立から新しい予算を使います"
-            );
+    match fitted {
+        Some(fitted) => {
+            let next = fitted.report(wanted);
+            if tokens == current.context_tokens() {
+                // **窓は同じで、余白だけが変わる**（落とし所の窓と同じ窓を照会できた回）。「変わりました」とは言わない。
+                tracing::info!(
+                    context_tokens = next.context_tokens(),
+                    previous_response_tokens = current.response_tokens(),
+                    response_tokens = next.response_tokens(),
+                    "上流のコンテキスト長が分かったので、本文の返答の上限で予算を組み直します"
+                );
+            } else {
+                tracing::warn!(
+                    previous_context_tokens = current.context_tokens(),
+                    context_tokens = next.context_tokens(),
+                    previous_response_tokens = current.response_tokens(),
+                    response_tokens = next.response_tokens(),
+                    "上流のコンテキスト長が変わりました。次のプロンプト組立から新しい予算を使います"
+                );
+            }
             Some(next)
         }
-        Err(err) => {
+        None => {
             // **採用しないことを告げる文言に割る。**「変わりました」とだけ言うと、
             // 予算が追随したのかしなかったのかが読み手に伝わらない。
+            // **理由は既定の余白で組んだときの断り**（`None` のとき、既定の余白でも必ず組めない / [`budget_for_window`]）。
+            let error = TokenBudget::new(tokens, TokenBudget::DEFAULT_RESPONSE_TOKENS).err();
             tracing::warn!(
-                error = %err,
+                error = ?error,
                 queried = tokens,
                 context_tokens = current.context_tokens(),
                 "上流が申告したコンテキスト長は予算になりません。現在の値を保ちます"
@@ -2293,6 +2705,38 @@ mod tests {
     fn budget_of(context_tokens: u32) -> TokenBudget {
         TokenBudget::new(context_tokens, TokenBudget::DEFAULT_RESPONSE_TOKENS)
             .expect("テストで使う予算は正当であること")
+    }
+
+    // ------------------------------------------------------------------
+    // **本文の面に何も書いていない呼び方**（作業単位 A-18a より前の呼び方）。
+    //
+    // A-18a で予算を組む関数は本文の面の値（`BodyFace`）を受けるようになった。**このモジュールの既存の
+    // テストは「何も書いていない面」の振る舞いを見ている**ので、同じ名前の薄い口で既定の面を渡す
+    // （グロブで取り込んだ `super::*` の同名の関数より、このモジュールの定義が勝つ）。
+    // **書いた面の腕は、`super::` を直に呼ぶ**（`a18a_` で始まるテスト）。
+    // ------------------------------------------------------------------
+
+    fn choose_budget(explicit: Option<TokenBudget>, queried: Option<u32>) -> TokenBudget {
+        super::choose_budget(explicit, queried, BodyFace::default()).value()
+    }
+
+    async fn resolve_budget(
+        explicit: Option<TokenBudget>,
+        upstream: &LmStudioClient,
+    ) -> (TokenBudget, UpstreamProbe) {
+        let (chosen, probe) = super::resolve_budget(explicit, upstream, BodyFace::default()).await;
+        (chosen.value(), probe)
+    }
+
+    fn adopt_refreshed(current: TokenBudget, queried: Option<u32>) -> Option<TokenBudget> {
+        super::adopt_refreshed(current, queried, TokenBudget::DEFAULT_RESPONSE_TOKENS)
+    }
+
+    fn explicit_main_budget(
+        environment: Option<TokenBudget>,
+        profile: Option<TokenBudget>,
+    ) -> Option<TokenBudget> {
+        super::explicit_main_budget(environment, profile, BodyFace::default())
     }
 
     /// 実機と同じ形の応答本文。
@@ -2919,7 +3363,20 @@ mod tests {
     ///
     /// 既定値のままだと「現在値から引き継いだ」と「既定値を置いた」が同値になり、
     /// **引き継ぎを捨てる変異が緑を通る**（このプロジェクト最頻の穴）。
+    ///
+    /// **A-18a から、引き直しが使う余白の出どころは「いまの予算の余白」ではなく「本文の面の上限」**
+    /// （ADR-0059 §決定2 —— 小さい窓で既定へ戻した後、窓が戻れば面の値に戻すため）。本番では2つは同じ値で
+    /// 入る（器を作るときに同じ値で組む）ので、この値を使うテストは器に**同じ値を面の上限として**入れる
+    /// （[`carried_body`]）。
     const CARRIED_RESPONSE_TOKENS: u32 = 2_048;
+
+    /// **[`CARRIED_RESPONSE_TOKENS`] を本文の面の上限として書いた形**（作業単位 A-18a）。
+    fn carried_body() -> BodyFace {
+        BodyFace {
+            reasoning_effort: None,
+            response_tokens: Some(CARRIED_RESPONSE_TOKENS),
+        }
+    }
 
     /// 余白が**既定値と別**の予算。引き継ぎを見る側のフィクスチャはこれを使う。
     ///
@@ -3237,6 +3694,8 @@ mod tests {
     async fn a_changed_upstream_value_replaces_the_shared_budget() {
         let server = upstream_answering(&[LOADED, RELOADED]).await;
         let shared = SharedBudget::new(carried_budget(LOADED));
+        // **本番と同じく、余白と同じ値を面の上限として器に入れる**（[`CARRIED_RESPONSE_TOKENS`] の doc / A-18a）。
+        shared.set_body(carried_body());
 
         let task =
             spawn_main_refresh_every(Some(source_for(&server)), shared.clone(), SHORT_INTERVAL);
@@ -3758,6 +4217,7 @@ mod tests {
                 super::super::config::ProfileContext {
                     main: profile.map(budget_of),
                     sub: None,
+                    body: BodyFace::default(),
                 },
             );
 
@@ -4313,7 +4773,7 @@ mod tests {
         );
 
         // 終段: 明示が外れたら（切り替え）、同じタスクが引き直し始める。
-        shared.install(Chosen::measured(budget_of(CONFIGURED)));
+        shared.install(Chosen::measured(budget_of(CONFIGURED)), BodyFace::default());
         wait_for_budget(&shared, RELOADED).await;
 
         drop(task);
@@ -4368,7 +4828,7 @@ mod tests {
         drop(task);
     }
 
-    /// **照会の最中に明示へ切り替わったら、その答えを採らない**（[`SharedBudget::adopt`] / 作業単位 A-13a-1）。
+    /// **照会の最中に明示へ切り替わったら、その答えを採らない**（[`SharedBudget::adopt_window`] / 作業単位 A-13a-1）。
     ///
     /// **引き直しの入口の検査は「照会しない」ためのもの**で、照会が始まった後に明示へ変わる窓は
     /// 採用の口が同じ錠の中で塞ぐ。**遅い上流**（500 ms）への照会の最中に明示を入れ、
@@ -4395,7 +4855,7 @@ mod tests {
             tokio::spawn(async move { refresh_once(&source, &budget, &upstream).await })
         };
         wait_for_queries(&server, 1).await;
-        budget.install(Chosen::explicit(budget_of(CONFIGURED)));
+        budget.install(Chosen::explicit(budget_of(CONFIGURED)), BodyFace::default());
         refresh.await.expect("引き直しが落ちていないこと");
 
         assert_eq!(
@@ -4667,14 +5127,16 @@ mod tests {
 
     /// **変わったら `warn`。新しい予算を返す**（ADR-0020 §5）。
     ///
-    /// 生成用の余白は**現在の値を引き継ぐ**（既定値に潰さない）。
+    /// 生成用の余白は**本文の面の上限を引き継ぐ**（既定値に潰さない）。A-18a までは「いまの予算の余白」を
+    /// 引き継いでいた —— 本番では同じ値なので、ここでは同じ値を面の上限として渡す（[`CARRIED_RESPONSE_TOKENS`] の doc）。
     #[test]
     fn a_changed_context_length_is_adopted_and_warned() {
         // 前提（余白が既定値と別であること）は `carried_budget` の入口が確かめる。
         let current = carried_budget(LOADED);
 
         let output = captured_under_default_filter(|| {
-            let adopted = adopt_refreshed(current, Some(RELOADED));
+            let adopted =
+                super::adopt_refreshed(current, Some(RELOADED), carried_body().response_room());
             assert_eq!(
                 adopted,
                 Some(carried_budget(RELOADED)),
@@ -4818,14 +5280,14 @@ mod tests {
     #[test]
     fn an_explicit_value_refuses_what_a_query_answers() {
         let explicit = SharedBudget::chosen(Chosen::explicit(budget_of(CONFIGURED)));
-        assert!(!explicit.adopt(budget_of(RELOADED)), "明示なのに採った");
+        assert!(!explicit.adopt_window(Some(RELOADED)), "明示なのに採った");
         assert_eq!(
             (explicit.get().context_tokens(), explicit.explicit_tokens()),
             (CONFIGURED, Some(CONFIGURED))
         );
         let measured = SharedBudget::chosen(Chosen::measured(budget_of(CONFIGURED)));
         assert!(
-            measured.adopt(budget_of(RELOADED)),
+            measured.adopt_window(Some(RELOADED)),
             "明示でないのに採らない"
         );
         assert_eq!(
@@ -5817,5 +6279,404 @@ mod tests {
             Some("WARN"),
             "対照: 抽出の明示ではない面は今のまま警告であること: {queried_sub:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // 本文の面の返答の上限（ADR-0059 §決定2 / 作業単位 A-18a）
+    // ------------------------------------------------------------------
+
+    /// **本文の面に返答の上限だけを書いた形**（思考の量は書かない）。
+    fn a18a_room(room: u32) -> BodyFace {
+        BodyFace {
+            reasoning_effort: None,
+            response_tokens: Some(room),
+        }
+    }
+
+    /// **窓と面の上限から予算を組む表**（[`budget_for_window`] の doc の表 / ADR-0059 §決定2）。
+    ///
+    /// **期待値は手で書く**（`TokenBudget::DEFAULT_RESPONSE_TOKENS` から作らない —— 1024 を書く）。
+    #[test]
+    fn a18a_the_window_carries_the_faces_room_or_falls_back_to_the_default() {
+        let budget = |context: u32, response: u32| {
+            TokenBudget::new(context, response).expect("期待値の予算は組めること")
+        };
+        for (window, wanted, expected) in [
+            (16_384, 2_048, Some(Fitted::Wanted(budget(16_384, 2_048)))),
+            (2_049, 2_048, Some(Fitted::Wanted(budget(2_049, 2_048)))),
+            (2_048, 2_048, Some(Fitted::FellBack(budget(2_048, 1_024)))),
+            (1_025, 2_048, Some(Fitted::FellBack(budget(1_025, 1_024)))),
+            (1_024, 2_048, None),
+            (16_384, 1_024, Some(Fitted::Wanted(budget(16_384, 1_024)))),
+            (1_024, 1_024, None),
+            // **照会した窓の下限 1024 は、面の上限が 1024 未満でも残す**（読み込み中の偽の小さな窓への備え /
+            // レビュー是正）。
+            (900, 512, None),
+            (1_024, 512, None),
+            (1_025, 512, Some(Fitted::Wanted(budget(1_025, 512)))),
+            (1_025, 1_024, Some(Fitted::Wanted(budget(1_025, 1_024)))),
+            (512, 512, None),
+        ] {
+            assert_eq!(
+                budget_for_window(window, wanted),
+                expected,
+                "{window} / {wanted}"
+            );
+        }
+    }
+
+    /// **照会した窓に面の上限を載せ、窓が上限以下なら既定の 1024 に戻して `warn` を1本出す**
+    /// （ADR-0059 §決定2 の「照会した窓が `response_tokens` 以下だったとき」/ 腕6の単体の側）。
+    ///
+    /// | 腕 | 窓 | 余白 | `warn` |
+    /// |---|---|---|---|
+    /// | 窓が十分 | 16384 | **2048**（面の値） | 出さない |
+    /// | 窓が上限以下 | 2048 | **1024**（既定へ戻す） | **出す**（同じ行に窓・書いた上限・戻した余白） |
+    /// | 照会できない | 既定の 8192 | **1024**（窓が分からないので面の値を使わない / レビュー是正） | **窓が分からないと言う行**を出す（窓の不足の行は出さない） |
+    /// | 照会した窓が予算にならない（900） | 既定の 8192 | **1024**（同上） | 同上 |
+    /// | 明示の予算 | 組んだまま | 組んだまま | 出さない |
+    ///
+    /// **落とし所の窓かどうか**（[`Chosen::on_fallback_window`]）も見る —— 送る値のログが、既定に戻した理由を
+    /// 言い分けるのに使う。
+    #[test]
+    fn a18a_choose_budget_puts_the_faces_room_on_the_queried_window_and_warns_on_falling_back() {
+        let roomy = captured_under_default_filter(|| {
+            let chosen = super::choose_budget(None, Some(16_384), a18a_room(2_048));
+            let budget = chosen.value();
+            assert_eq!(
+                (
+                    budget.context_tokens(),
+                    budget.response_tokens(),
+                    chosen.on_fallback_window()
+                ),
+                (16_384, 2_048, false)
+            );
+        });
+        assert!(
+            !roomy.contains(RESPONSE_FALLBACK_LINE),
+            "窓が十分なのに戻したと言った: {roomy}"
+        );
+        assert!(!roomy.contains(RESPONSE_UNKNOWN_WINDOW_LINE), "{roomy}");
+
+        let narrow = captured_under_default_filter(|| {
+            let chosen = super::choose_budget(None, Some(2_048), a18a_room(2_048));
+            let budget = chosen.value();
+            assert_eq!(
+                (
+                    budget.context_tokens(),
+                    budget.response_tokens(),
+                    chosen.on_fallback_window()
+                ),
+                (2_048, 1_024, false),
+                "窓が上限以下なら既定の 1024 に戻すこと（窓は分かっている）"
+            );
+        });
+        assert!(!narrow.contains(RESPONSE_UNKNOWN_WINDOW_LINE), "{narrow}");
+        let line = line_containing(&narrow, RESPONSE_FALLBACK_LINE);
+        assert!(
+            line.contains("WARN"),
+            "既定のフィルタで見える警告であること: {line}"
+        );
+        for field in [
+            "context_tokens=2048",
+            "response_tokens_written=2048",
+            "response_tokens=1024",
+        ] {
+            assert!(has_field(line, field), "{field} を同じ行で言うこと: {line}");
+        }
+
+        // **窓が分からない**（照会に失敗した / 照会した窓が予算にならない）—— 落とし所の窓 8192 で組み、
+        // **面の上限は使わない**（使うとプロンプトの予算が縮んで削れない枠が収まらなくなりうる / レビュー是正）。
+        for queried in [None, Some(900)] {
+            let unanswered = captured_under_default_filter(|| {
+                let chosen = super::choose_budget(None, queried, a18a_room(2_048));
+                let budget = chosen.value();
+                assert_eq!(
+                    (
+                        budget.context_tokens(),
+                        budget.response_tokens(),
+                        chosen.on_fallback_window()
+                    ),
+                    (8_192, 1_024, true),
+                    "{queried:?}: 窓が分からないなら既定の 1024 にすること"
+                );
+            });
+            assert!(
+                !unanswered.contains(RESPONSE_FALLBACK_LINE),
+                "{queried:?}: 窓の不足と言った: {unanswered}"
+            );
+            let line = line_containing(&unanswered, RESPONSE_UNKNOWN_WINDOW_LINE);
+            assert!(line.contains("WARN"), "{queried:?}: {line}");
+            for field in ["response_tokens_written=2048", "response_tokens=1024"] {
+                assert!(
+                    has_field(line, field),
+                    "{queried:?}: {field} を同じ行で言うこと: {line}"
+                );
+            }
+        }
+        // **対照**: 面に何も書いていなければ、窓が分からなくても「戻した」とは言わない（もともと 1024）。
+        let plain = captured_under_default_filter(|| {
+            let chosen = super::choose_budget(None, None, BodyFace::default());
+            assert_eq!(chosen.value(), TokenBudget::default());
+        });
+        assert!(!plain.contains(RESPONSE_UNKNOWN_WINDOW_LINE), "{plain}");
+
+        let explicit = TokenBudget::new(30_000, 3_000).expect("組めること");
+        let chosen = super::choose_budget(Some(explicit), Some(2_048), a18a_room(2_048));
+        assert_eq!(
+            (chosen.value(), chosen.on_fallback_window()),
+            (explicit, false),
+            "明示の予算は組んだまま使うこと"
+        );
+    }
+
+    /// **起こす上流で起動したときは、まだ聞いていないだけなので「窓が分からない」は `info`**
+    /// （A-18a の再レビュー是正 / [`super::budget_before_launch`]）。照会したが窓が取れなかった起動
+    /// （[`super::choose_budget`]）は今どおり `warn` —— 同じ入力で段階だけが割れることを1本で見る。
+    #[test]
+    fn a18a_a_launch_has_not_asked_yet_so_the_unknown_window_is_info() {
+        let launching = captured_under_default_filter(|| {
+            let chosen = super::budget_before_launch(None, a18a_room(2_048));
+            assert_eq!(
+                (chosen.value(), chosen.on_fallback_window()),
+                (TokenBudget::default(), true),
+                "起こす上流の起動も、落とし所の窓で既定の 1024"
+            );
+        });
+        let line = line_containing(&launching, RESPONSE_UNKNOWN_WINDOW_LINE);
+        assert!(line.contains("INFO"), "まだ聞いていないだけ: {line}");
+        assert!(!line.contains("WARN"), "{line}");
+        assert!(has_field(line, "response_tokens_written=2048"), "{line}");
+
+        let unanswered = captured_under_default_filter(|| {
+            super::choose_budget(None, None, a18a_room(2_048));
+        });
+        let line = line_containing(&unanswered, RESPONSE_UNKNOWN_WINDOW_LINE);
+        assert!(
+            line.contains("WARN"),
+            "対照: 照会したが取れなかった: {line}"
+        );
+
+        let explicit = TokenBudget::new(30_000, 3_000).expect("組めること");
+        let chosen = super::budget_before_launch(Some(explicit), a18a_room(3_000));
+        assert_eq!(
+            (chosen.value(), chosen.on_fallback_window()),
+            (explicit, false),
+            "明示の予算は組んだまま使うこと"
+        );
+    }
+
+    /// **落とし所の窓で既定の 1024 にした後、照会が成功したら面の値に戻る** —— 照会した窓が落とし所と同じ 8192 でも
+    /// （窓の数だけを比べて「同じだから採らない」と言う実装を赤にする / レビュー是正）。
+    ///
+    /// 器の側も見る: **落とし所の窓の印**（送る値のログが理由を言い分ける）は、予算になる窓を照会できたら外れる ——
+    /// 予算が同じまま（面の上限が 8192 以上で、窓 8192 では既定に戻る）でも外れる。
+    #[test]
+    fn a18a_a_known_window_after_the_fallback_window_restores_the_faces_room() {
+        let restored = super::adopt_refreshed(TokenBudget::default(), Some(8_192), 2_048)
+            .expect("窓が分かったので面の上限で組み直すこと");
+        assert_eq!(
+            (restored.context_tokens(), restored.response_tokens()),
+            (8_192, 2_048)
+        );
+        assert_eq!(
+            super::adopt_refreshed(TokenBudget::default(), Some(8_192), 1_024),
+            None,
+            "対照: 同じ予算なら採らない（5分ごとに鳴らさない）"
+        );
+
+        let shared = SharedBudget::chosen(Chosen::fallback_window(TokenBudget::default()));
+        shared.set_body(a18a_room(2_048));
+        assert!(shared.current().on_fallback_window(), "前提");
+        assert!(!shared.adopt_window(None), "照会に失敗したら採らない");
+        assert!(
+            shared.current().on_fallback_window(),
+            "照会に失敗したら印は残る"
+        );
+        assert!(
+            !shared.adopt_window(Some(900)),
+            "予算にならない窓は採らない"
+        );
+        assert!(
+            shared.current().on_fallback_window(),
+            "予算にならない窓では印は残る"
+        );
+        assert!(shared.adopt_window(Some(8_192)), "窓が分かったら採る");
+        assert_eq!(
+            (
+                shared.get().response_tokens(),
+                shared.current().on_fallback_window()
+            ),
+            (2_048, false)
+        );
+
+        let wide = SharedBudget::chosen(Chosen::fallback_window(TokenBudget::default()));
+        wide.set_body(a18a_room(9_000));
+        assert!(
+            !wide.adopt_window(Some(8_192)),
+            "前提: 窓 8192 では上限 9000 は既定に戻る＝予算は同じ"
+        );
+        assert!(
+            !wide.current().on_fallback_window(),
+            "予算が同じでも、窓が分かったら印は外れる（理由は窓の不足になる）"
+        );
+    }
+
+    /// **引き直しの余白は「いまの余白」ではなく面の上限** —— 小さい窓で既定へ戻した後、窓が戻れば面の値に戻る
+    /// （ADR-0059 §決定2 の「5分ごとの照会し直しで窓が変われば、同じ判定をやり直す」）。
+    ///
+    /// **いまの予算の余白（1024）を引き継ぐ実装は、戻る腕で赤になる。** 対照: 面に何も書いていなければ 1024 のまま。
+    #[test]
+    fn a18a_requery_restores_the_faces_room_when_the_window_grows_back() {
+        let fell_back = TokenBudget::new(2_048, 1_024).expect("組めること");
+        let restored = super::adopt_refreshed(fell_back, Some(16_384), 2_048)
+            .expect("窓が変わったので新しい予算を採ること");
+        assert_eq!(
+            (restored.context_tokens(), restored.response_tokens()),
+            (16_384, 2_048),
+            "窓が戻ったら面の上限に戻すこと"
+        );
+
+        let shrunk = super::adopt_refreshed(restored, Some(2_048), 2_048)
+            .expect("窓が変わったので新しい予算を採ること");
+        assert_eq!(
+            (shrunk.context_tokens(), shrunk.response_tokens()),
+            (2_048, 1_024),
+            "窓が上限以下へ縮んだら既定へ戻すこと"
+        );
+
+        let plain = super::adopt_refreshed(fell_back, Some(16_384), 1_024)
+            .expect("窓が変わったので新しい予算を採ること");
+        assert_eq!(
+            plain.response_tokens(),
+            1_024,
+            "対照: 書いていなければ 1024"
+        );
+    }
+
+    /// **環境変数の窓を使うときも、余白は本文の面の上限**（ADR-0059 §決定2 / [`super::explicit_main_budget`]）。
+    ///
+    /// 面に窓があれば面の予算をそのまま使う（組んだ時点で上限が入っている）。
+    #[test]
+    fn a18a_the_environment_window_carries_the_faces_room() {
+        let environment = budget_of(12_288);
+        let from_environment =
+            super::explicit_main_budget(Some(environment), None, a18a_room(3_000))
+                .expect("環境変数の窓があること");
+        assert_eq!(
+            (
+                from_environment.context_tokens(),
+                from_environment.response_tokens()
+            ),
+            (12_288, 3_000)
+        );
+        let profile = TokenBudget::new(30_000, 3_000).expect("組めること");
+        assert_eq!(
+            super::explicit_main_budget(Some(environment), Some(profile), a18a_room(3_000)),
+            Some(profile),
+            "面の窓が勝つこと"
+        );
+        assert_eq!(
+            super::explicit_main_budget(Some(environment), None, BodyFace::default()),
+            Some(environment),
+            "対照: 書いていなければ環境変数の予算のまま"
+        );
+
+        // **面の窓があるときは、環境変数の窓で組み直さない**（A-18a の再レビュー是正）—— 環境変数の窓（2048）が面の上限
+        // （3000）以下でも、使うのは面の予算なので、「既定に戻します」とは言わない（言うと事実と違う）。
+        let small_environment = budget_of(2_048);
+        let profile = TokenBudget::new(8_192, 3_000).expect("組めること");
+        let output = captured_under_default_filter(|| {
+            assert_eq!(
+                super::explicit_main_budget(
+                    Some(small_environment),
+                    Some(profile),
+                    a18a_room(3_000)
+                ),
+                Some(profile),
+                "面の窓が勝つこと"
+            );
+        });
+        assert!(
+            !output.contains(RESPONSE_FALLBACK_LINE),
+            "面の予算を使うのに、既定に戻すと言った: {output}"
+        );
+        // **対照: 面に窓が無ければ、同じ環境変数の窓では組めないので戻すと言う**（防御の枝。読み込みは止めている）。
+        let output = captured_under_default_filter(|| {
+            assert_eq!(
+                super::explicit_main_budget(Some(small_environment), None, a18a_room(3_000)),
+                Some(small_environment),
+                "組めなければ環境変数の予算のまま"
+            );
+        });
+        let line = line_containing(&output, RESPONSE_FALLBACK_LINE);
+        assert!(line.contains("WARN"), "{line}");
+    }
+
+    /// **切り替えで、本文の面の値も予算と一緒に差し替わり、持ち越さない**（ADR-0059 §決定1・2 / [`install_face`]）。
+    ///
+    /// 1. 面の上限と思考の量を書いたプロファイルへ（窓なし）→ 落とし所の窓 8192 で、**余白は既定の 1024**
+    ///    （窓がまだ分からないので面の上限を使わない / レビュー是正）。思考は `low`、器の面の値は書いたもの。
+    ///    **窓を照会できたら面の上限 2048 に戻る**（[`SharedBudget::adopt_window`]）。
+    /// 2. 何も書いていないプロファイルへ → 1024・`None` に戻る。
+    #[test]
+    fn a18a_switching_installs_the_body_face_with_the_budget() {
+        use crate::llm::ReasoningEffort;
+
+        let base_url = "http://127.0.0.1:9";
+        let client = Arc::new(client_for(base_url));
+        let clients = FaceClients::new(Arc::clone(&client), Arc::clone(&client));
+        let pending = PendingRefresh::new(
+            Chosen::measured(budget_of(LOADED)),
+            None,
+            Chosen::measured(SubContext::FALLBACK),
+            None,
+            upstream_facts(),
+            CheckAtStart::NONE,
+        );
+        let budget = pending.shared();
+        let sub_context = pending.sub_context();
+        let upstream = pending.upstream();
+        let thinking = BodyFace {
+            reasoning_effort: Some(ReasoningEffort::Low),
+            response_tokens: Some(2_048),
+        };
+        for (body, expected_after_query, expected_effort) in [
+            (thinking, 2_048, Some(ReasoningEffort::Low)),
+            (BodyFace::default(), 1_024, None),
+        ] {
+            install_face(
+                &clients,
+                ModelFace::Main,
+                clients.face(ModelFace::Main).as_candidate(),
+                &budget,
+                &sub_context,
+                &upstream,
+                None,
+                super::super::config::ProfileContext {
+                    main: None,
+                    sub: None,
+                    body,
+                },
+            );
+            let (now, effort) = budget.turn();
+            assert_eq!(
+                (now.context_tokens(), now.response_tokens(), effort),
+                (8_192, 1_024, expected_effort),
+                "{body:?}: 窓が分からない間は既定の 1024"
+            );
+            assert_eq!(budget.body(), body, "{body:?}");
+            assert!(budget.current().on_fallback_window(), "{body:?}");
+
+            budget.adopt_window(Some(16_384));
+            assert_eq!(
+                (
+                    budget.get().context_tokens(),
+                    budget.get().response_tokens()
+                ),
+                (16_384, expected_after_query),
+                "{body:?}: 窓が分かったら面の上限"
+            );
+        }
     }
 }

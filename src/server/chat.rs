@@ -219,7 +219,9 @@ pub(super) async fn chat_completions(
     // 組立・中継・答え合わせで読み直すと、ちょうど差し替わった回だけ
     // 「組んだときの予算」と「照合に使う予算」が食い違う。
     // **新しい値は次のリクエストの組立から効く**（組立中のものには遡らない）。
-    let budget = state.budget();
+    // **本文の面の思考の量も同じ1回の読みで取る**（ADR-0059 §決定1）。予算の余白は本文の面の返答の上限
+    // （窓が小さければ既定の 1024 / ADR-0059 §決定2）で、下の `max_tokens` の天井にもなる。
+    let (budget, reasoning_effort) = state.budget();
 
     // 2. **`max_tokens: 0` は入口で拒否する。** `cap_max_tokens` は上限を切り下げる
     //    関数なので 0 を素通しし、そのまま上流へ「1トークンも生成するな」と送ってしまう。
@@ -363,6 +365,8 @@ pub(super) async fn chat_completions(
             streaming,
             temperature: request.temperature,
             max_tokens,
+            // **本文の経路だけが思考の量を載せる**（ADR-0059 §決定1 —— 封と送信の本文の両方に載る）。
+            reasoning_effort,
         },
         &PromptInput {
             character: &character,
