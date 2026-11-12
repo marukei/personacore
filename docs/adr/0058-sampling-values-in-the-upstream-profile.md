@@ -115,7 +115,7 @@
 
 - **編集の依頼が `sampling` を送らなければ、保存はいまのファイルの、同じ名前・同じ面の `sampling` を残す。** 画面に欄が無いあいだも、手で書いた値は画面から別の欄を直しても消えない。~~この作業単位では依頼の型（`WrittenFaceRequest`）に `sampling` を足さない。依頼の型は知らない欄を拒む（`deny_unknown_fields`）ので、依頼が `sampling` を送ることはなく、「送らなければ残す」が常に当たる。~~ → 依頼の型に `sampling` を任意の欄として足し、省けば残す・`null` で消す・値で置き換える（[ADR-0060](0060-sampling-and-response-room-on-the-screen.md) §決定2）。「送らなければ残す」はそのまま生きている。
 - `allow_key_over_plain_http` と違い、`endpoint` や `model` が変わっても落とさない。値が合わなくなる可能性はあるが、知らせずに消えるほうが、知らせずに残るより見つけにくい。残した値は §決定3 のログに出る。
-- **`FACE_KEYS` の doc の主規則（「画面の編集がその欄を持つまでは足さないこと」）の、3つ目の例外にする。** `api_key` と `allow_key_over_plain_http` と同じく、doc に例外の節を足す。`FACE_KEYS` は画面の写し（`web/src/lib/upstreamProfiles.ts`）と仕様書の閉じた綴りを兼ねるので、それらも同じ作業単位で変える。
+- ~~**`FACE_KEYS` の doc の主規則（「画面の編集がその欄を持つまでは足さないこと」）の、3つ目の例外にする。** `api_key` と `allow_key_over_plain_http` と同じく、doc に例外の節を足す。~~ → 画面が欄を持ったので、例外から外した（[ADR-0060](0060-sampling-and-response-room-on-the-screen.md) §決定4）。`FACE_KEYS` は画面の写し（`web/src/lib/upstreamProfiles.ts`）と仕様書の閉じた綴りを兼ねるので、それらも同じ作業単位で変える。
 - ~~**画面の写しでは `sampling` を「画面が欄を持つ鍵」（`EDITABLE_FACE_KEYS` / `EditableFaceKey`）から除く。** `allow_key_over_plain_http` を除いているのと同じ形にする。除かないと、画面に無い欄を持つことになり、`key: "sampling"` の 422 を存在しない欄に結びつけようとする（`isEditableFaceKey`）。~~ → 画面が欄を持つので、例外から外して `EDITABLE_FACE_KEYS` に入れる（[ADR-0060](0060-sampling-and-response-room-on-the-screen.md) §決定4）。
 - 見張り番は前例に倣って2本置く。画面から別の欄を直して保存しても `sampling` が残ること（前例 `a_hand_written_approval_survives_a_save_from_the_screen`）と、`sampling` を書いていない面は保存のバイト列が変わらないこと（前例 `a_face_without_context_tokens_is_written_byte_for_byte_as_before`）。
 - ~~画面で値を表示・編集できるようにする作業は、別の作業単位で後から行う。~~ → [ADR-0060](0060-sampling-and-response-room-on-the-screen.md)（作業単位 D-21）で決めた。

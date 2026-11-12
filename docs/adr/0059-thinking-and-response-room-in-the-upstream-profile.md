@@ -123,7 +123,7 @@ ADR-0058 の背景では、`repeat_penalty 1.0` で崩れは 0/4 だった。そ
 
 ### 5. 画面の編集は ADR-0058 §決定6 と同じ形にする
 
-画面から保存しても、書いた `reasoning_effort` と `response_tokens` を消さない（~~依頼の型には足さない。画面の欄は marukei/personacore#36 で追いつく~~ → 依頼の型に任意の欄として足し、省けば残す。[ADR-0060](0060-sampling-and-response-room-on-the-screen.md) §決定2）。`response_tokens` は `FACE_KEYS` の 10 個目にし、doc の例外の節に加える（~~`EDITABLE_FACE_KEYS` からは除く~~ → 画面が欄を持つので例外から外す。ADR-0060 §決定4）。画面の写し（`web/src/lib/upstreamProfiles.ts` の `FACE_KEYS`）と、仕様書の閉じた綴りも、同じ作業単位で変える。API の版は ADR-0047 に照らして決める。
+画面から保存しても、書いた `reasoning_effort` と `response_tokens` を消さない（~~依頼の型には足さない。画面の欄は marukei/personacore#36 で追いつく~~ → 依頼の型に任意の欄として足し、省けば残す。[ADR-0060](0060-sampling-and-response-room-on-the-screen.md) §決定2）。`response_tokens` は `FACE_KEYS` の 10 個目にし、~~doc の例外の節に加える（`EDITABLE_FACE_KEYS` からは除く）~~ → 画面が欄を持つので例外から外す（ADR-0060 §決定4）。画面の写し（`web/src/lib/upstreamProfiles.ts` の `FACE_KEYS`）と、仕様書の閉じた綴りも、同じ作業単位で変える。API の版は ADR-0047 に照らして決める。
 
 ### 6. この ADR で決めないこと
 
