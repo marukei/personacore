@@ -288,6 +288,13 @@ extraction starts in the background. In streaming mode the pair is stored only w
 upstream finished normally; **if the client stops the stream, nothing is stored.**
 The reply text is returned exactly as the model produced it.
 
+**If the reply comes back empty** (nothing but whitespace once any leaked thinking is
+removed), personacore asks the upstream once more with the same request and uses the
+second reply, so that turn can take about twice as long. In streaming mode the second
+reply continues the same response: chunks already sent from the first attempt (for
+example whitespace or a closed thinking block) stay, and only the second attempt is
+stored. If the second attempt is also empty, the turn is stored empty.
+
 **If the upstream fails in the middle of a stream**, the 200 status has already been
 sent. personacore then sends one final event whose `data` is an error object (the same
 shape as in [Errors](#errors)) and **does not send `data: [DONE]`**. The chunks sent

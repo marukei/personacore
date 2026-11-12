@@ -32,6 +32,9 @@ const EFFECTIVE_CONTEXT_FIELD: &str = "n_ctx";
 /// `usage` の中で**プロンプトとして数えられたトークン数**を持つ項目（OpenAI 互換）。
 const PROMPT_TOKENS_FIELD: &str = "prompt_tokens";
 
+/// `usage` の中で**生成したトークン数**を持つ項目（OpenAI 互換 / ADR-0059 §決定3）。
+const COMPLETION_TOKENS_FIELD: &str = "completion_tokens";
+
 /// 生成が止まった理由。
 ///
 /// **未知の値をエラーにしない。** 上流の実装差でここが増えても、中継そのものは
@@ -68,16 +71,20 @@ impl FinishReason {
 /// **これは実際に答えたモデル自身が数えた真値**で、こちらの見積もり
 /// （`prompt::estimate_tokens` = UTF-8 バイト数）の答え合わせに使う。
 ///
-/// # `prompt_tokens` しか持たない理由
+/// # 答え合わせに使うのは `prompt_tokens` だけ
 ///
 /// 第3層が見るのは「**送った側の見積もりが上界だったか**」なので、
-/// 突き合わせる相手はプロンプト側の実測1つで足りる。`completion_tokens` /
-/// `total_tokens` は上流が生成した側の話で、こちらの見積もりと対応する相手が居ない。
-/// **使わない値を持つと「どちらが権威か」が曖昧になる**ので載せない。
+/// 突き合わせる相手はプロンプト側の実測1つで足りる。`total_tokens` は持たない。
+///
+/// **`completion_tokens` は答え合わせに使わない。** 持つのは、空の本文を引き直した回に
+/// **捨てた1回目の生成数**を分解の行に出すためだけ（ADR-0059 §決定3 / 作業単位 A-18b）。
+/// **`TokenUsage` が在るかはプロンプトの数だけで決まる**（生成数が読めなくても `None` にしない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenUsage {
     /// プロンプトとして数えられたトークン数。**必ず 1 以上**（`parse_usage` の doc）。
     pub prompt_tokens: u32,
+    /// 上流が生成したトークン数（思考を含みうる）。**読めなければ `None`**（0 は正当）。
+    pub completion_tokens: Option<u32>,
 }
 
 /// 非ストリーミングの補完結果。
@@ -221,7 +228,14 @@ fn parse_usage(usage: Option<&Value>) -> Option<TokenUsage> {
         .and_then(|raw| u32::try_from(raw).ok())
         .filter(|tokens| *tokens > 0)
     {
-        Some(prompt_tokens) => Some(TokenUsage { prompt_tokens }),
+        Some(prompt_tokens) => Some(TokenUsage {
+            prompt_tokens,
+            // **プロンプトの数を巻き込まない。** 読めなければ生成数だけ `None`。
+            completion_tokens: usage?
+                .get(COMPLETION_TOKENS_FIELD)
+                .and_then(Value::as_u64)
+                .and_then(|raw| u32::try_from(raw).ok()),
+        }),
         None => {
             // **項目はあるのに読めない**ケースだけがここに来る（欠落は上で抜けている）。
             tracing::debug!(
@@ -977,10 +991,77 @@ mod tests {
 
         assert_eq!(
             parsed.usage,
-            Some(TokenUsage { prompt_tokens: 123 }),
+            Some(TokenUsage {
+                prompt_tokens: 123,
+                completion_tokens: Some(45),
+            }),
             "completion_tokens（45）や total_tokens（168）と取り違えないこと"
         );
         assert_eq!(parsed.content, "こんにちは", "本文はそのまま");
+    }
+
+    /// **生成トークン数も読む**（ADR-0059 §決定3 / 作業単位 A-18b —— 捨てた1回目の生成数を分解の行に出す）。
+    ///
+    /// **読めない値は `None` に落ち、プロンプトの数（答え合わせの材料）を巻き込まない。**
+    /// 0 は正当（何も生成しなかった回）。プロンプトの数・合計（`total_tokens`）と取り違えないよう、
+    /// 3つは別の値にしてある。
+    #[test]
+    fn keeps_the_completion_tokens_without_risking_the_prompt_tokens() {
+        let usage_of = |completion_raw: &str| {
+            completion(&format!(
+                r#"{{"choices":[{{"message":{{"content":"本文"}}}}],
+                    "usage":{{"prompt_tokens":123,"completion_tokens":{completion_raw},"total_tokens":999}}}}"#
+            ))
+            .usage
+        };
+        assert_eq!(
+            usage_of("45"),
+            Some(TokenUsage {
+                prompt_tokens: 123,
+                completion_tokens: Some(45),
+            })
+        );
+        assert_eq!(
+            usage_of("0"),
+            Some(TokenUsage {
+                prompt_tokens: 123,
+                completion_tokens: Some(0),
+            }),
+            "0 は正当な生成数"
+        );
+        for broken in ["\"45\"", "4.5", "-1", "4294967296", "null", "true"] {
+            assert_eq!(
+                usage_of(broken),
+                Some(TokenUsage {
+                    prompt_tokens: 123,
+                    completion_tokens: None,
+                }),
+                "raw = {broken}"
+            );
+        }
+        // **項目が無い**のも `None`（プロンプトの数は残る）。
+        assert_eq!(
+            completion(
+                r#"{"choices":[{"message":{"content":"本文"}}],"usage":{"prompt_tokens":123}}"#
+            )
+            .usage,
+            Some(TokenUsage {
+                prompt_tokens: 123,
+                completion_tokens: None,
+            })
+        );
+        // **使用量だけのチャンク**（中継の1回目の生成数はここから来る）。
+        let chunk =
+            parse_chunk(r#"{"choices":[],"usage":{"prompt_tokens":321,"completion_tokens":77}}"#)
+                .expect("解釈できること")
+                .expect("使用量だけのチャンクは読み飛ばさないこと");
+        assert_eq!(
+            chunk.usage,
+            Some(TokenUsage {
+                prompt_tokens: 321,
+                completion_tokens: Some(77),
+            })
+        );
     }
 
     /// u32 の上限ちょうどは受け取る（境界で 1 ずれない）。
@@ -993,7 +1074,8 @@ mod tests {
         assert_eq!(
             completion(&body).usage,
             Some(TokenUsage {
-                prompt_tokens: u32::MAX
+                prompt_tokens: u32::MAX,
+                completion_tokens: None,
             })
         );
     }
@@ -1080,7 +1162,10 @@ mod tests {
 
         assert_eq!(
             boundary.usage,
-            Some(TokenUsage { prompt_tokens: 1 }),
+            Some(TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: None,
+            }),
             "1 は正当な実トークン数なので捨てないこと"
         );
     }
@@ -1199,7 +1284,10 @@ mod tests {
         assert_eq!(parsed.delta, "い」", "本文はそのまま");
         assert_eq!(
             parsed.usage,
-            Some(TokenUsage { prompt_tokens: 123 }),
+            Some(TokenUsage {
+                prompt_tokens: 123,
+                completion_tokens: Some(45),
+            }),
             "completion_tokens（45）や total_tokens（168）と取り違えないこと"
         );
     }
@@ -1217,7 +1305,13 @@ mod tests {
 
         assert_eq!(parsed.delta, "", "増分は無い");
         assert_eq!(parsed.finish_reason, None);
-        assert_eq!(parsed.usage, Some(TokenUsage { prompt_tokens: 321 }));
+        assert_eq!(
+            parsed.usage,
+            Some(TokenUsage {
+                prompt_tokens: 321,
+                completion_tokens: None,
+            })
+        );
     }
 
     /// **`usage` が無いチャンクは `None`。** 欠落を `0` などで埋めない

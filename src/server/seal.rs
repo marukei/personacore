@@ -911,7 +911,10 @@ mod tests {
                     shared_deduction: 13,
                 },
                 &plan,
-                Some(TokenUsage { prompt_tokens: 41 }),
+                Some(TokenUsage {
+                    prompt_tokens: 41,
+                    completion_tokens: None,
+                }),
                 true,
             );
         });
@@ -970,7 +973,10 @@ mod tests {
     }
 
     fn usage(prompt_tokens: u32) -> Option<TokenUsage> {
-        Some(TokenUsage { prompt_tokens })
+        Some(TokenUsage {
+            prompt_tokens,
+            completion_tokens: None,
+        })
     }
 
     /// **バイト数の計画に、封の数 `sealed` で封をして送った回**（何も数えられなかった回の形）。

@@ -199,7 +199,9 @@ async fn completes_a_non_streaming_request() {
     assert_eq!(
         completion.usage,
         Some(TokenUsage {
-            prompt_tokens: PROMPT_TOKENS
+            prompt_tokens: PROMPT_TOKENS,
+            // フィクスチャの `completion_tokens`（A-18b から読む / 捨てた1回目の生成数）。
+            completion_tokens: Some(11),
         }),
         "上流が数えた prompt_tokens を落とさないこと"
     );

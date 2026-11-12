@@ -8,11 +8,41 @@
 //!
 //! **1チャンク受けたら1イベント返す**（docs/02-architecture.md）。
 //! 本文の蓄積（永続化が使う）は `Relay::relay` の中の `push_str` 1行で、
-//! **中継と同じ場所にある**ので、蓄積のためにストリームを止める余地がそもそも無い。
+//! **中継と同じ場所にある**ので、蓄積のためだけにストリームを止めることはしない
+//! （流すものと蓄積するものが、同じ1回の呼び出しで決まる）。
 //!
-//! 唯一の例外が**使用量だけのチャンク**（`is_usage_only`）で、これは受け取って
-//! 答え合わせに使うが下流へは出さない。**溜め込みではない**（次のチャンクを
-//! 待たずにその場で捨てる）。
+//! 例外は2つ（どちらも「蓄積のために止める」ではなく、「流すのを遅らせる／流さない」）。
+//!
+//! 1. **使用量だけのチャンク**（`is_usage_only`）。受け取って答え合わせに使うが下流へは出さない。
+//!    **溜め込みではない**（次のチャンクを待たずにその場で捨てる）。
+//! 2. **`finish_reason` 付きのチャンクと終わりの印（`[DONE]`）に限って保留する**
+//!    （[ADR-0059](../../../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md) §決定3 /
+//!    作業単位 A-18b）。下の「本文が空なら1回だけ引き直す」の節。**本文の差分は今までどおり受けたそばに流す。**
+//!
+//! # 本文が空なら1回だけ引き直す（ADR-0059 §決定3 / 作業単位 A-18b）
+//!
+//! `finish_reason` 付きのチャンクが届いた時点で、それまでに積み上げた本文（そのチャンクの差分を含む）が
+//! 剥がして空（空白だけを含む）で、**かつ閉じない思考ではない**とき（`super::empty_retry::retries`）、
+//! そのチャンクを流さずに保留する。1回目の上流が尽きたら（使用量のチャンクまで読み切ってから —— 捨てた回の
+//! 生成数を取るため）、**同じ上流の写し・同じ要求**（[`Redo`]）で2回目を開き、**同じ応答の続き**として流す。
+//!
+//! | 2回目 | 下流に見えるもの | 保存 |
+//! |---|---|---|
+//! | 開けた | 保留したチャンクの差分（空でなければ、`finish_reason` を外して） → 2回目のチャンク列 → `[DONE]` | **2回目の生の出力**（2回目も空なら空のまま。3回目は無い） |
+//! | 開けなかった（接続の失敗・上流のエラー） | 保留したチャンクをそのまま → `[DONE]`（引き直しが無かったときと同じ） | 1回目の生の出力 |
+//!
+//! * **役割は最初のチャンクにしか付かない** —— 2回目も同じ [`Relay`] を通すので、二重にならない。
+//! * **保留したチャンクの差分を捨てない**（閉じタグ `</think>` でありうる。捨てると使い手の側で、
+//!   閉じない思考の後ろに2回目の本文が続く形になり、本文まで思考として剥がされる）。
+//! * **空かの判定は、最初の `finish_reason` 付きのチャンクを受けた時点で行う**（`RelayState::holds`）。
+//!   保留した後に届くものでは、判定をやり直さない:
+//!   * **また `finish_reason` 付きのチャンクが届いたら、保留に足す**（差分を後ろに連結し、`finish_reason` は
+//!     後のものにする）。上書きしない —— 先の差分が流れず蓄積からも落ちると、`raw_content` が欠ける。
+//!   * **`finish_reason` の無い本文の差分**が届いたら、今までどおり受けたそばに流して蓄積する（保留した差分より
+//!     前に並ぶ）。その後も引き直すことは変わらない（そういう上流は想定していない）。
+//! * 1回目の上流が尽きる前に壊れたら、下の「途中で上流が壊れたとき」と同じ（保留したチャンクは流さず、保存しない）。
+//! * 2回目の途中で上流が壊れたら、下の「途中で上流が壊れたとき」と同じ（保存しない）。
+//! * 答え合わせと封の清算は、2回目の `usage` で1回だけ（[`Relay::restart`] が1回目の `usage` を捨てる）。
 //!
 //! # 途中で上流が壊れたときの伝え方
 //!
@@ -97,6 +127,7 @@
 //! 「上流を逐次読む」という同じ1点に寄りかかっている。**
 
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::response::sse::{Event, Sse};
@@ -105,10 +136,11 @@ use futures_util::{Stream, StreamExt as _, stream};
 use serde_json::{Map, Value};
 
 use super::chat::{ASSISTANT_ROLE, finish_reason_to_wire, upstream_error};
+use super::empty_retry::{self, Delivery, EmptyRetry};
 use super::seal::Sealed;
 use super::turn::TurnSink;
 use super::usage;
-use crate::llm::{ChatChunk, ChatStream, LlmError, TokenUsage};
+use crate::llm::{ChatChunk, ChatRequest, ChatStream, LlmClient, LlmError, LlmFuture, TokenUsage};
 use crate::prompt::{BudgetPlan, TokenBudget};
 
 /// `object` フィールドの定数（OpenAI 互換のストリーミング）。
@@ -193,11 +225,16 @@ impl Relay {
     ///
     /// 直列化の失敗という**到達不能な分岐**を作らないため
     /// （`unwrap` も、誰も通らない `unwrap_or_else` も置かない）。
+    ///
+    /// # 下流の枠を組むのはこの関数だけ（作業単位 A-18b）
+    ///
+    /// 空の本文の引き直しで保留したチャンク（モジュールの doc）を後から流すときも、ここを通す
+    /// （`web/tests/chat-wire.test.ts` がこの関数の本体を枠の権威として読む）。
     pub(super) fn relay(&mut self, chunk: &ChatChunk) -> Option<String> {
         // **蓄積は中継と同じ1行。** ここが「ストリームを止めない」の実装そのもの。
         self.content.push_str(&chunk.delta);
         // **最終チャンクの `usage` を落とさない。** 無ければ持っている値のまま。
-        self.usage = chunk.usage.or(self.usage);
+        self.note_usage(chunk.usage);
 
         // **受け取ってから判定する。** 先に返すと答え合わせの材料ごと捨てる。
         if is_usage_only(chunk) {
@@ -231,6 +268,23 @@ impl Relay {
         );
 
         Some(Value::Object(view).to_string())
+    }
+
+    /// **`usage` だけを受け取る**（後勝ち。`None` なら持っている値のまま）。
+    ///
+    /// 保留するチャンク（`finish_reason` 付き / モジュールの doc）は、本文の差分を流すときまで蓄積しないが、
+    /// `usage` はその場で受け取る —— 後から届く使用量だけのチャンクに負けるように（届いた順の後勝ち）。
+    fn note_usage(&mut self, usage: Option<TokenUsage>) {
+        self.usage = usage.or(self.usage);
+    }
+
+    /// **2回目の上流の前に、1回目の蓄積と `usage` を捨てる**（ADR-0059 §決定3）。
+    ///
+    /// 保存するのは採用した回（2回目）の生の出力、清算するのは2回目の `usage`。**役割を載せたか（`started`）は
+    /// 捨てない** —— 2回目は同じ応答の続きなので、役割をもう一度載せない。
+    fn restart(&mut self) {
+        self.content.clear();
+        self.usage = None;
     }
 
     /// ここまでに蓄積した本文。**完結したときに保存する本文そのもの。**
@@ -315,14 +369,51 @@ struct RelayState {
     ///
     /// いまここが決めるのは、報告の `after_first_token` 欄だけである
     /// ——`false` なら「まだ1トークンも来ていない」（JIT ロード中かもしれない）、
-    /// `true` なら「喋り出してから止まった」。**読み手にとって意味がまるで違う。**
+    /// `true` なら「**このターンの上流が、もう1件は返した後の沈黙**」。**読み手にとって意味がまるで違う。**
+    ///
+    /// **⚠ `true` は「喋り出してから止まった」より広い**（ADR-0059 §決定3 / 作業単位 A-18b）。
+    /// 空の本文を引き直した回は、**2回目の上流を開いて最初のチャンクを待つ間の沈黙**も `true` で報告される
+    /// （1回目が返した後なので）。2回目のプロンプトの処理の待ちは、ここでは「喋り出してから止まった」と
+    /// 見分けが付かない。分解の行の `empty_retries` で、そのターンが引き直したかが分かる。
     ///
     /// **使用量だけのチャンクも「来た1件」に数える**
     /// （下流へ出ないだけで、上流が喋っている証拠ではある）。
     received_first: bool,
+    /// **空の本文の引き直しに使う、同じ上流の写しと同じ要求**（ADR-0059 §決定3）。
+    ///
+    /// **引き直したら `None`**（2回目を開いた時点で取り出す）—— 2回目も空でも3回目は無い。
+    redo: Option<Redo>,
+    /// **保留している `finish_reason` 付きのチャンク**（ADR-0059 §決定3 / モジュールの doc）。
+    ///
+    /// 1回目の上流が尽きた時点で `Some` なら、引き直す。2回目が開けなければ、このチャンクをそのまま流す。
+    held: Option<ChatChunk>,
+    /// **2回目が開けなかったので、次の1件で `[DONE]` を流して終わる**（保留したチャンクを流した後）。
+    finish_next: bool,
+    /// 引き直しの記録（分解の行の欄 / `super::empty_retry::EmptyRetry`）。
+    retry: EmptyRetry,
 }
 
-/// 上流のチャンク列を SSE の応答にする。**溜め込まない。**
+/// **空の本文を引き直すための、そのターンの上流の写しと要求**（ADR-0059 §決定3 / 作業単位 A-18b）。
+///
+/// 写しは `AppState::llm_for_turn`（封と1回目の送信に使ったもの）—— **途中で上流が切り替わっても、
+/// 引き直しは1回目と同じ上流へ送る。** 要求は1回目と同じもの（`counted_plan` が作った本文）。
+pub(super) struct Redo {
+    llm: Arc<dyn LlmClient>,
+    request: ChatRequest,
+}
+
+impl Redo {
+    /// そのターンの写しと、1回目に送った要求。
+    pub(super) const fn new(llm: Arc<dyn LlmClient>, request: ChatRequest) -> Self {
+        Self { llm, request }
+    }
+}
+
+/// 上流のチャンク列を SSE の応答にする。**溜め込まない**（`finish_reason` と `[DONE]` の保留だけ / モジュールの doc）。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "中継1本分の持ち物を `chat` から1回で渡す。束ねる型を作っても、作る側で同じ数を並べる"
+)]
 pub(super) fn relay_response(
     upstream: ChatStream,
     relay: Relay,
@@ -331,6 +422,7 @@ pub(super) fn relay_response(
     max_tokens: u32,
     sealed: Sealed,
     turn: TurnSink,
+    redo: Redo,
 ) -> Response {
     Sse::new(chunk_events(RelayState {
         upstream: Some(upstream),
@@ -342,8 +434,68 @@ pub(super) fn relay_response(
         turn,
         // 最初の1件はまだ来ていない。**報告の欄がそう名乗る**（免除ではない / B-6）。
         received_first: false,
+        redo: Some(redo),
+        held: None,
+        finish_next: false,
+        retry: EmptyRetry::default(),
     }))
     .into_response()
+}
+
+impl RelayState {
+    /// **このチャンクを保留するか**（ADR-0059 §決定3）。チャンクを蓄積する**前**に聞く。
+    ///
+    /// `finish_reason` 付きで、まだ引き直していなくて、次のどちらか:
+    ///
+    /// * **既に保留がある**（判定は最初の `finish_reason` 付きのチャンクで済んでいる。後のものは保留に足す /
+    ///   [`Self::hold`]）。
+    /// * 積み上げた本文（**このチャンクの差分を含む**）が、中継で引き直す空（閉じない思考ではない）。
+    fn holds(&self, chunk: &ChatChunk) -> bool {
+        chunk.finish_reason.is_some()
+            && self.redo.is_some()
+            && (self.held.is_some()
+                || empty_retry::retries(
+                    &format!("{}{}", self.relay.accumulated(), chunk.delta),
+                    Delivery::Stream,
+                ))
+    }
+
+    /// **保留する。** 既に保留があれば、**上書きせずに足す**（差分を後ろに連結し、`finish_reason` は後のもの）。
+    ///
+    /// 上書きすると、先の差分が流れず蓄積からも落ちる（`raw_content` が欠ける / 絶対制約）。
+    /// `usage` はその場で受け取る（後から届く使用量だけのチャンクに負けるように / `Relay::note_usage`）。
+    fn hold(&mut self, chunk: ChatChunk) {
+        self.relay.note_usage(chunk.usage);
+        let delta = match self.held.take() {
+            Some(earlier) => earlier.delta + &chunk.delta,
+            None => chunk.delta,
+        };
+        self.held = Some(ChatChunk {
+            delta,
+            finish_reason: chunk.finish_reason,
+            usage: None,
+        });
+    }
+
+    /// **完結した回の締め**: 答え合わせと封の清算（採用した回の `usage` で1回）、保存、`[DONE]`。
+    async fn complete(&mut self) -> String {
+        self.upstream = None;
+        finish_relay(
+            &self.relay,
+            self.budget,
+            &self.plan,
+            self.max_tokens,
+            &self.sealed,
+            "SSE 中継を完了しました",
+        );
+        // **応答が完全に返り切った回だけ保存する。**
+        // `[DONE]` の直前なので、失敗しても中継の成否は変えられない
+        // （`super::turn` は `Result` を返さない）。
+        self.turn
+            .persist(self.relay.accumulated(), self.retry)
+            .await;
+        DONE_DATA.to_owned()
+    }
 }
 
 /// 1チャンク受けるたびに1イベント返すストリーム。
@@ -356,13 +508,15 @@ pub(super) fn relay_response(
 /// | 上流の様子 | 下流に見えるもの | 保存 |
 /// |---|---|---|
 /// | 尽きた（`[DONE]` を受けた） | `data: [DONE]` を流して終端 | **する** |
+/// | **本文が空のまま尽きた**（ADR-0059 §決定3） | 2回目の上流を開いて続ける（モジュールの doc の表）。終端は「尽きた」か「途中で失敗した」の行と同じ | 2回目（開けなければ1回目） |
 /// | 途中で失敗した（**天井に当たった回を含む**） | error オブジェクトを1件流して終端（**`[DONE]` は送らない**） | **しない** |
 /// | **黙り込んだ** | **何も見えない**（`warn` がログに出るだけ。中継は続く） | — |
 ///
 /// # 無通信の報告（11c-3a → ADR-0035 / 作業単位 B-6）
 ///
-/// 見張りを巻くのは **`events.next()` の1件分だけ**で、掛けるのは**1件ごとの間隔**。
-/// **やるのは報告だけで、打ち切りはしない**（[`next_reporting_silence`]）。
+/// 見張りを巻くのは **`events.next()` の1件分**（[`next_reporting_silence`]）と、**空の本文を引き直す
+/// 2回目の上流を開く future**（[`open_reporting_silence`] / ADR-0059 §決定3）の2つで、掛けるのは**1件ごとの間隔**。
+/// **やるのは報告だけで、打ち切りはしない。**
 ///
 /// * **最初の1件も報告する。** かつては免除していたが、それは
 ///   「JIT ロードの待ちを**打ち切って**しまうから」だった。打ち切らない以上、
@@ -376,6 +530,12 @@ fn chunk_events(state: RelayState) -> impl Stream<Item = Result<Event, Infallibl
         // **流すものが決まるまで上流を読み続ける。** 使用量だけのチャンクは
         // 受け取っても下流へ出さないので、その場合だけここを回る（`Relay::relay`）。
         loop {
+            // **2回目が開けなかった回の締め**（保留したチャンクを前の1件で流した後 / ADR-0059 §決定3）。
+            if std::mem::take(&mut state.finish_next) {
+                let data = state.complete().await;
+                return Some((Ok(Event::default().data(data)), state));
+            }
+
             // 終端済み。**`fuse` 相当**（もう一度読まれても `None` を返し続ける）。
             let events = state.upstream.as_mut()?;
 
@@ -386,6 +546,13 @@ fn chunk_events(state: RelayState) -> impl Stream<Item = Result<Event, Infallibl
             state.received_first = true;
 
             let data = match received {
+                // **本文が空のまま終わった。保留して、1回目の上流が尽きるのを待つ**（ADR-0059 §決定3）。
+                // **`usage` はその場で受け取り、本文の差分は流すときまで蓄積しない**（流すときに
+                // `Relay::relay` を通すので、2回蓄積しないように / `RelayState::hold`）。
+                Some(Ok(chunk)) if state.holds(&chunk) => {
+                    state.hold(chunk);
+                    continue;
+                }
                 // **受けたそばに1件返す。** ここで溜めると体感が死ぬ。
                 Some(Ok(chunk)) => match state.relay.relay(&chunk) {
                     Some(data) => data,
@@ -407,22 +574,54 @@ fn chunk_events(state: RelayState) -> impl Stream<Item = Result<Event, Infallibl
                     // **保存しない。** 途中までの応答を履歴に混ぜない（モジュールの doc）。
                     error_data(&err)
                 }
-                None => {
-                    state.upstream = None;
-                    finish_relay(
-                        &state.relay,
-                        state.budget,
-                        &state.plan,
-                        state.max_tokens,
-                        &state.sealed,
-                        "SSE 中継を完了しました",
-                    );
-                    // **応答が完全に返り切った回だけ保存する。**
-                    // `[DONE]` の直前なので、失敗しても中継の成否は変えられない
-                    // （`super::turn` は `Result` を返さない）。
-                    state.turn.persist(state.relay.accumulated()).await;
-                    DONE_DATA.to_owned()
+                // **1回目が空のまま尽きた。同じ写し・同じ要求で2回目を開く**（ADR-0059 §決定3）。
+                None if state.held.is_some() => {
+                    let (Some(held), Some(redo)) = (state.held.take(), state.redo.take()) else {
+                        // 到達しない（保留は `redo` が在るときだけ / `holds`）。締めへ回す。
+                        state.finish_next = true;
+                        continue;
+                    };
+                    // **2回目を待つ間の沈黙も報告する**（打ち切らない / `received_first` の doc）。
+                    match open_reporting_silence(redo.llm.stream(&redo.request)).await {
+                        Ok(second) => {
+                            // **保留した差分は捨てない**（閉じタグでありうる / モジュールの doc）。
+                            // `finish_reason` だけを外して流す。空なら何も流さない。
+                            // **1回目の蓄積を捨てる前に通す**（2回目の蓄積に混ぜない）。
+                            let carried = if held.delta.is_empty() {
+                                None
+                            } else {
+                                state.relay.relay(&ChatChunk {
+                                    finish_reason: None,
+                                    ..held
+                                })
+                            };
+                            // **捨てる1回目を記録してから、蓄積と `usage` を捨てる**（保存も清算も2回目で1回）。
+                            state.retry = EmptyRetry::discarded(
+                                state.relay.accumulated(),
+                                state.relay.usage(),
+                            );
+                            state.relay.restart();
+                            state.upstream = Some(second);
+                            match carried {
+                                Some(data) => data,
+                                None => continue,
+                            }
+                        }
+                        Err(err) => {
+                            // **引き直しが無かったときと同じ結果にする**: 保留したチャンクをそのまま流し、
+                            // 次の1件で `[DONE]`（1回目の空を保存する）。
+                            empty_retry::log_retry_failure(&err, Delivery::Stream);
+                            state.retry = EmptyRetry::failed();
+                            state.finish_next = true;
+                            match state.relay.relay(&held) {
+                                Some(data) => data,
+                                // 到達しない（`finish_reason` 付きは使用量だけのチャンクではない）。
+                                None => continue,
+                            }
+                        }
+                    }
                 }
+                None => state.complete().await,
             };
 
             return Some((Ok(Event::default().data(data)), state));
@@ -448,7 +647,7 @@ fn error_data(err: &LlmError) -> String {
 /// | 欄 | 中身 |
 /// |---|---|
 /// | `silent_secs` | **この沈黙が始まってからの通算の秒数。** 間隔ではなく実際の経過 |
-/// | `after_first_token` | `false` なら**まだ1トークンも来ていない**（JIT ロード中かもしれない） |
+/// | `after_first_token` | `false` なら**まだ1トークンも来ていない**（JIT ロード中かもしれない）。`true` は「このターンの上流が1件は返した後」で、**空の本文を引き直す2回目を待つ沈黙も含む**（`RelayState::received_first` の doc / ADR-0059 §決定3） |
 ///
 /// **秒数は間隔ではなく経過にする。** 間隔（＝定数）を出すと、
 /// **1本目と5本目のログが同じ文字列**になり、
@@ -485,16 +684,39 @@ async fn next_reporting_silence(
     loop {
         match tokio::time::timeout(IDLE_BUDGET, events.next()).await {
             Ok(received) => return received,
-            Err(_elapsed) => {
-                // **黙っているだけ。応答には何も出さない**（絶対制約）。
-                tracing::warn!(
-                    silent_secs = started.elapsed().as_secs(),
-                    after_first_token,
-                    "上流からトークンが届かないまま待っています"
-                );
-            }
+            Err(_elapsed) => report_silence(started, after_first_token),
         }
     }
+}
+
+/// **空の本文を引き直す2回目の上流を開く。** 黙っている間は [`next_reporting_silence`] と同じ行を出す
+/// （ADR-0059 §決定3 / 作業単位 A-18b）。
+///
+/// 開く（ヘッダが返る）までの待ちは、上流によってはプロンプトの処理を含む。1回目が返した後の沈黙なので
+/// `after_first_token=true` で言う（`RelayState::received_first` の doc）。
+///
+/// **こちらは future を1回だけ作り、`&mut` で巻き直す**（[`next_reporting_silence`] の doc の ⚠ ——
+/// 開く future は途中の状態（送りかけの要求）を自分で持つので、作り直すと失う）。
+async fn open_reporting_silence(
+    mut opening: LlmFuture<'_, ChatStream>,
+) -> Result<ChatStream, LlmError> {
+    let started = tokio::time::Instant::now();
+
+    loop {
+        match tokio::time::timeout(IDLE_BUDGET, &mut opening).await {
+            Ok(opened) => return opened,
+            Err(_elapsed) => report_silence(started, true),
+        }
+    }
+}
+
+/// 沈黙の報告の1行（[`next_reporting_silence`] の doc の表）。**応答には何も出さない**（絶対制約）。
+fn report_silence(started: tokio::time::Instant, after_first_token: bool) {
+    tracing::warn!(
+        silent_secs = started.elapsed().as_secs(),
+        after_first_token,
+        "上流からトークンが届かないまま待っています"
+    );
 }
 
 #[cfg(test)]
@@ -513,6 +735,7 @@ mod tests {
     use crate::domain::{Character, CharacterId, DisplayName, Handle, Persona, Role, SessionId};
     use crate::llm::FinishReason;
     use crate::prompt::{CountedParts, PromptInput, build_prompt};
+    use crate::server::empty_retry::test_upstream::Again;
     use crate::server::extract::Extraction;
     use crate::server::seal::TurnSeal;
     use crate::store::Store;
@@ -617,7 +840,10 @@ mod tests {
         ChatChunk {
             delta: String::new(),
             finish_reason: None,
-            usage: Some(TokenUsage { prompt_tokens }),
+            usage: Some(TokenUsage {
+                prompt_tokens,
+                completion_tokens: None,
+            }),
         }
     }
 
@@ -689,6 +915,11 @@ mod tests {
                     // **本番の入口と同じ初期値。** この helper の上流は
                     // 待たずに次を返すので、無通信の報告は最後まで出ない。
                     received_first: false,
+                    // **引き直しは開けない**（空の回は、引き直しが無かったときと同じ結果になる）。
+                    redo: Some(unreachable_redo()),
+                    held: None,
+                    finish_next: false,
+                    retry: EmptyRetry::default(),
                 };
 
                 let events = Box::pin(chunk_events(state)).count().await;
@@ -816,15 +1047,27 @@ mod tests {
         let _ = relay.relay(&ChatChunk {
             delta: "い".to_owned(),
             finish_reason: Some(FinishReason::Stop),
-            usage: Some(TokenUsage { prompt_tokens: 123 }),
+            usage: Some(TokenUsage {
+                prompt_tokens: 123,
+                completion_tokens: None,
+            }),
         });
-        assert_eq!(relay.usage(), Some(TokenUsage { prompt_tokens: 123 }));
+        assert_eq!(
+            relay.usage(),
+            Some(TokenUsage {
+                prompt_tokens: 123,
+                completion_tokens: None
+            })
+        );
 
         // 後続の（`usage` を持たない）チャンクで消えないこと。
         let _ = relay.relay(&chunk("", None));
         assert_eq!(
             relay.usage(),
-            Some(TokenUsage { prompt_tokens: 123 }),
+            Some(TokenUsage {
+                prompt_tokens: 123,
+                completion_tokens: None
+            }),
             "後から来た None で上書きしないこと"
         );
     }
@@ -835,16 +1078,21 @@ mod tests {
     /// **異なる値を2回渡していない**ので、先勝ち（`self.usage.or(chunk.usage)`）に
     /// 退行しても区別が付かない。
     ///
-    /// 今は `TokenUsage` が `prompt_tokens` だけで応答を通じて変化しないため実害は
-    /// 小さいが、**チャンクごとに増える `completion_tokens` を足した瞬間に、
-    /// 先勝ちは「最初の1チャンク分」を最終値として報告する**——しかも数字は
-    /// もっともらしく、答え合わせ（ADR-0013 第3層）が静かに嘘をつく。
+    /// **`completion_tokens` を足した（A-18b）ので、先勝ちは「最初の1チャンク分」を
+    /// 最終値として報告する** —— しかも数字はもっともらしく、捨てた1回目の生成数
+    /// （ADR-0059 §決定3）が静かに嘘をつく。2つの申告は生成数も別の値にしてある。
     #[test]
     fn a_later_reported_usage_wins_over_an_earlier_one() {
         let mut relay = relay();
 
-        let first = TokenUsage { prompt_tokens: 100 };
-        let last = TokenUsage { prompt_tokens: 277 };
+        let first = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: Some(3),
+        };
+        let last = TokenUsage {
+            prompt_tokens: 277,
+            completion_tokens: Some(41),
+        };
         // **2つが同値だと先勝ち／後勝ちを区別できない**（フィクスチャの取り違え）。
         assert_ne!(first, last, "前提: 2回の申告は別の値であること");
 
@@ -877,6 +1125,7 @@ mod tests {
             // 見積もりを必ず超える値（上界の破れ）。
             usage: Some(TokenUsage {
                 prompt_tokens: u32::MAX,
+                completion_tokens: None,
             }),
         });
 
@@ -1018,7 +1267,10 @@ mod tests {
         );
         assert_eq!(
             relaying.usage(),
-            Some(TokenUsage { prompt_tokens: 321 }),
+            Some(TokenUsage {
+                prompt_tokens: 321,
+                completion_tokens: None
+            }),
             "答え合わせの材料としては受け取ること"
         );
         assert_eq!(relaying.accumulated(), "「はい」", "本文を変えないこと");
@@ -1040,7 +1292,10 @@ mod tests {
                 .relay(&ChatChunk {
                     delta: "い」".to_owned(),
                     finish_reason: Some(FinishReason::Stop),
-                    usage: Some(TokenUsage { prompt_tokens: 321 }),
+                    usage: Some(TokenUsage {
+                        prompt_tokens: 321,
+                        completion_tokens: None
+                    }),
                 })
                 .is_some(),
             "本文と一緒に usage が載っているチャンクを落とさないこと"
@@ -1059,7 +1314,10 @@ mod tests {
                 .relay(&ChatChunk {
                     delta: String::new(),
                     finish_reason: Some(FinishReason::Stop),
-                    usage: Some(TokenUsage { prompt_tokens: 654 }),
+                    usage: Some(TokenUsage {
+                        prompt_tokens: 654,
+                        completion_tokens: None
+                    }),
                 })
                 .is_some(),
             "usage が同乗していても、停止理由を運ぶチャンクは落とさないこと"
@@ -1115,6 +1373,7 @@ mod tests {
                         // 見積もりを必ず超える値（上界の破れ）。
                         usage: Some(TokenUsage {
                             prompt_tokens: u32::MAX,
+                            completion_tokens: None,
                         }),
                     }),
                     Err(LlmError::Truncated),
@@ -1208,6 +1467,7 @@ mod tests {
                     finish_reason: Some(FinishReason::Stop),
                     usage: Some(TokenUsage {
                         prompt_tokens: u32::MAX,
+                        completion_tokens: None,
                     }),
                 })],
                 plan,
@@ -1409,7 +1669,7 @@ mod tests {
         );
 
         let output = captured_with_filter(PERSIST_ORDER_FILTER, || {
-            runtime.block_on(sink.persist(REPLY));
+            runtime.block_on(sink.persist(REPLY, EmptyRetry::default()));
         });
 
         // 前提: 保存は現に成功したこと（失敗していれば書き込みの記録は出ない）。
@@ -1663,6 +1923,16 @@ mod tests {
         plan: BudgetPlan,
         persist_stall: Option<StallPersist>,
     ) -> Relayed {
+        run_relay_with(steps, plan, persist_stall, unreachable_redo())
+    }
+
+    /// [`run_relay`] に、**空の本文の引き直しの相手**（`redo`）を渡す形（作業単位 A-18b）。
+    fn run_relay_with(
+        steps: Vec<Step>,
+        plan: BudgetPlan,
+        persist_stall: Option<StallPersist>,
+        redo: Redo,
+    ) -> Relayed {
         let dir = tempfile::tempdir().expect("一時ディレクトリを作成できること");
 
         // **現在のスレッドで走らせる**（ログの捕捉はスレッドローカル）。
@@ -1703,6 +1973,7 @@ mod tests {
                     Vec::new(),
                     Extraction::quiet_for_tests(store.clone()),
                 ),
+                redo,
             );
 
             // **1件ずつ読む。** `to_bytes` で読み切ると、印を見られるのは
@@ -1846,6 +2117,7 @@ mod tests {
                         // 見積もりを必ず超える値（上界の破れ）。
                         usage: Some(TokenUsage {
                             prompt_tokens: u32::MAX,
+                            completion_tokens: None,
                         }),
                     })),
                     Step::Silence(WITHIN),
@@ -2045,7 +2317,8 @@ mod tests {
     ///
     /// **代わりに欄になった** —— `after_first_token` が `false` なら
     /// 「まだ1トークンも来ていない」（JIT ロード中かもしれない）、
-    /// `true` なら「喋り出してから止まった」。
+    /// `true` なら「このターンの上流が1件は返した後の沈黙」（喋り出してから止まった回のほか、
+    /// 空の本文を引き直す2回目を待つ回も含む / `RelayState::received_first` の doc / A-18b）。
     /// **読み手にとって意味がまるで違う**ので、報告からは落とさない。
     ///
     /// **打ち切りの天井は引き続き `llm` 層**（`DEFAULT_IDLE_TIMEOUT`）が持つ。
@@ -2480,6 +2753,492 @@ mod tests {
         assert!(
             !seen.iter().any(|line| line.contains(IDLE_REPORT_MARKER)),
             "遅い保存を「上流が黙っている」と報告しないこと: {seen:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // **空の本文を1回だけ引き直す**（ADR-0059 §決定3 / 作業単位 A-18b）
+    //
+    // 本番の入口からの見張り番は `tests/server_empty_retry.rs`。ここは中継の中の形
+    // （保留した差分・終わりの印の数・沈黙の報告）を仮想時計の上で見る。
+    // ------------------------------------------------------------------
+
+    /// **引き直しを開けない相手**（`stream` が必ず失敗する）。引き直しを見ないテストの既定。
+    ///
+    /// 空の回が来ても「引き直しが無かったときと同じ結果」になる（ADR-0059 §決定3 の2回目の失敗）。
+    fn unreachable_redo() -> Redo {
+        Redo::new(Again::streaming(Vec::new()), ChatRequest::new(Vec::new()))
+    }
+
+    /// 引き直しの相手と、それに渡す要求。**要求は空でない値**（同じ要求が届いたかを見るため）。
+    fn redo_to(again: &Arc<Again>) -> Redo {
+        Redo::new(Arc::clone(again) as Arc<dyn LlmClient>, redo_request())
+    }
+
+    fn redo_request() -> ChatRequest {
+        let mut request = ChatRequest::new(Vec::new());
+        request.max_tokens = Some(777);
+        request
+    }
+
+    /// 使用量だけのチャンク（プロンプトの数と生成数）。
+    fn usage_chunk(prompt_tokens: u32, completion_tokens: u32) -> ChatChunk {
+        ChatChunk {
+            delta: String::new(),
+            finish_reason: None,
+            usage: Some(TokenUsage {
+                prompt_tokens,
+                completion_tokens: Some(completion_tokens),
+            }),
+        }
+    }
+
+    /// 2回目の本文（2つの差分に割って流す）。
+    const SECOND: [&str; 2] = ["「おかえり", "なさい」"];
+
+    /// 2回目の上流の台本（本文 → 終わり → 使用量）。
+    fn second_stream() -> Vec<Result<ChatChunk, LlmError>> {
+        vec![
+            Ok(chunk("", None)),
+            Ok(chunk(SECOND[0], None)),
+            Ok(chunk(SECOND[1], None)),
+            Ok(chunk("", Some(FinishReason::Stop))),
+            Ok(usage_chunk(803, 9)),
+        ]
+    }
+
+    /// 下流に見えたもの（増分の連結・役割の数・`finish_reason` の位置・`[DONE]` の位置）。
+    struct Downstream {
+        content: String,
+        roles: usize,
+        finishes: Vec<usize>,
+        dones: Vec<usize>,
+        len: usize,
+    }
+
+    fn downstream(events: &[String]) -> Downstream {
+        let mut seen = Downstream {
+            content: String::new(),
+            roles: 0,
+            finishes: Vec::new(),
+            dones: Vec::new(),
+            len: events.len(),
+        };
+        for (index, data) in events.iter().enumerate() {
+            if data == DONE_DATA {
+                seen.dones.push(index);
+                continue;
+            }
+            let value: Value = serde_json::from_str(data).expect("JSON として読めること");
+            let choice = &value["choices"][0];
+            seen.content
+                .push_str(choice["delta"]["content"].as_str().unwrap_or_default());
+            if choice["delta"].get("role").is_some() {
+                seen.roles += 1;
+            }
+            if !choice["finish_reason"].is_null() {
+                seen.finishes.push(index);
+            }
+        }
+        seen
+    }
+
+    impl Downstream {
+        /// **`finish_reason` と `[DONE]` が最後に1回ずつ**（`finish_reason` の直後に `[DONE]` で終わり）。役割も1回。
+        fn finished_once_at_the_end(&self) -> bool {
+            self.dones == [self.len - 1] && self.finishes == [self.len - 2] && self.roles == 1
+        }
+    }
+
+    /// **本文が空のまま終わった中継は、同じ要求で1回だけ引き直し、2回目を同じ応答の続きとして流す。**
+    ///
+    /// 1回目は思考を別欄で返した形（役割だけの差分 → 空の差分で `stop`、使用量は終わりのチャンク）。
+    /// 下流には `finish_reason` と `[DONE]` が最後に1回ずつ、役割は1回。保存は2回目、清算は1回で2回目の値、
+    /// 捨てた1回目の生成数は分解の行に出る。
+    #[test]
+    fn a_blank_stream_is_retried_once_as_the_continuation_of_the_same_response() {
+        let again = Again::streaming(vec![Ok(second_stream())]);
+        let mut relayed = None;
+        let output = captured_under_default_filter(|| {
+            relayed = Some(run_relay_with(
+                vec![
+                    Step::Chunk(Ok(chunk("", None))),
+                    Step::Chunk(Ok(ChatChunk {
+                        delta: String::new(),
+                        finish_reason: Some(FinishReason::Stop),
+                        usage: Some(TokenUsage {
+                            prompt_tokens: 701,
+                            completion_tokens: Some(41),
+                        }),
+                    })),
+                ],
+                plan(),
+                None,
+                redo_to(&again),
+            ));
+        });
+        let relayed = relayed.expect("走ったこと");
+
+        assert_eq!(again.opens(), 1, "1回だけ引き直すこと");
+        assert_eq!(again.requests(), vec![redo_request()], "同じ要求を送ること");
+        let seen = downstream(&relayed.events);
+        assert!(seen.finished_once_at_the_end(), "{:?}", relayed.events);
+        assert_eq!(seen.content, SECOND.concat());
+        assert_eq!(relayed.saved.len(), 2, "{:?}", relayed.saved);
+        assert_eq!(relayed.saved[1].raw_content, SECOND.concat(), "保存は2回目");
+
+        let seals = report_lines(&output, "封を観測しました");
+        assert_eq!(seals.len(), 1, "清算は1回だけ: {seals:?}");
+        assert!(
+            has_field(seals[0], "usage_prompt_tokens=Some(803)"),
+            "2回目の値: {}",
+            seals[0]
+        );
+        let line = line_containing(&output, PARSE_MARKER);
+        assert!(has_field(line, "empty_retries=1"), "{line:?}");
+        assert!(
+            has_field(line, "discarded_completion_tokens=Some(41)"),
+            "{line:?}"
+        );
+    }
+
+    /// **2回目が `usage` を返さなければ、清算は「答え合わせできない」**（1回目の `usage` を持ち越さない）。
+    ///
+    /// 2回目が `usage` を返す材料だけだと、1回目の `usage` を捨てない実装（`Relay::restart` で `usage` を残す）は
+    /// 2回目の値に上書きされて緑になる（A-18b の変異 M13 で実測）。
+    #[test]
+    fn the_first_usage_is_not_carried_into_a_retry_without_usage() {
+        let again = Again::streaming(vec![Ok(vec![
+            Ok(chunk(SECOND[0], None)),
+            Ok(chunk(SECOND[1], Some(FinishReason::Stop))),
+        ])]);
+        let mut relayed = None;
+        let output = captured_under_default_filter(|| {
+            relayed = Some(run_relay_with(
+                vec![Step::Chunk(Ok(ChatChunk {
+                    delta: String::new(),
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: Some(TokenUsage {
+                        prompt_tokens: 701,
+                        completion_tokens: Some(41),
+                    }),
+                }))],
+                plan(),
+                None,
+                redo_to(&again),
+            ));
+        });
+        let relayed = relayed.expect("走ったこと");
+
+        assert_eq!(again.opens(), 1, "前提: 引き直したこと");
+        assert_eq!(relayed.saved[1].raw_content, SECOND.concat());
+        let seals = report_lines(&output, "封を観測しました");
+        assert_eq!(seals.len(), 1, "清算は1回だけ: {seals:?}");
+        assert!(
+            has_field(seals[0], "usage_prompt_tokens=None"),
+            "1回目の値を2回目の清算に使わないこと: {}",
+            seals[0]
+        );
+        // 捨てた1回目の生成数は、分解の行には残る。
+        let line = line_containing(&output, PARSE_MARKER);
+        assert!(
+            has_field(line, "discarded_completion_tokens=Some(41)"),
+            "{line:?}"
+        );
+    }
+
+    /// **保留したチャンクの差分は捨てない**（閉じタグでありうる / モジュールの doc）。
+    ///
+    /// 1回目は本文の中で閉じた思考だけで、閉じタグが `finish_reason` のチャンクに載って届く形。
+    /// 捨てると下流は「閉じない思考＋2回目の本文」を受け取り、使い手の剥がしが2回目まで思考として捨てる。
+    ///
+    /// **捨てた回の文字数は、保留した差分（閉じタグ）込み**（レビューの T2）——記録を、保留した差分を蓄積する前に
+    /// 取ると、閉じタグの分だけ短く出る。
+    #[test]
+    fn the_held_delta_is_still_relayed_before_the_retry() {
+        /// 1回目の本文（閉じタグの前まで）と、終わりのチャンクに載る閉じタグ。
+        const THOUGHT: &str = "<think>\nThe user is home.\n";
+        const CLOSE: &str = "</think>";
+
+        let again = Again::streaming(vec![Ok(second_stream())]);
+        let mut relayed = None;
+        let output = captured_under_default_filter(|| {
+            relayed = Some(run_relay_with(
+                vec![
+                    Step::Chunk(Ok(chunk(THOUGHT, None))),
+                    Step::Chunk(Ok(chunk(CLOSE, Some(FinishReason::Stop)))),
+                ],
+                plan(),
+                None,
+                redo_to(&again),
+            ));
+        });
+        let relayed = relayed.expect("走ったこと");
+
+        assert_eq!(again.opens(), 1, "閉じた思考だけの回は引き直すこと");
+        let seen = downstream(&relayed.events);
+        assert!(seen.finished_once_at_the_end(), "{:?}", relayed.events);
+        assert_eq!(
+            seen.content,
+            format!("{THOUGHT}{CLOSE}{}", SECOND.concat()),
+            "閉じタグを落とさずに、2回目を続けること"
+        );
+        assert_eq!(relayed.saved[1].raw_content, SECOND.concat());
+        let line = line_containing(&output, PARSE_MARKER);
+        assert!(
+            has_field(
+                line,
+                &format!(
+                    "discarded_reply_chars={}",
+                    format!("{THOUGHT}{CLOSE}").chars().count()
+                )
+            ),
+            "捨てた回の文字数は閉じタグ込み: {line:?}"
+        );
+    }
+
+    /// **`finish_reason` 付きのチャンクが2本来ても、先の保留の差分を落とさない**（レビューの C1 / 絶対制約の
+    /// `raw_content`）。後の1本は保留に足す（差分を連結し、`finish_reason` は後のもの）。
+    ///
+    /// 2回目を開けない腕で見る —— 保存されるのが1回目の生の出力なので、差分が欠ければ `raw_content` に出る。
+    /// 下流には、連結した差分が後の `finish_reason` 付きで1件だけ流れ、`[DONE]` で終わる。
+    #[test]
+    fn a_second_finish_chunk_is_added_to_the_held_one_without_losing_its_delta() {
+        let steps = vec![
+            Step::Chunk(Ok(chunk("<think>a", None))),
+            Step::Chunk(Ok(chunk("</think>", Some(FinishReason::Stop)))),
+            Step::Chunk(Ok(chunk("\n", Some(FinishReason::Length)))),
+        ];
+        let again = Again::streaming(vec![Err(())]);
+        let relayed = run_relay_with(steps, plan(), None, redo_to(&again));
+
+        assert_eq!(again.opens(), 1, "前提: 引き直しを試みたこと");
+        assert_eq!(
+            relayed.saved[1].raw_content, "<think>a</think>\n",
+            "保留したどの差分も、届いた順のまま蓄積に残ること"
+        );
+        let seen = downstream(&relayed.events);
+        assert_eq!(seen.content, "<think>a</think>\n", "{:?}", relayed.events);
+        assert!(seen.finished_once_at_the_end(), "{:?}", relayed.events);
+        let last: Value = serde_json::from_str(&relayed.events[relayed.events.len() - 2])
+            .expect("JSON として読めること");
+        assert_eq!(
+            last["choices"][0]["finish_reason"],
+            json!("length"),
+            "finish_reason は後のもの"
+        );
+    }
+
+    /// **2回目を開いた後に上流が壊れたら、途中で壊れた中継と同じ**（レビューの T1）。
+    ///
+    /// error オブジェクトが最後に1件流れ、`finish_reason` も `[DONE]` も流れない。**何も保存しない** ——
+    /// 1回目の空も保存しない（2回目の差分を既に流しているので、1回目へは戻れない / モジュールの doc）。
+    #[test]
+    fn a_retry_that_breaks_midway_saves_nothing_and_ends_with_an_error() {
+        let again = Again::streaming(vec![Ok(vec![
+            Ok(chunk(SECOND[0], None)),
+            Err(LlmError::MissingContent),
+        ])]);
+        let relayed = run_relay_with(
+            vec![Step::Chunk(Ok(chunk("", Some(FinishReason::Stop))))],
+            plan(),
+            None,
+            redo_to(&again),
+        );
+
+        assert_eq!(again.opens(), 1, "前提: 2回目を開いたこと");
+        let seen = downstream_until_error(&relayed.events);
+        assert_eq!(seen.content, SECOND[0], "2回目の差分は流れている");
+        assert!(
+            seen.finishes.is_empty(),
+            "finish_reason は流さない: {:?}",
+            relayed.events
+        );
+        assert!(
+            seen.dones.is_empty(),
+            "[DONE] は流さない: {:?}",
+            relayed.events
+        );
+        assert_eq!(
+            relayed.events.len(),
+            2,
+            "差分1件と error 1件: {:?}",
+            relayed.events
+        );
+        assert_eq!(
+            relayed.events.last(),
+            Some(&error_data(&LlmError::MissingContent)),
+            "最後に error オブジェクトが1件"
+        );
+        assert!(
+            relayed.saved.is_empty(),
+            "1回目の空も2回目の途中も保存しないこと: {:?}",
+            relayed.saved
+        );
+    }
+
+    /// [`downstream`] の、最後の error オブジェクトを読まない形。
+    fn downstream_until_error(events: &[String]) -> Downstream {
+        downstream(events.split_last().map_or(&[][..], |(_, rest)| rest))
+    }
+
+    /// **閉じない思考は引き直さない**（続けると2回目まで思考として捨てられる）。**空でない回も引き直さない。**
+    #[test]
+    fn an_unclosed_thought_or_a_body_is_not_retried_on_the_stream() {
+        for first in ["<think>\nThe user is asking", "「ただいま」"] {
+            let again = Again::streaming(vec![Ok(second_stream())]);
+            let relayed = run_relay_with(
+                vec![
+                    Step::Chunk(Ok(chunk(first, None))),
+                    Step::Chunk(Ok(chunk("", Some(FinishReason::Stop)))),
+                ],
+                plan(),
+                None,
+                redo_to(&again),
+            );
+            assert_eq!(again.opens(), 0, "{first:?}: 引き直さないこと");
+            assert!(
+                downstream(&relayed.events).finished_once_at_the_end(),
+                "{first:?}: {:?}",
+                relayed.events
+            );
+            assert_eq!(relayed.saved[1].raw_content, first);
+        }
+    }
+
+    /// **2回目も空なら、そのまま終える**（3回目は無い）。保存は2回目の空。
+    #[test]
+    fn a_second_blank_stream_is_not_retried_again() {
+        let again = Again::streaming(vec![
+            Ok(vec![Ok(chunk(" \n", Some(FinishReason::Stop)))]),
+            Ok(second_stream()),
+        ]);
+        let relayed = run_relay_with(
+            vec![Step::Chunk(Ok(chunk("", Some(FinishReason::Stop))))],
+            plan(),
+            None,
+            redo_to(&again),
+        );
+        assert_eq!(again.opens(), 1, "3回目を開かないこと");
+        assert!(
+            downstream(&relayed.events).finished_once_at_the_end(),
+            "{:?}",
+            relayed.events
+        );
+        assert_eq!(relayed.saved[1].raw_content, " \n", "2回目の空を保存する");
+    }
+
+    /// **2回目が開けなければ、保留したチャンクをそのまま流して `[DONE]`**（引き直しが無かったときと同じ）。
+    ///
+    /// 下流は、引き直しの相手を持たない形と**同じ並び**になる。保存は1回目、失敗は `warn` に出る。
+    #[test]
+    fn a_failed_reopen_relays_the_held_chunk_and_done_once() {
+        let steps = || {
+            vec![
+                Step::Chunk(Ok(chunk("<think>a</think>", None))),
+                Step::Chunk(Ok(chunk("\n", Some(FinishReason::Stop)))),
+            ]
+        };
+        let again = Again::streaming(vec![Err(())]);
+        let mut relayed = None;
+        let output = captured_under_default_filter(|| {
+            relayed = Some(run_relay_with(steps(), plan(), None, redo_to(&again)));
+        });
+        let relayed = relayed.expect("走ったこと");
+
+        assert_eq!(again.opens(), 1);
+        let seen = downstream(&relayed.events);
+        assert!(seen.finished_once_at_the_end(), "{:?}", relayed.events);
+        assert_eq!(seen.content, "<think>a</think>\n");
+        assert_eq!(relayed.saved[1].raw_content, "<think>a</think>\n");
+        let line = line_containing(&output, super::empty_retry::RETRY_FAILED_LINE);
+        assert!(line.contains("WARN"), "{line:?}");
+        let line = line_containing(&output, PARSE_MARKER);
+        assert!(has_field(line, "empty_retry_failed=true"), "{line:?}");
+
+        // **引き直しが無かったときの並び**（受けたチャンクを1件ずつそのまま流して `[DONE]`）と同じ。
+        let mut plain = relay();
+        let expected: Vec<String> = steps()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Chunk(Ok(chunk)) => plain.relay(&chunk),
+                Step::Chunk(Err(_)) | Step::Silence(_) => None,
+            })
+            .chain([DONE_DATA.to_owned()])
+            .collect();
+        assert_eq!(relayed.events, expected);
+    }
+
+    /// 開くまでに `wait` だけ黙る相手（2回目のプロンプトの処理を模す）。**仮想時計を自分で進める。**
+    struct SlowToOpen {
+        wait: Duration,
+        items: Mutex<Option<Vec<Result<ChatChunk, LlmError>>>>,
+    }
+
+    impl LlmClient for SlowToOpen {
+        fn pinned(&self) -> Option<Arc<dyn LlmClient>> {
+            None
+        }
+
+        fn complete<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> crate::llm::LlmFuture<'a, crate::llm::Completion> {
+            Box::pin(async { Err(LlmError::MissingContent) })
+        }
+
+        fn stream<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> crate::llm::LlmFuture<'a, ChatStream> {
+            let items = self
+                .items
+                .lock()
+                .expect("ロック")
+                .take()
+                .unwrap_or_default();
+            let wait = self.wait;
+            Box::pin(async move {
+                tokio::time::advance(wait).await;
+                for _ in 0..YIELDS_AFTER_ADVANCE {
+                    tokio::task::yield_now().await;
+                }
+                Ok(Box::pin(stream::iter(items)) as ChatStream)
+            })
+        }
+    }
+
+    /// **2回目を開くまでの沈黙も報告する。最初のトークンの後の沈黙として**（`RelayState::received_first` の doc）。
+    #[test]
+    fn the_silence_while_reopening_is_reported_after_the_first_token() {
+        let slow = Arc::new(SlowToOpen {
+            wait: STALL,
+            items: Mutex::new(Some(second_stream())),
+        });
+        let mut relayed = None;
+        let output = captured_under_default_filter(|| {
+            relayed = Some(run_relay_with(
+                vec![Step::Chunk(Ok(chunk("", Some(FinishReason::Stop))))],
+                plan(),
+                None,
+                Redo::new(slow, redo_request()),
+            ));
+        });
+        let relayed = relayed.expect("走ったこと");
+
+        assert_eq!(downstream(&relayed.events).content, SECOND.concat());
+        let lines = report_lines(&output, IDLE_REPORT_MARKER);
+        assert!(!lines.is_empty(), "開く間の沈黙を報告すること: {output:?}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| has_field(line, "after_first_token=true")),
+            "最初のトークンの後の沈黙として言うこと: {lines:?}"
+        );
+        assert_eq!(
+            reported_silences(&output),
+            vec![STALL.as_secs()],
+            "開く間の沈黙を、通算の秒数で1本言うこと: {lines:?}"
         );
     }
 }
