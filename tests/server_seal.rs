@@ -33,7 +33,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use personacore::domain::{ChatMessage, DisplayName, Handle, NewMessage, Persona, Role, SessionId};
+use personacore::domain::{
+    ChatMessage, DisplayName, Handle, NewMessage, Persona, Role, SessionId, fold_runaway_repetition,
+};
 use personacore::llm::{
     ChatChunk, ChatRequest, ChatStream, Completion, DEFAULT_ENDPOINT, FinishReason, LlmClient,
     LlmFuture, TokenCount, TokenUsage,
@@ -90,9 +92,30 @@ const TIGHT_CONTEXT: &str = "4096";
 const TIGHT_CONTEXT_TOKENS: u32 = 4_096;
 
 /// 履歴の1件の本文。**ASCII で、ちょうど `bytes` バイト**（番号ごとに別の綴り）。
+///
+/// **埋め草は同じ文字の繰り返しにしない**（作業単位 A-21a）。応答の行は履歴に載る前に
+/// 返答の中の暴走として畳まれる（ADR-0062 §決定2）ので、`a` を並べると単位1回分に縮み、
+/// 載せたつもりの量が載らない（予算を食わせる台本が成り立たない）。番号から決まる擬似乱数の
+/// 小文字の並びにし、**畳まれないことを前提として確かめる。**
 fn history_text(index: usize, bytes: usize) -> String {
     let head = format!("{index:04}");
-    format!("{head}{}", "a".repeat(bytes - head.len()))
+    // 線形合同法（係数は Knuth の MMIX）。番号ごとに別の並びになる。
+    let mut state = u64::try_from(index).expect("番号は u64 に収まること") ^ 0x9E37_79B9_7F4A_7C15;
+    let filler: String = (0..bytes - head.len())
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let letter = u8::try_from((state >> 33) % 26).expect("26 未満であること");
+            char::from(b'a' + letter)
+        })
+        .collect();
+    let text = format!("{head}{filler}");
+    assert!(
+        fold_runaway_repetition(&text).runs.is_empty(),
+        "前提: 履歴の埋め草は暴走として畳まれないこと: {text}"
+    );
+    text
 }
 
 /// 記憶の本文の頭（送った本文の中で記憶の行を数える目印）。

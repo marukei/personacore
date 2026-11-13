@@ -815,6 +815,109 @@ async fn the_extraction_request_reads_the_reply_without_the_leaked_thought() {
     server.stop().await;
 }
 
+/// 暴走の単位（8 文字）。**`、` で終える** —— [`REPLY`] の末尾の `。` と周期が合わないように
+/// （合うと区間が1文字前へ伸び、残る単位が回転する / 作業単位 A-21a）。
+const RUNAWAY_UNIT: &str = "ずっと一緒だよ、";
+
+/// **[`REPLY`] の後ろに、思考を挟んで2つに割れた暴走が続く応答**（ADR-0062 / 作業単位 A-21a）。
+///
+/// 暴走の単位 5 回（40 文字）が思考の前後に1つずつ。**剥がした後なら 80 文字の1つの区間**として畳まれ、
+/// **剥がす前に畳むと、どちらの半分も 64 文字に届かず畳まれない** —— 1つのフィクスチャで
+/// 「畳むこと」と「剥がした後に畳むこと」を全部の読み手で見る。
+fn runaway_reply() -> String {
+    let half = RUNAWAY_UNIT.repeat(5);
+    format!("{REPLY}{half}<think>\n{LEAKED_THOUGHT}\n</think >{half}")
+}
+
+/// [`runaway_reply`] を剥がして畳んだ後。**手で書いた値**（実装から作らない）。
+const FOLDED_RUNAWAY_REPLY: &str = "「おかえりなさい」 彼女は微笑んだ。ずっと一緒だよ、";
+
+/// **暴走を含む生の出力は、分解・裏方・次のターンの履歴へは畳まれて届き、保存の `raw_content` は畳まれない**
+/// （ADR-0062 §決定2・§決定7 / 作業単位 A-21a）。
+///
+/// 3つの読み手（`server::turn` の分解・`Extraction::start` の `character_message`・`prompt::history_turn`）と
+/// 保存を、**同じ1つの応答**で見る。単体テストは各読み手を直に呼ぶので、**本番の配線
+/// （`TurnSink::persist` が畳む前の生出力を保存と抽出に渡しているか、`chat` が保存した行から履歴を組むか）**
+/// はここでしか見えない。
+#[tokio::test]
+async fn a_runaway_reaches_every_reader_folded_and_is_saved_whole() {
+    let raw = runaway_reply();
+    // 前提: 畳んだ形は生の出力の頭と同じなので、「畳んだ形が載る」だけでは畳んだことにならない。
+    // **単位が2回続く綴りが載らないこと**を一緒に見る（生の出力には在る）。
+    assert!(
+        raw.starts_with(FOLDED_RUNAWAY_REPLY) && raw.contains(&RUNAWAY_UNIT.repeat(2)),
+        "前提: 生の出力は単位を2回以上続けて持つこと"
+    );
+
+    let main = MainLlm::replying(&raw);
+    let sub = SubLlm::replying(&[EXTRACTED]);
+    let server = TestServer::start(Arc::clone(&main), Arc::clone(&sub)).await;
+
+    let body = server.chat(&non_streaming_body(USER_MESSAGE)).await;
+    // **API の使い手に返す本文は畳まない**（ADR-0062 §決定2）。
+    let value: Value = serde_json::from_str(&body).expect("JSON として読めること");
+    assert_eq!(
+        value["choices"][0]["message"]["content"].as_str(),
+        Some(raw.as_str()),
+        "前提: 非ストリーミングの応答本文は上流のまま返ること"
+    );
+
+    // 1. 裏方（記憶抽出）には、剥がして畳んだ本文がキャラクター側の小見出しの下に載る。
+    wait_for_calls(&sub, 1).await;
+    let extraction = sub.last_prompt();
+    assert_each_turn_sits_under_its_own_heading(&extraction, USER_MESSAGE, FOLDED_RUNAWAY_REPLY);
+    assert!(
+        !extraction.contains(&RUNAWAY_UNIT.repeat(2)),
+        "抽出の依頼に暴走を載せないこと: {extraction:?}"
+    );
+    assert!(
+        !extraction.contains(LEAKED_THOUGHT),
+        "抽出の依頼に思考を載せないこと: {extraction:?}"
+    );
+
+    // 2. 保存: `raw_content` は生のまま、分解した本文は畳んだ後。
+    let model = value["model"].as_str().expect("model は文字列であること");
+    let (_, raw_session) = model.split_once('@').expect("`名前@セッションid` の形");
+    let raw_session: i64 = raw_session.parse().expect("セッション id は整数");
+    let character = server.character().await;
+    let session = server
+        .store
+        .find_session(character.id, raw_session)
+        .await
+        .expect("セッションを引けること")
+        .expect("セッションが存在すること");
+    let saved = server
+        .store
+        .recent_messages(session.id, 10)
+        .await
+        .expect("履歴を読めること");
+    assert_eq!(saved.len(), 2, "往復2件が入ること: {saved:?}");
+    assert_eq!(
+        saved[1].raw_content, raw,
+        "`raw_content` を畳まないこと（絶対制約）"
+    );
+    assert_eq!(saved[1].dialogue.as_deref(), Some("おかえりなさい"));
+    assert_eq!(
+        saved[1].narration.as_deref(),
+        Some(" 彼女は微笑んだ。ずっと一緒だよ、"),
+        "分解した本文は剥がして畳んだ後であること"
+    );
+
+    // 3. 次のターンの履歴には、保存した生の出力から畳み直した本文が載る。
+    server.chat(&non_streaming_body("もう一度")).await;
+    let persona = main.last_prompt();
+    assert!(
+        persona.contains(FOLDED_RUNAWAY_REPLY),
+        "履歴に畳んだ応答が載ること: {persona:?}"
+    );
+    assert!(
+        !persona.contains(&RUNAWAY_UNIT.repeat(2)),
+        "履歴に暴走を載せないこと: {persona:?}"
+    );
+
+    server.stop().await;
+}
+
 /// **保存済みのキャラクター自身の記憶は、本文の依頼に載らず、抽出の依頼には載る**
 /// （ADR-0050 §作る前の測定と決め直し 1 / A-11a）。
 ///

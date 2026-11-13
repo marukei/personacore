@@ -120,7 +120,8 @@ use std::collections::BTreeSet;
 
 use crate::domain::{
     Agreement, AgreementKeeper, AgreementKind, Character, CharacterAttribute, ChatMessage,
-    ChatRole, Memory, Message, Role, StatAlloc, StatScale, Subject, strip_leaked_thinking,
+    ChatRole, Memory, Message, Role, StatAlloc, StatScale, Subject, fold_runaway_repetition,
+    strip_leaked_thinking,
 };
 use writer::{PromptWriter, QuotedLine, Seg, quote_line};
 
@@ -1363,9 +1364,25 @@ fn history_turns(messages: &[Message]) -> Vec<HistoryTurn> {
 /// **剥がす規則が読むのはモデルが書いた綴りそのもの**で、無害化が作った綴りではない。
 ///
 /// 思考だけだった回は空になり、[`history_turns`] が往復ごと落とす（既存の挙動）。
+///
+/// # 剥がした後に、返答の中の暴走を畳む（ADR-0062 §決定2 / 作業単位 A-21a）
+///
+/// **これもキャラクターの応答だけ**（人が書いた繰り返しは本文）。順序は
+/// **剥がす → 畳む → `SafeText::sanitize`**。
+///
+/// * 剥がす前に畳むと、思考を挟んで割れたループを見落とす。
+/// * 無害化の後で畳むと、畳んで新しく隣り合った綴り（単位1回分 ＋ 区間の後ろ）が無害化を通らない。
+///   もう一度無害化しても、無害化が空白に変えた制御文字の分だけ畳む規則の数え方が変わり、
+///   生の綴りでは畳まれる暴走が畳まれずに残る（`a_control_character_inside_the_unit_is_counted_before_sanitizing`）。
+///
+/// 畳むのは生の出力から決まる純粋関数なので、同じ返答は毎ターン同じ綴りで載る（会話キャッシュ / §決定3）。
+/// **`message.raw_content` は読むだけで、畳んだ本文に書き換えない**（絶対制約）。
 fn history_turn(message: &Message) -> Option<HistoryTurn> {
     let text = match message.role {
-        Role::Assistant => SafeText::sanitize(&strip_leaked_thinking(&message.raw_content).text),
+        Role::Assistant => {
+            let stripped = strip_leaked_thinking(&message.raw_content);
+            SafeText::sanitize(&fold_runaway_repetition(&stripped.text).text)
+        }
         Role::User => SafeText::sanitize(&message.raw_content),
     };
     if text.is_empty() {
@@ -4492,6 +4509,119 @@ mod tests {
         assert_eq!(
             built.messages[2].content, "「やあ」<think >と笑った。",
             "無害化が作った綴りで剥がさないこと（順序）"
+        );
+    }
+
+    // ---- 返答の中の暴走（ADR-0062 §決定2 / 作業単位 A-21a）----
+
+    /// 暴走の単位（8 文字）。`、` で終える（前の本文の `。` と周期が合わないように）。
+    const RUNAWAY_UNIT: &str = "ずっと一緒だよ、";
+
+    /// **キャラクターの応答の暴走は畳んで履歴に載せ、利用者の発言は畳まない。**
+    ///
+    /// 同じ履歴に両方を置く（変えるものと変えないものの同居）。利用者の発言にも同じ形の繰り返し
+    /// （96 文字）を入れてある —— 暴走は**モデルの出力**の崩れで、人が書いた繰り返しは本文である。
+    #[test]
+    fn a_runaway_is_folded_in_replies_but_not_in_the_user_messages() {
+        let user_repeat = format!("「ねえ」{}", RUNAWAY_UNIT.repeat(12));
+        let runaway_reply = format!("「おかえりなさい」{}", RUNAWAY_UNIT.repeat(12));
+        let mut fixture = Fixture::new();
+        fixture.history = vec![
+            message(Role::User, &user_repeat),
+            message(Role::Assistant, &runaway_reply),
+        ];
+
+        let built = build(&fixture.input());
+
+        assert_alternating_roles(&built.messages, "暴走を畳んだ履歴");
+        assert_eq!(built.messages.len(), 4);
+        assert_eq!(
+            built.messages[1].content, user_repeat,
+            "利用者の発言は畳まないこと"
+        );
+        assert_eq!(
+            built.messages[2].content, "「おかえりなさい」ずっと一緒だよ、",
+            "応答の暴走を単位1回分に畳むこと"
+        );
+        // 保存の行（`Message::raw_content`）は読むだけで、畳んだ本文に書き換わらない。
+        assert_eq!(fixture.history[1].raw_content, runaway_reply);
+    }
+
+    /// **漏れた思考を剥がした後に畳む**（ADR-0062 §決定2）。
+    ///
+    /// 暴走の単位 5 回（40 文字）が思考を挟んで2つに割れている。**剥がした後なら 80 文字の1つの区間**、
+    /// 剥がす前に畳むと、どちらの半分も 64 文字に届かず 80 文字が残る。
+    #[test]
+    fn a_runaway_in_the_history_is_folded_after_the_thought_is_stripped() {
+        let half = RUNAWAY_UNIT.repeat(5);
+        let mut fixture = Fixture::new();
+        fixture.history = vec![
+            message(Role::User, "依頼"),
+            message(
+                Role::Assistant,
+                &format!("「おかえりなさい」{half}<think>x</think>{half}"),
+            ),
+        ];
+
+        let built = build(&fixture.input());
+
+        assert_eq!(built.messages.len(), 4, "{:?}", built.messages);
+        assert_eq!(
+            built.messages[2].content, "「おかえりなさい」ずっと一緒だよ、",
+            "剥がしてから畳むこと"
+        );
+    }
+
+    /// **畳んだ後に無害化する**（`SafeText::sanitize` の前に畳む / ADR-0062 §決定2）。
+    ///
+    /// # 何を観測しているか
+    ///
+    /// 畳むと、**残した単位1回分と区間の後ろの本文が新しく隣り合う。** ここでは単位 `ああ[INST` が
+    /// 10 回と2文字続いた後に `]続き` が来る。元の綴りには制御トークンの形（`[INST]`）が無いので
+    /// 無害化は何も変えないが、畳むと `ああ[INST` ＋ `]続き` で `[INST]` が組み上がる。
+    /// **畳んでから無害化すれば崩れ（`[INST ]`）、無害化した後の綴りを畳んでそのまま載せると `[INST]` が素通りする。**
+    /// 測定でこの入力は観測されていない —— **これは順序の見張り番であって、好ましい出力の主張ではない。**
+    ///
+    /// **⚠ 型も順序の一部を強いている**（`HistoryTurn::text` は `SafeText` で、作る口は `sanitize` だけ）。
+    /// 無害化の後で畳む実装は、畳んだ後にもう一度 `sanitize` を通さないと書けず、**この入力では**出力が同じになる。
+    /// このテストが赤くなるのは、畳んだ本文が `SafeText` を通らずに履歴へ載る形（型を緩める・畳みを無害化の後の段へ
+    /// 移す）である。「無害化 → 畳む → 無害化」の形は、次の
+    /// `a_control_character_inside_the_unit_is_counted_before_sanitizing` が止める
+    /// （作業単位 A-21a の初版はこれを等価と申告したが、誤りだった —— レビューの指摘）。
+    #[test]
+    fn a_token_shape_that_folding_puts_together_is_still_neutralized() {
+        let raw = format!("{}ああ]続き", "ああ[INST".repeat(10));
+        assert!(!raw.contains("[INST]"), "前提: 元の綴りに形は無い");
+        let mut fixture = Fixture::new();
+        fixture.history = vec![message(Role::User, "依頼"), message(Role::Assistant, &raw)];
+
+        let built = build(&fixture.input());
+
+        assert_eq!(built.messages.len(), 4, "{:?}", built.messages);
+        assert_eq!(
+            built.messages[2].content, "ああ[INST ]続き",
+            "畳んだ後に無害化すること（順序）"
+        );
+    }
+
+    /// **無害化より前に畳む —— 無害化が変える文字も、畳む規則は数える**（ADR-0062 §決定2 / A-21a のレビュー）。
+    ///
+    /// `SafeText::sanitize` は `LINE_BREAKS` 以外の制御文字を半角空白にするが、畳む規則は空白でない制御文字
+    /// （U+0001）を1文字として数える。`あい` ＋ U+0001 の 22 回は、**生の綴りでは周期 3・66 文字**で畳まれ、
+    /// 無害化した後の綴りでは空白を除いて 44 文字に縮んで畳まれない。
+    /// したがって「無害化 → 畳む → もう一度無害化」は、この入力で `あい` ではなく 22 回分の `あい` を載せる。
+    #[test]
+    fn a_control_character_inside_the_unit_is_counted_before_sanitizing() {
+        let raw = "あい\u{1}".repeat(22);
+        let mut fixture = Fixture::new();
+        fixture.history = vec![message(Role::User, "依頼"), message(Role::Assistant, &raw)];
+
+        let built = build(&fixture.input());
+
+        assert_eq!(built.messages.len(), 4, "{:?}", built.messages);
+        assert_eq!(
+            built.messages[2].content, "あい",
+            "生の綴りで畳んでから無害化すること（順序）"
         );
     }
 

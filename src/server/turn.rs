@@ -6,6 +6,7 @@
 //! ```text
 //! 上流の応答（生出力）
 //!   → domain::strip_leaked_thinking … 漏れた思考を剥がす（ADR-0053。raw_content は生のまま）
+//!   → domain::fold_runaway_repetition … 暴走を畳む（ADR-0062。剥がした後に。raw_content は生のまま）
 //!   → parse::parse_response      … 台詞 / 地の文へ分解（純粋関数）
 //!   → domain::NewMessage × 2     … 利用者の発言 ＋ 応答
 //!   → Store::append_turn         … 1トランザクションで書く（11b-1）
@@ -40,7 +41,9 @@
 
 use super::empty_retry::EmptyRetry;
 use super::extract::Extraction;
-use crate::domain::{NewMessage, Role, SessionId, StatAlloc, strip_leaked_thinking};
+use crate::domain::{
+    NewMessage, Role, SessionId, StatAlloc, fold_runaway_repetition, strip_leaked_thinking,
+};
 use crate::parse::leak::{AxisLeaks, detect_axis_leaks};
 use crate::parse::{ParseOutcome, parse_response};
 use crate::store::{Store, StoreError};
@@ -70,8 +73,20 @@ struct TurnMessages<'a> {
     /// 分解の手前で剥がした思考（ADR-0053 / 作業単位 B-61）。**記録するだけ**——
     /// `raw_content` は思考込みの生出力のまま。
     thinking: ThinkingTally,
+    /// 分解の手前で畳んだ暴走（ADR-0062 / 作業単位 A-21a）。**記録するだけ**——
+    /// `raw_content` は暴走込みの生出力のまま。
+    runaway: RunawayTally,
     /// 応答に漏れた軸名（ADR-0018）。**記録するだけで、保存する2件には影響しない。**
     leaks: AxisLeaks<'a>,
+}
+
+/// 分解の手前で畳んだ暴走の数え（ADR-0062 §決定7）。**ログの2つの欄になる。**
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RunawayTally {
+    /// 畳んだ区間の数。
+    runs: usize,
+    /// 最長の区間の長さ（空白を除いた文字数）。区間が無ければ 0。
+    longest: usize,
 }
 
 /// 分解の手前で剥がした思考の数え（ADR-0053 §決定5）。**ログの2つの欄になる。**
@@ -99,7 +114,10 @@ fn turn_messages<'a>(
     // `parse_response` の中で剥がさないのは、崩れた回の「生出力を丸ごと地の文」が
     // 思考込みに戻ってしまうから（ADR-0053 の却下欄）。**`raw_content` には生のまま入れる。**
     let thinking = strip_leaked_thinking(raw_reply);
-    let parsed = parse_response(&thinking.text);
+    // **剥がした後に、返答の中の暴走を畳む**（ADR-0062 §決定2）。剥がす前に畳むと、思考を挟んで
+    // 割れたループを見落とし、思考の中のループで区間を数える。**`raw_content` には生のまま入れる。**
+    let runaway = fold_runaway_repetition(&thinking.text);
+    let parsed = parse_response(&runaway.text);
     // **分解の後に判定する。** 地の文と台詞を分けて数えるので、分解前には決められない。
     let leaks = detect_axis_leaks(&parsed, stats);
 
@@ -116,7 +134,8 @@ fn turn_messages<'a>(
             dialogue: parsed.dialogue,
             narration: parsed.narration,
             // **生出力を丸ごと。** 崩れた回もここに全部残る（絶対制約）。
-            // **剥がした後の本文を入れないこと**（思考込みの生出力が唯一の調査材料 / ADR-0053 §決定3）。
+            // **剥がした後・畳んだ後の本文を入れないこと**（思考込み・暴走込みの生出力が唯一の調査材料 /
+            // ADR-0053 §決定3・ADR-0062 §決定2）。
             raw_content: raw_reply.to_owned(),
         },
         outcome: parsed.outcome,
@@ -124,6 +143,10 @@ fn turn_messages<'a>(
         thinking: ThinkingTally {
             blocks: thinking.blocks,
             unclosed: thinking.unclosed,
+        },
+        runaway: RunawayTally {
+            runs: runaway.runs.len(),
+            longest: runaway.longest(),
         },
         leaks,
     }
@@ -155,6 +178,7 @@ fn log_outcome(
     outcome: ParseOutcome,
     emphasis_pairs_stripped: usize,
     thinking: ThinkingTally,
+    runaway: RunawayTally,
     leaks: &AxisLeaks<'_>,
     session_id: SessionId,
     retry: EmptyRetry,
@@ -181,6 +205,13 @@ fn log_outcome(
         // （ADR-0053 §結果。そのとき画面は「応答が空でした。」になる）。
         thinking_blocks_stripped = thinking.blocks,
         thinking_unclosed = thinking.unclosed,
+        // **分解の手前で畳んだ暴走**（ADR-0062 §決定7 / 作業単位 A-21a）。**画面には出さない。**
+        // **0 の回も出す**（出さないと分母が作れない / ADR-0053 §決定5 と同じ理由）。
+        // 欄名は `runaway_` で始める —— 思考の欄・強調の欄と単位が混ざらないように。
+        // `runaway_runs_folded` は畳んだ区間の数、`runaway_longest_run_chars` は最長の区間の長さ
+        // （空白を除いた文字数。区間が無ければ 0）。**中継の打ち切り（ADR-0062 §決定4）は別の行で言う。**
+        runaway_runs_folded = runaway.runs,
+        runaway_longest_run_chars = runaway.longest,
         // **空の本文の引き直し**（ADR-0059 §決定3 / 追記（2026-11-13）の決定5 / 作業単位 A-18b・A-18c）。
         // **0 / false / None の回も出す**（出さないと分母が作れない）。
         // `empty_retries` は送った引き直しの回数（0〜2。開けなかった回も数える）。
@@ -275,6 +306,7 @@ impl TurnSink {
             turn.outcome,
             turn.emphasis_pairs_stripped,
             turn.thinking,
+            turn.runaway,
             &turn.leaks,
             self.session_id,
             retry,
@@ -646,6 +678,7 @@ mod tests {
                 ParseOutcome::Structured,
                 0,
                 ThinkingTally::default(),
+                RunawayTally::default(),
                 &no_leaks(),
                 session(),
                 EmptyRetry::default(),
@@ -699,6 +732,7 @@ mod tests {
                     outcome,
                     0,
                     ThinkingTally::default(),
+                    RunawayTally::default(),
                     &no_leaks(),
                     session(),
                     EmptyRetry::default(),
@@ -730,6 +764,7 @@ mod tests {
                 ParseOutcome::Fallback(FallbackReason::Unclosed),
                 0,
                 ThinkingTally::default(),
+                RunawayTally::default(),
                 &no_leaks(),
                 session(),
                 EmptyRetry::default(),
@@ -788,6 +823,7 @@ mod tests {
                 turn.outcome,
                 turn.emphasis_pairs_stripped,
                 turn.thinking,
+                turn.runaway,
                 &turn.leaks,
                 session(),
                 EmptyRetry::default(),
@@ -864,6 +900,7 @@ mod tests {
                 turn.outcome,
                 turn.emphasis_pairs_stripped,
                 turn.thinking,
+                turn.runaway,
                 &turn.leaks,
                 session(),
                 EmptyRetry::default(),
@@ -899,6 +936,7 @@ mod tests {
                 turn.outcome,
                 turn.emphasis_pairs_stripped,
                 turn.thinking,
+                turn.runaway,
                 &turn.leaks,
                 session(),
                 EmptyRetry::default(),
@@ -945,6 +983,7 @@ mod tests {
                 turn.outcome,
                 turn.emphasis_pairs_stripped,
                 turn.thinking,
+                turn.runaway,
                 &turn.leaks,
                 session(),
                 EmptyRetry::default(),
@@ -978,6 +1017,7 @@ mod tests {
                 turn.outcome,
                 turn.emphasis_pairs_stripped,
                 turn.thinking,
+                turn.runaway,
                 &turn.leaks,
                 session(),
                 EmptyRetry::default(),
@@ -1021,6 +1061,7 @@ mod tests {
                 turn.outcome,
                 turn.emphasis_pairs_stripped,
                 turn.thinking,
+                turn.runaway,
                 &turn.leaks,
                 session(),
                 EmptyRetry::default(),
@@ -1175,6 +1216,7 @@ mod tests {
                     turn.outcome,
                     turn.emphasis_pairs_stripped,
                     turn.thinking,
+                    turn.runaway,
                     &turn.leaks,
                     session(),
                     EmptyRetry::default(),
@@ -1195,6 +1237,138 @@ mod tests {
             assert!(
                 !output.contains("First.") && !output.contains("The user"),
                 "思考の中身をログに出さないこと: {output:?}"
+            );
+        }
+    }
+
+    // ---- 返答の中の暴走（ADR-0062 / 作業単位 A-21a）----
+
+    /// 暴走の単位（8 文字）。**`、` で終える** —— [`REPLY`] の末尾の `。` と周期が合わないように
+    /// （合うと区間が1文字前へ伸び、残る単位が回転する）。
+    const RUNAWAY_UNIT: &str = "ずっと一緒だよ、";
+
+    /// **まともな前半の後ろに、同じ単位がそのまま 12 回続く応答**（96 文字の区間 / ADR-0062 §背景の形を縮めたもの）。
+    fn runaway_reply() -> String {
+        format!("{REPLY}{}", RUNAWAY_UNIT.repeat(12))
+    }
+
+    /// **思考の剥がしとの順序の見張り番。** 暴走の単位 5 回（40 文字）が思考を挟んで2つに割れている。
+    ///
+    /// **剥がした後なら 80 文字の1つの区間**として畳まれ、**剥がす前に畳むと、どちらの半分も
+    /// 64 文字に届かず畳まれない**（その後で剥がすと、畳まれない 80 文字が残る）。
+    fn runaway_split_by_a_thought() -> String {
+        let half = RUNAWAY_UNIT.repeat(5);
+        format!("「おかえりなさい」{half}<think>x</think>{half}")
+    }
+
+    /// **保存は暴走込み、分解は畳んだ後**——同じ回で両方を見る（ADR-0062 §決定2）。
+    #[test]
+    fn a_runaway_reply_is_folded_before_splitting_but_kept_whole_in_the_raw_output() {
+        assert_eq!(RUNAWAY_UNIT.chars().count(), 8, "前提: 単位は 8 文字");
+        let stats = stats();
+        let raw = runaway_reply();
+        let turn = turn_messages(USER_MESSAGE, &raw, &stats);
+
+        // **保存する生出力は暴走込み**（絶対制約）。
+        assert_eq!(
+            turn.reply.raw_content, raw,
+            "`raw_content` に畳んだ本文を入れないこと（絶対制約）"
+        );
+        // **分解した本文は畳んだ後**（単位1回分が残る）。
+        assert_eq!(turn.reply.dialogue.as_deref(), Some("おかえりなさい"));
+        assert_eq!(
+            turn.reply.narration.as_deref(),
+            Some(" 彼女は微笑んだ。ずっと一緒だよ、")
+        );
+        assert_eq!(turn.outcome, ParseOutcome::Structured);
+        assert_eq!(
+            turn.runaway,
+            RunawayTally {
+                runs: 1,
+                longest: 96
+            }
+        );
+        // 対照: 暴走の無い回は 0。
+        let clean = turn_messages(USER_MESSAGE, REPLY, &stats);
+        assert_eq!(clean.runaway, RunawayTally::default());
+    }
+
+    /// **漏れた思考を剥がした後に畳む**（ADR-0062 §決定2）。
+    #[test]
+    fn a_runaway_is_folded_after_the_leaked_thought_is_stripped() {
+        let stats = stats();
+        let raw = runaway_split_by_a_thought();
+        let turn = turn_messages(USER_MESSAGE, &raw, &stats);
+
+        assert_eq!(turn.reply.raw_content, raw, "生出力は思考も暴走も込み");
+        assert_eq!(turn.reply.dialogue.as_deref(), Some("おかえりなさい"));
+        assert_eq!(
+            turn.reply.narration.as_deref(),
+            Some(RUNAWAY_UNIT),
+            "剥がしてから畳むこと（畳んでから剥がすと 80 文字が残る）"
+        );
+        assert_eq!(
+            turn.thinking,
+            ThinkingTally {
+                blocks: 1,
+                unclosed: false
+            }
+        );
+        assert_eq!(
+            turn.runaway,
+            RunawayTally {
+                runs: 1,
+                longest: 80
+            }
+        );
+    }
+
+    /// **畳んだ区間の数と最長の区間の長さが、分解の記録と同じ1行に載る**（ADR-0062 §決定7）。
+    ///
+    /// 3つの回（区間2つ・区間1つ・暴走なし）を**それぞれ別の値**で見る。
+    /// 区間2つの回は、**最長が後ろの区間**になるようにしてある（「最初の区間の長さ」を載せる実装を緑にしない）。
+    #[test]
+    fn the_folded_runaway_is_recorded_in_the_parse_line() {
+        let stats = stats();
+        let two_runs = format!(
+            "{}「おかえりなさい」{}",
+            "あい".repeat(32),
+            RUNAWAY_UNIT.repeat(9)
+        );
+
+        for (reply, runs, longest) in [
+            (two_runs.as_str(), 2, 72),
+            (runaway_reply().as_str(), 1, 96),
+            // **0 の回も欄を出す**（出さないと分母が作れない）。
+            (REPLY, 0, 0),
+        ] {
+            let turn = turn_messages(USER_MESSAGE, reply, &stats);
+            let output = captured_under_default_filter(|| {
+                log_outcome(
+                    turn.outcome,
+                    turn.emphasis_pairs_stripped,
+                    turn.thinking,
+                    turn.runaway,
+                    &turn.leaks,
+                    session(),
+                    EmptyRetry::default(),
+                );
+            });
+
+            let line = line_containing(&output, "応答を分解しました");
+            assert!(
+                has_field(line, &format!("runaway_runs_folded={runs}")),
+                "{reply:?}: 畳んだ区間の数を同じ行に載せること: {line:?}"
+            );
+            assert!(
+                has_field(line, &format!("runaway_longest_run_chars={longest}")),
+                "{reply:?}: 最長の区間の長さを同じ行に載せること: {line:?}"
+            );
+            assert!(has_field(line, "session_id=42"), "{line:?}");
+            // **暴走の中身をログに出さない**（運用ログを会話の写しにしない）。
+            assert!(
+                !output.contains(RUNAWAY_UNIT) && !output.contains("あいあい"),
+                "暴走の中身をログに出さないこと: {output:?}"
             );
         }
     }
@@ -1279,6 +1453,7 @@ mod tests {
                     ParseOutcome::Structured,
                     0,
                     ThinkingTally::default(),
+                    RunawayTally::default(),
                     &no_leaks(),
                     session(),
                     retry,

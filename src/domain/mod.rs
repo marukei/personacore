@@ -23,6 +23,7 @@ mod drift;
 mod drift_ledger;
 mod memory;
 mod message;
+mod runaway;
 mod selector;
 mod session;
 mod stat;
@@ -73,6 +74,10 @@ pub use memory::{
     MemoryId, NewMemory, Subject, SupersededMemory, UnreadableMemory,
 };
 pub use message::{Message, MessageId, NewMessage, Role};
+pub use runaway::{
+    FoldedRunaway, RUNAWAY_MAX_PERIOD, RUNAWAY_MIN_CHARS, RUNAWAY_MIN_COPIES, RunawayRun,
+    fold_runaway_repetition,
+};
 pub use selector::{ModelSelector, SelectorError, SessionRef};
 pub use session::SessionId;
 pub use stat::{AxisError, ScaleError, StatAlloc, StatAxis, StatScale, StatValue, ValueError};

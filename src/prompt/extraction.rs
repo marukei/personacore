@@ -589,12 +589,12 @@ pub struct ExtractionInput<'a> {
     /// 今回の利用者の発言。
     pub user_message: &'a str,
     /// 今回のキャラクターの応答。**生出力（`message.raw_content` と同じ文字列）から、
-    /// 上流が漏らした思考だけを剥がしたものを渡す**（`server::extract::TurnJob::character_message` /
-    /// ADR-0053 §決定4）。
+    /// 上流が漏らした思考を剥がし、返答の中の暴走も畳んだものを渡す**（`server::extract::TurnJob::character_message` /
+    /// ADR-0053 §決定4・ADR-0062 §決定2）。
     ///
     /// 分解後の `dialogue` / `narration` を組み直すと、地の文と台詞の境目が
     /// 元と変わる。抽出は「何を言ったか」を読む処理なので、組み直さない本文が正。
-    /// **思考はキャラクターが言ったことではない**ので、それだけは剥がす。
+    /// **思考はキャラクターが言ったことではない**ので剥がす。崩れた繰り返し（暴走）は畳む（ADR-0062 §決定2）。
     pub character_message: &'a str,
     /// **すでに記録済みの記憶**（ADR-0021 §13 / 作業単位 13c-3a）。
     ///
