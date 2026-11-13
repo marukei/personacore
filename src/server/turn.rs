@@ -181,16 +181,20 @@ fn log_outcome(
         // （ADR-0053 §結果。そのとき画面は「応答が空でした。」になる）。
         thinking_blocks_stripped = thinking.blocks,
         thinking_unclosed = thinking.unclosed,
-        // **空の本文の引き直し**（ADR-0059 §決定3 / 作業単位 A-18b）。**0 / false / None の回も出す**
-        // （出さないと分母が作れない）。`empty_retries` は2回目の要求を送った回数（失敗した回も 1）。
-        // `empty_retry_failed=true` は2回目が失敗して1回目を保存した回（捨てた回は無いので `discarded_*` は 0）。
-        // `discarded_*` は捨てた1回目のもの —— 生の出力は保存しないので、長さ（文字数・思考込み）・
-        // 閉じない思考だったか・上流が数えた生成数（返さなければ `None`）だけがここに残る。
+        // **空の本文の引き直し**（ADR-0059 §決定3 / 追記（2026-11-13）の決定5 / 作業単位 A-18b・A-18c）。
+        // **0 / false / None の回も出す**（出さないと分母が作れない）。
+        // `empty_retries` は送った引き直しの回数（0〜2。開けなかった回も数える）。
+        // `empty_retry_failed=true` は引き直しのどれかが開けず、その手前の回を保存した回
+        // （2回目で失敗なら捨てた回は無いので、文字数は 0・閉じない思考は false・生成数は無し。3回目で失敗なら1回目の値が入る）。
+        // `discarded_*` は捨てた回すべてのもの —— 生の出力は保存しないので、長さの合計（文字数・思考込み）・
+        // どれかが閉じない思考だったか・上流が数えた生成数の合計（1回でも返さなければ `None`）だけがここに残る。
+        // `upstream_finish_missing` は、どれかの回が `finish_reason` を返さないまま終わったか（`warn` の行と別に数えるため）。
         empty_retries = retry.retries(),
         empty_retry_failed = retry.failed_over(),
         discarded_reply_chars = retry.discarded_chars(),
         discarded_reply_unclosed = retry.discarded_unclosed(),
         discarded_completion_tokens = ?retry.discarded_completion_tokens(),
+        upstream_finish_missing = retry.finish_missing(),
         session_id = session_id.get(),
         "応答を分解しました"
     );
@@ -244,12 +248,13 @@ impl TurnSink {
     /// 途中で失敗した回に呼ぶと、部分的な応答が履歴に載って以後の文脈が汚れる。
     /// 「呼ばない」ことで守っているので、中継での呼び出し位置は `super::relay` の
     /// `RelayState::complete` の1箇所だけにしてある。そこへ来るのは2経路
-    /// （`chunk_events` の**上流が尽きた枝**と、空の本文を引き直す2回目が**開けなかった後の締め**（`finish_next`） /
-    /// ADR-0059 §決定3）で、どちらも `[DONE]` を流す直前。非ストリーミングは `super::chat` の1箇所。
+    /// （`chunk_events` の**上流が尽きた枝**と、空の本文の回を引き直さずに終える（回数が尽きた・次の回を**開けなかった**）
+    /// 後の締め（`finish_next`） / ADR-0059 §決定3）で、どちらも `[DONE]` を流す直前。非ストリーミングは `super::chat` の1箇所。
     ///
     /// 失敗しても応答は壊さない（モジュールの doc）。
     ///
-    /// **`raw_reply` は採用した回の生の出力**（空の本文を引き直した回は2回目 / ADR-0059 §決定3）。
+    /// **`raw_reply` は採用した回の生の出力**（空の本文を引き直した回は最後に送った回。開けなかったらその手前の回 /
+    /// ADR-0059 §決定3・追記（2026-11-13））。
     /// `retry` は引き直しの記録で、分解の行の欄にだけ載る（保存する2件には影響しない）。
     pub(super) async fn persist(&self, raw_reply: &str, retry: EmptyRetry) {
         let turn = turn_messages(&self.user_message, raw_reply, &self.stats);
@@ -1198,17 +1203,20 @@ mod tests {
 
     /// **引き直しの欄が、分解の記録と同じ1行に載る。0 の回も出す**（出さないと分母が作れない）。
     ///
-    /// 3つの回（引き直さなかった・捨てた・2回目が失敗した）を**それぞれ別の値**で見る。
-    /// 捨てた回の文字数（11）と生成数（57）は互いにも、ほかの欄の値とも違えてある。
+    /// 5つの回（引き直さなかった・捨てた・2回目が失敗した・2回捨てた・3回目が失敗した）を**それぞれ別の値**で見る。
+    /// 捨てた回の文字数（13・3）と生成数（57・23）は互いにも、ほかの欄の値とも違えてある。
+    /// `upstream_finish_missing` は `finish_reason` の無い回を記録した腕だけで立つ（作業単位 A-18c）。
     #[test]
     fn the_empty_retry_is_recorded_in_the_parse_line() {
-        let discarded = EmptyRetry::discarded(
-            "<think>考え中のまま",
+        let usage = |completion_tokens| {
             Some(crate::llm::TokenUsage {
                 prompt_tokens: 900,
-                completion_tokens: Some(57),
-            }),
-        );
+                completion_tokens: Some(completion_tokens),
+            })
+        };
+        let discarded = EmptyRetry::default().discarded("<think>考え中のまま", usage(57));
+        let mut twice = discarded.discarded("  \n", usage(23));
+        twice.note_ending(None, super::super::empty_retry::Delivery::Complete);
         for (retry, expected) in [
             (
                 EmptyRetry::default(),
@@ -1218,6 +1226,7 @@ mod tests {
                     "discarded_reply_chars=0",
                     "discarded_reply_unclosed=false",
                     "discarded_completion_tokens=None",
+                    "upstream_finish_missing=false",
                 ],
             ),
             (
@@ -1228,16 +1237,40 @@ mod tests {
                     "discarded_reply_chars=13",
                     "discarded_reply_unclosed=true",
                     "discarded_completion_tokens=Some(57)",
+                    "upstream_finish_missing=false",
                 ],
             ),
             (
-                EmptyRetry::failed(),
+                EmptyRetry::default().failed(),
                 [
                     "empty_retries=1",
                     "empty_retry_failed=true",
                     "discarded_reply_chars=0",
                     "discarded_reply_unclosed=false",
                     "discarded_completion_tokens=None",
+                    "upstream_finish_missing=false",
+                ],
+            ),
+            (
+                twice,
+                [
+                    "empty_retries=2",
+                    "empty_retry_failed=false",
+                    "discarded_reply_chars=16",
+                    "discarded_reply_unclosed=true",
+                    "discarded_completion_tokens=Some(80)",
+                    "upstream_finish_missing=true",
+                ],
+            ),
+            (
+                discarded.failed(),
+                [
+                    "empty_retries=2",
+                    "empty_retry_failed=true",
+                    "discarded_reply_chars=13",
+                    "discarded_reply_unclosed=true",
+                    "discarded_completion_tokens=Some(57)",
+                    "upstream_finish_missing=false",
                 ],
             ),
         ] {
