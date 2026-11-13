@@ -747,12 +747,13 @@
   （スイート全件緑）。**同じ形の `trimmable_set_matches_the_schema_check`（`character` 側）は未測定。**
   > **「両方向 × 両列」で測ること。** 片方向・片列だけ赤になるのを見て
   > 「守られている」と読むと外す。**12a では台帳の記述そのものが逆だった。**
-- **`the_stat_directive_stays_short` の `FIXED_FRAME` / `NEWEST_MEMORY` は、どのテストも検証していない。**
+- ~~**`the_stat_directive_stays_short` の `FIXED_FRAME` / `NEWEST_MEMORY` は、どのテストも検証していない。**
   削れない枠が動くたびに**人手で測り直す**必要があるのに、**古いままでも緑を通る**
-  （0011b で実際に枠が 8 バイト動き、**更新し忘れても緑だった**ことを実測）。
-  > **気づけたのは作業者が自分で測ったからで、仕組みは何も見張っていない。**
+  （0011b で実際に枠が 8 バイト動き、**更新し忘れても緑だった**ことを実測）。~~
+  → **marukei/personacore#48 で解消。** いまの権威は `every_field_at_its_limit_still_fits_the_default_budget` の `WorstCase` と `FIXED_FRAME_SLACK`（`the_stat_directive_stays_short` は同じ組み立てから測る形になった）。
+  > ~~**気づけたのは作業者が自分で測ったからで、仕組みは何も見張っていない。**
   > 閾値と実測は `src/prompt/mod.rs` の `FIXED_FRAME` の doc が正。**ここに写さない。**
-  > 直すなら「実際に組み上げて測る」形にする話で、**見張り番の作りを変える**ことになる。
+  > 直すなら「実際に組み上げて測る」形にする話で、**見張り番の作りを変える**ことになる。~~
 - **同時実行のテストは、負荷をかけると落ちる。既知のフレークは2本ある。**
   **どちらも変異検査の赤と取り違えやすいので、失敗したテスト名まで見ること。**
   - `tests/store_session.rs::append_turn_is_not_interleaved_with_concurrent_writers`（下記）
@@ -771,10 +772,11 @@
   `unicode-properties`（データのみ・無依存）を入れれば表ごと捨てられる。
   **いま入れていないのは依存を増やす判断を先送りしたため。**
   **見えない文字を完全には覆えないという限界は、`is_effectively_blank` の doc が正。**
-- **`the_stat_directive_stays_short` の上限は、半分しか式になっていない。**
+- ~~**`the_stat_directive_stays_short` の上限は、半分しか式になっていない。**
   `allowance` は `TokenBudget` の定数から導出したが、**削れない枠 `6958` と最新記憶 `104` は
   ハードコード**（どちらも「同じ入力で組み立てたときの実測値」で、定数から導けない）。
-  **削れない枠の中身が増減しても上限は動かない。** 換算が入るまで残る。
+  **削れない枠の中身が増減しても上限は動かない。** 換算が入るまで残る。~~
+  → **marukei/personacore#48 で解消。** いまの権威は `every_field_at_its_limit_still_fits_the_default_budget` の `WorstCase` と `FIXED_FRAME_SLACK`（`the_stat_directive_stays_short` は同じ組み立てから測る形になった）。
 - **`server::context` のテストが `TokenBudget::DEFAULT_CONTEXT_TOKENS` の値に依存している**
   （`the_upstream_value_is_used_when_nothing_is_configured`）。
   **既定値を実機寄りに動かすと一緒に落ちる**（0007 の変異検査で実測）。11c で触るときに直すこと。

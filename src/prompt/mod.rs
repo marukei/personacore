@@ -223,10 +223,11 @@ const STAT_HEADING: &str = "# 性格ステータス";
 /// **裸の数値のまま**という [ADR-0012](../../docs/adr/0012-stat-section-directive.md) の
 /// 実測結果を解消しない。尺度の行は範囲と向きの両方を持つので、こちらは重複になる。
 ///
-/// **削れない枠の余白は 2 バイトしかない**（`STAT_AXIS_DIRECTIVE` の doc）ので、
-/// 尺度の行を足す原資でもある。実測は
-/// `the_scale_line_replaces_only_the_sentence_it_makes_redundant` と
-/// `every_field_at_its_limit_still_fits_the_default_budget`。
+/// **当時（0011b の着手前）の削れない枠の余白は 2 バイトしかなかった**（当時の実測。いまの値ではない /
+/// `STAT_AXIS_DIRECTIVE` の doc）ので、尺度の行を足す原資でもあった。差し替えの実測は
+/// `the_scale_line_replaces_only_the_sentence_it_makes_redundant`。
+/// **いまの余白は `every_field_at_its_limit_still_fits_the_default_budget` の
+/// `WorstCase` と `FIXED_FRAME_SLACK` が固定している**（数をここに写さない）。
 const STAT_NOTE: &str = "記載のない軸は考慮しません。";
 
 /// 性格ステータスの尺度の行、軸の値より前の部分（ADR-0015）。
@@ -307,11 +308,17 @@ const STAT_SCALE_SUFFIX: &str = " が最も強い";
 /// | `SHOW_DONT_TELL` | `口調や性格を地の文で説明せず台詞で示すこと。` | 66 |
 /// | この定数 | `項目名や数値に触れない。` | **36** |
 ///
-/// **`項目名や数値に触れないこと。`（42 バイト）にすると +10 になって入らない。**
-/// `〜ないこと。` を `〜ない。` に削って 36 バイトに収めてある。
+/// > **ここから下の余白の数は、当時の実測である。いまの値ではない。**
+/// > いまの余白は `every_field_at_its_limit_still_fits_the_default_budget` の
+/// > `WorstCase` と `FIXED_FRAME_SLACK` が固定している（marukei/personacore#48。数をここに写さない）。
+/// > 12b で `Persona::MAX_CHARS` を下げてから余白は大きく広がった。
+/// > 下の「入らない」がいまも成り立つかは、`FIXED_FRAME_SLACK` で判断する。
+///
+/// **当時は `項目名や数値に触れないこと。`（42 バイト）にすると +10 になって入らなかった。**
+/// `〜ないこと。` を `〜ない。` に削って 36 バイトに収めた。
 /// 分割前の余白が 6 バイトだったので、**残りは 2 バイトだった。**
 ///
-/// > **作業単位 0011b で 10 バイトに広がった**（実測）。差引 **−8 バイト**の内訳は
+/// > **作業単位 0011b で 10 バイトに広がった**（当時の実測）。差引 **−8 バイト**の内訳は
 /// > **足した尺度の行が 48 バイト ＋ 改行 1**（引用行が1本増えるので改行も1本増える。
 /// > 最悪ケースの `StatScale::MAX` = 100 での実測値
 /// > `stat_scale_line(StatScale::MAX).as_str().len()` = 48）、
@@ -320,11 +327,9 @@ const STAT_SCALE_SUFFIX: &str = " が最も強い";
 /// >
 /// > **単位を混ぜないこと。** 行の増減は「`.len()` ＋ 改行」、行の途中の増減は
 /// > 「`.len()` だけ」で数える（`the_stat_directive_stays_short` も
-/// > `DIRECTIVE_LINES` の `.len()` と `NEWLINES` を別々に引く流儀）。
-/// > 混ぜると再導出した人が `FIXED_FRAME` を 1 ずれた値に「直す」。
-/// > **広がったぶんを使い切る予定が既にある**わけではないが、
-/// > 予算テストの `stats` を3桁に振り切るには 24 バイト要るので**足りない**
-/// > （数字は `every_field_at_its_limit_still_fits_the_default_budget` の doc）。
+/// > `DIRECTIVE_LINES` の `.len()` と `NEWLINES` を別々に数える流儀）。
+/// > 当時は、予算テストの `stats` を3桁に振り切るには 24 バイト要るので**足りなかった**
+/// > （当時の数字は `every_field_at_its_limit_still_fits_the_default_budget` の doc の 0011b の注記）。
 ///
 /// 超えると `every_field_at_its_limit_still_fits_the_default_budget` が落ちるが、
 /// **そこで上限（`Persona::MAX_CHARS` 等）を削る方向に反応しないこと**（ADR-0012）。
@@ -397,7 +402,7 @@ const ATTRIBUTE_HEADING: &str = "# 属性";
 /// # なぜ削れない枠ではないのか（ADR-0051 §決定4 の追記 / 2026-10-22）
 ///
 /// 上限いっぱい（16 件 × 60 字）を削れない枠に入れると、既定の予算（8192）では
-/// 削れない枠だけで取り分を超える（削れない枠 6644 → 10883 > 7168 の実測）。
+/// 削れない枠だけで取り分を超える（当時（A-12a）の実測で、削れない枠 6644 → 10883 > 7168。いまの値ではない）。
 /// **既定の予算は上げない**（小さい窓の上流で溢れる / ADR-0036）。そこで
 /// **削れない枠を引いた残りから先に取り、入りきらないときだけ古い側から落とす**
 /// （`budget::Frames`。落とした件数は `warn` に出る —— `report_agreements`）。
@@ -3057,88 +3062,95 @@ mod tests {
     /// **同じ一覧（`DIRECTIVE_LINES`）から導く。** 3本目の指示行を足す人が
     /// 改行の本数だけ直し忘れる、という形のずれを構造的に潰すため。
     ///
-    /// > **ただし、この一覧は改行の本数を「見張って」はいない。**
-    /// > `NEWLINES` を手で `1` に書き換える変異は**緑を通る**（実測）。
-    /// > 上限が 112 か 113 かで結果が変わるのは合計がちょうど 113 のときだけで、
-    /// > **そこでは下記の権威側が必ず落ちる**ため、どのテストからも観測できない。
-    /// > 境界を踏むテストが無いのであって、権威側が見落とすわけではない。
+    /// # 上限は手で書かず、見張り番と同じ組み立てから測る（marukei/personacore#48）
     ///
-    /// 余白は 114 バイト（`allowance 7168 / これらの行を除いた削れない枠 6950 /
-    /// 最新の記憶 104`）。改行2バイトを含めて収める必要があるため、上限は 112 バイト。
+    /// 上限は「取り分 − これらの行を除いた削れない枠 − 直近の記憶1件 − 最新の1往復」で、
+    /// **どの項も `fixture_at_every_limit()` を既定の予算で組み立てて、その場で測る**
+    /// （`every_field_at_its_limit_still_fits_the_default_budget` と同じ入力）。
+    /// 最新の1往復を引くのは、予算が記憶より先にそれを確保するため（`budget::Frames::new`）。
+    /// いまの余白の大きさは同テストの `WorstCase` と `FIXED_FRAME_SLACK` が固定している。
+    /// **ここに数を写さないこと。**
     ///
-    /// **導出式**（この定数を更新する人が再導出できるように残す）:
+    /// > **かつては削れない枠と直近の記憶を手書きの定数で持っていた**（当時の実測。いまの値ではない）。
+    /// > その定数はどのテストも検証しておらず、0011b で枠が 8 バイト動いても緑のままだった
+    /// > （手書きの枠を実際より 10 バイト大きくしても全緑。0011b のレビューの実測）。
+    /// > その後、手書きの値は実際の枠から離れたまま残っていた（B-83 で判明）。
     ///
-    /// ```text
-    /// 112 = allowance(7168) − これらの行を除いた削れない枠(6950) − 最新記憶のコスト(104) − 改行(2)
-    /// ```
+    /// **合計と改行は、上限の側と比べる側で打ち消し合う**（枠を測って引くため）。つまりこのテストの
+    /// 合否は「最悪ケースの削れない枠が、直近の記憶1件と最新の1往復を残せるか」と同値で、
+    /// **指示行が伸びた分だけ余白が減り、余白（`FIXED_FRAME_SLACK`）を超えたところで落ちる。**
+    /// 指示行を名指しするのは落ちたときの文面である。改行の本数（`NEWLINES`）は合否に効かないが、
+    /// 文面の内訳のために一覧から導いておく。
     ///
-    /// > **`FIXED_FRAME` は作業単位 0011b で 6958 → 6950 に動いた**（実測）。
-    /// > 差引 **−8 バイト**の内訳は `STAT_AXIS_DIRECTIVE` の doc に書いてある
-    /// > （**バイト数を2箇所に書かない。** 片方を直してもう片方が古びるのを避ける）。
-    /// > **尺度の行は定数行ではない**（引用行）ので
-    /// > `DIRECTIVE_LINES` には入らず、この上限が見張る対象ではない。
-    /// > 枠の実測値としてだけ効いている。
-    ///
-    /// **`allowance` の項だけは式で書く**（`MAX_DIRECTIVE_BYTES`）。手写しの数だと
-    /// 予算定数が動いたときに誰も直さないまま黙って古びるため。
-    /// **ただし効果は半分**で、`6958` と `104` は依然ハードコードである
-    /// （どちらも「同じ入力で組み立てたときの実測値」で、定数から導けない）。
-    /// つまり `DEFAULT_CONTEXT_TOKENS` が動けば上限は追随するが、
-    /// **削れない枠の中身が増減しても上限は動かない。**
-    ///
-    /// 実測は `every_field_at_its_limit_still_fits_the_default_budget` と同じ入力で取る。
-    /// **この上限が緩すぎても厳しすぎても、権威側（同テスト）が必ず落ちる**ので、
-    /// こちらは「先に理由付きで落ちる速報」でしかない。
-    /// 現在の合計は 102 バイト（66 + 36）で、**残りは 10 バイト**（0011b の実測）。
+    /// **権威は `every_field_at_its_limit_still_fits_the_default_budget`**（余白を超えれば、
+    /// そちらも必ず落ちる。余白を超えなくても、指示の文面が1バイト動けば `WorstCase` で落ちる）。
+    /// こちらは指示行の大きさを名指しして落ちる速報である。ただし**余白の判定の文面で落ちるのは、
+    /// 指示行の伸びが足せる量（`FIXED_FRAME_SLACK`）を超えてから、余り（`WorstCase::headroom`）を
+    /// 超えるまでの間だけ**。余りまで超えると削れない枠だけで取り分を超え、組み立ての失敗の文面で落ちる
+    /// （その文面にも指示行の大きさを載せる）。指示行以外が伸びて部屋の計算が負になる場合は、
+    /// 引き算の文面で落ちる（指示行のせいではないことが分かる）。
     /// **落ちたときに上限（`Persona::MAX_CHARS` 等）を削る方向で反応しないこと**（ADR-0012）。
     /// 換算（docs/06-roadmap.md の「単位が違う」）が入れば解消する。
     #[test]
     fn the_stat_directive_stays_short() {
         /// 削れない枠に同時に載る指示行。**バイト数も改行の本数もここから導く。**
         const DIRECTIVE_LINES: [&str; 2] = [SHOW_DONT_TELL, STAT_AXIS_DIRECTIVE];
-        /// これらの行を除いた削れない枠の実測値（`allowance` と同じ単位）。
-        ///
-        /// **0011b で 6958 → 6950。** 尺度の行を足し `STAT_NOTE` を削った差引 −8
-        /// （内訳は `STAT_AXIS_DIRECTIVE` の doc）。
-        ///
-        /// # **この値はどのテストも検証していない**（0011b のレビューで判明）
-        ///
-        /// 枠を実際に組み立てて測り直す仕掛けは無く、手で書いた数がそのまま効く。
-        /// **大きすぎる方向には誰も気づかない。** 実測（`cargo test --no-fail-fast`、
-        /// 直列、変異ごとに `Compiling personacore` を確認）:
-        ///
-        /// | `FIXED_FRAME` | 結果 |
-        /// |---|---|
-        /// | 6_958（0011b で更新し忘れた場合の値） | **819 全緑** |
-        /// | 6_960 | **819 全緑**（緑を保つ上限） |
-        /// | 6_961 | 1 失敗（このテストだけ） |
-        ///
-        /// つまり **`FIXED_FRAME ≤ 6_960` なら、この速報は何を書いても緑**である
-        /// （現在の合計 102 バイトに対して上限が 102 に縮むところが境目）。
-        /// **0011b で 6958 のまま放置しても緑だった。** 今回 6950 に直せたのは
-        /// 人が測ったからで、**仕組みは何も見張っていない。**
-        ///
-        /// 小さすぎる方向は安全側（このテストが赤くなるので気づく）。
-        /// **見張り番を足すかどうかは司令塔の判断**（この作業単位の範囲外）。
-        const FIXED_FRAME: u32 = 6_950;
-        /// 最新の記憶1件のコストの実測値。
-        const NEWEST_MEMORY: u32 = 104;
         /// 定数行に付く改行。**一覧から導く**（手書きの `2` は独立に緩められる）。
         const NEWLINES: u32 = DIRECTIVE_LINES.len() as u32;
-        /// 上限。**`allowance` だけを予算定数から導く。**
-        const MAX_DIRECTIVE_BYTES: usize = (TokenBudget::DEFAULT_CONTEXT_TOKENS
-            - TokenBudget::DEFAULT_RESPONSE_TOKENS
-            - FIXED_FRAME
-            - NEWEST_MEMORY
-            - NEWLINES) as usize;
 
         // **合計で見る。** 片方ずつ見ると、もう片方が伸ばし放題になる。
-        let total: usize = DIRECTIVE_LINES.iter().map(|line| line.len()).sum();
+        let total = u32::try_from(DIRECTIVE_LINES.iter().map(|line| line.len()).sum::<usize>())
+            .expect("収まること");
+
+        // 見張り番と同じ入力・同じ予算で組み立てて、枠をその場で測る。
+        let fixture = fixture_at_every_limit();
+        let budget = TokenBudget::default();
+        let Ok(built) = build_prompt(&fixture.input(), budget) else {
+            panic!(
+                "組み立てに失敗した（削れない枠だけで取り分を超えた）: 指示行の合計 {total} バイト ＋ 改行 {NEWLINES} \
+                 （SHOW_DONT_TELL {} / STAT_AXIS_DIRECTIVE {}）",
+                SHOW_DONT_TELL.len(),
+                STAT_AXIS_DIRECTIVE.len()
+            );
+        };
+        let system = system_text(&built);
+        for line in DIRECTIVE_LINES {
+            assert!(
+                system.lines().any(|candidate| candidate == line),
+                "前提: 指示行が1行として削れない枠に載っていること: {line}"
+            );
+        }
+        let fixed_without_directives = built.plan.fixed_tokens() - total - NEWLINES;
+        // 直近の記憶と最新の1往復は**計画からではなく部品から**測る。計画から読むと、
+        // 指示行が余白を超えた瞬間に記憶が落ちて 0 になり、このテストの主張が成り立たなくなる。
+        // 足し方は `price` と同じ（記憶は行区切りの `+ 1`、履歴は `MESSAGE_OVERHEAD_TOKENS`）。
+        // **利用者の記憶の最後を採る**（本文の想起は候補を `Subject::User` に絞る / `prepare`）。
+        let newest_memory = fixture
+            .memories
+            .iter()
+            .rev()
+            .find(|memory| memory.subject == Subject::User)
+            .map(|memory| estimate_tokens(memory_line(memory).line.as_str()) + 1)
+            .expect("利用者の記憶があること");
+        let history_costs: Vec<u32> = history_turns(&fixture.history)
+            .iter()
+            .map(|turn| estimate_tokens(turn.text.as_str()) + MESSAGE_OVERHEAD_TOKENS)
+            .collect();
+        let newest_turn: u32 = history_costs.iter().rev().take(2).sum();
+
+        let room = budget
+            .prompt_allowance()
+            .checked_sub(fixed_without_directives + newest_memory + newest_turn)
+            .unwrap_or_else(|| {
+                panic!(
+                    "指示行を除いた削れない枠 {fixed_without_directives} ＋ 直近の記憶 {newest_memory} \
+                     ＋ 最新の1往復 {newest_turn} だけで取り分を超えた（指示行のせいではない）"
+                )
+            });
         assert!(
-            total <= MAX_DIRECTIVE_BYTES,
-            "削れない枠の余白（{} バイト、改行込み）を超えた: 合計 {total} バイト \
+            total + NEWLINES <= room,
+            "削れない枠の余白（{room} バイト、改行込み）を超えた: 合計 {total} バイト ＋ 改行 {NEWLINES} \
              （SHOW_DONT_TELL {} / STAT_AXIS_DIRECTIVE {}）",
-            MAX_DIRECTIVE_BYTES + usize::try_from(NEWLINES).expect("収まること"),
             SHOW_DONT_TELL.len(),
             STAT_AXIS_DIRECTIVE.len()
         );
@@ -6705,7 +6717,9 @@ mod tests {
     /// * **性格値の「桁数」は上限ちょうどではない**（3つ目の例外 / 作業単位 0011a-2）。
     ///   尺度は上限（`StatScale::MAX` = 100）で作ってあるが、**値は 1〜5 の1桁**。
     ///
-    ///   > **0011b で実測した。振り切ると入らない。**
+    ///   > **0011b で実測した。当時は振り切ると入らなかった**（当時の実測。いまの値ではない。
+    ///   > 12b の後は余白が広がった。いま振り切れるかどうかは `FIXED_FRAME_SLACK` で判断する。
+    ///   > 例外を外して桁数まで振り切るかは、まだ決めていない）。
     ///   > 全 `CROWDED_AXES`（12）軸を `100`（3桁）にすると
     ///   > **削れない枠 7054 → 7078**（+24 バイト）で、
     ///   > **余り 90 に対し最新の記憶が 104** ——「直近の記憶が1件は載る」が破れる
@@ -6722,19 +6736,25 @@ mod tests {
     ///   件数は `AttributeSet::MAX_LEN`（8）、キー 12 文字・値 20 文字。
     ///   **主語は両方を混ぜる**ので小見出しが2本とも出る（最悪ケース）。
     ///
-    /// # この作業単位（12b）での実測
+    /// # いまの数（**権威はこのテストの末尾の `assert_eq!`**）
+    ///
+    /// 削れない枠・取り分・余り・直近の記憶1件・履歴の大きさは `WorstCase` で、
+    /// 削れない枠に**あと足せる量**は `FIXED_FRAME_SLACK` で、このテストが固定している
+    /// （marukei/personacore#48）。**doc やほかの文書に数を写さないこと** —— 写した数は
+    /// 上限や見出しが動いても誰も直さず、黙って古びる（実際に古びていた）。
+    /// どれかの上限・見出し・定数行が動けばこのテストが赤くなるので、**数を直すのはここだけ。**
+    ///
+    /// いまのフィクスチャでは、足せる量は「余り − 直近の記憶 − 最新の1往復」になる
+    /// （境目で、履歴の取り分に最新の1往復しか入らないため。一般には成り立たないので、
+    /// 権威は式ではなく `FIXED_FRAME_SLACK` の境目を踏むこのテスト）。それより古い履歴は削れる枠で、
+    /// 削れない枠が太ると先に落ちる（`budget::Frames::new` の取る順）。
+    /// **新しい欄を削れない枠に足すなら、その上限いっぱいの大きさがこの量に収まること。**
+    ///
+    /// # 作業単位 12b での増減（**当時の実測。いまの値ではない**）
     ///
     /// **単位はすべて `estimate_tokens` の返す値（= UTF-8 バイト数）。**
-    ///
-    /// | | 削れない枠 | 余り（取り分 7168 − 枠） |
-    /// |---|---|---|
-    /// | 着手前 | 7054 | 114 |
-    /// | 属性の節を足した分 | **+1260** | |
-    /// | `Persona::MAX_CHARS` 1000 → 600 | **−1600** | |
-    /// | 完了後 | **6714** | **454** |
-    ///
-    /// **最新の記憶が 104**（実測）なので、**残りは 350 バイト。**
-    /// 着手前の残りは 10 バイトだった（0011b の実測）ので、**340 バイト広がった。**
+    /// 12b は属性の節を足し（**+1260**）、`Persona::MAX_CHARS` を 1000 → 600 に下げた（**−1600**）。
+    /// 差引で余りが 340 バイト広がった。
     ///
     /// 属性の節 1260 の内訳（すべてアストラル面 = 1文字4バイト）:
     /// 節の手前の空行 1 ＋ `# 属性` 8＋改行 ＋ 小見出し 99＋改行 ＋ 69＋改行
@@ -6746,14 +6766,14 @@ mod tests {
     /// 数えており、このテストは**アストラル面 4 バイトの最悪ケース**で測るため。
     /// **差は −150（見積もり）に対し +340（実測）で、符号が逆。**
     ///
-    /// **`Persona::MAX_CHARS` を 1000 のままにすると入らない**（実測。
-    /// 6714 + 1600 = 8314 > 7168 で `BudgetExhausted`）。
+    /// **当時は `Persona::MAX_CHARS` を 1000 のままにすると入らなかった**（12b の実測で
+    /// `BudgetExhausted`）。上限を戻せるかどうかは `FIXED_FRAME_SLACK` で判断する。
     ///
     /// # 取り決めはここに入れない（作業単位 A-12a の決め直し / ADR-0051 §決定4 の追記）
     ///
     /// 取り決めは**削れない枠ではなく、その次の優先の枠**（入りきらないときだけ古い側から落とす）。
     /// 上限いっぱい（16 件 × 60 字）を削れない枠に入れると、削れない枠が 6644 → 10883 になり、
-    /// 取り分 7168 を超えた（実測。節は 4239 = 1行 257 × 16 ＋ 見出し・小見出し3本・空行の 127）。
+    /// 取り分 7168 を超えた（当時（A-12a）の実測。いまの値ではない。節は 4239 = 1行 257 × 16 ＋ 見出し・小見出し3本・空行の 127）。
     /// **既定の予算は上げない**（ADR-0036）。取り決めの側の見張り番は2本:
     /// `agreements_at_their_limit_never_exhaust_the_default_budget_and_the_drop_is_reported`（既定の予算）と
     /// `agreements_at_their_limit_all_fit_a_sufficient_budget`（16384）。
@@ -6787,6 +6807,67 @@ mod tests {
         let built = build_prompt(&fixture.input(), budget)
             .expect("全項目が上限いっぱいでも既定の予算に収まること");
         assert_every_limit_fits(&fixture, &built, allowance);
+
+        let plan = &built.plan;
+        assert_eq!(
+            WorstCase {
+                fixed: plan.fixed_tokens(),
+                allowance,
+                headroom: allowance - plan.fixed_tokens(),
+                included_memories: plan.included_memories(),
+                newest_memory: plan.memory_tokens(),
+                history: plan.history_tokens(),
+            },
+            WorstCase {
+                fixed: 6644,
+                allowance: 7168,
+                headroom: 524,
+                included_memories: 1,
+                newest_memory: 104,
+                history: 300,
+            },
+        );
+        // 削れない枠に**あと何バイト足せるか**の境目（＝新しい欄の上限を決める材料）。
+        // いまのフィクスチャでは、余り（`headroom`）から直近の記憶と最新の1往復を引いた値
+        // （一般には成り立たない。権威はこの境目の assert）。それより古い履歴は
+        // 削れる枠なので、枠が太ると先に落ちる。
+        assert_eq!(
+            (
+                newest_memory_survives(&fixture, FIXED_FRAME_SLACK),
+                newest_memory_survives(&fixture, FIXED_FRAME_SLACK + 1),
+            ),
+            (true, false),
+            "削れない枠に足せる量が {FIXED_FRAME_SLACK} バイトから動いた"
+        );
+    }
+
+    /// 最悪ケースで、削れない枠に**あと足せるバイト数**。これを1バイト超えると
+    /// 直近の記憶が1件も載らなくなる。権威は `every_field_at_its_limit_still_fits_the_default_budget`。
+    const FIXED_FRAME_SLACK: u32 = 360;
+
+    /// 最悪ケースの数（**数の権威**）。単位はすべて `estimate_tokens`（= UTF-8 バイト数）。
+    #[derive(Debug, PartialEq, Eq)]
+    struct WorstCase {
+        fixed: u32,
+        allowance: u32,
+        headroom: u32,
+        included_memories: usize,
+        newest_memory: u32,
+        history: u32,
+    }
+
+    /// 削れない枠が `extra` だけ大きくなっても、組み立てに成功し直近の記憶が1件は載るか。
+    ///
+    /// 削れない枠を直接は太らせられないので、**取り分を同じだけ縮めて**代える
+    /// （`budget::remaining_after_fixed` は「取り分 − 削れない枠」しか見ないので同値）。
+    fn newest_memory_survives(fixture: &Fixture, extra: u32) -> bool {
+        let budget = TokenBudget::new(
+            TokenBudget::DEFAULT_CONTEXT_TOKENS - extra,
+            TokenBudget::DEFAULT_RESPONSE_TOKENS,
+        )
+        .expect("縮めた予算も正当であること");
+        build_prompt(&fixture.input(), budget)
+            .is_ok_and(|built| built.plan.included_memories() >= 1)
     }
 
     /// **削れない枠に載る値をすべて上限いっぱいにしたフィクスチャ**（取り決めは無い）。
@@ -6828,8 +6909,9 @@ mod tests {
                 //
                 // **値そのものは上限ちょうどではない**（1〜5 の1桁）。
                 // 上限ちょうどの尺度（100）で作った値なので 100 まで表現できるが、
-                // **0011b で実測したところ、振り切ると入らない**（+24 バイトで
-                // 「直近の記憶が1件は載る」が破れる）。数字はこのテストの doc にある。
+                // **0011b の当時は、振り切ると入らなかった**（+24 バイトで
+                // 「直近の記憶が1件は載る」が破れた。当時の実測で、いまの値ではない）。
+                // 経緯はこのテストの doc にある。
                 value: StatScale::parse(StatScale::MAX)
                     .expect("上限ちょうどの尺度は正当であること")
                     .value(1 + u32::try_from(index % 5).expect("収まること"))
