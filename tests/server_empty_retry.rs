@@ -1,18 +1,29 @@
-//! **本文が空なら1回だけ引き直す**（[ADR-0059](../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md)
-//! §決定3 / §決定4 の腕5 / 作業単位 A-18b）が、**本番の入口（`App::bind` → `App::serve`）を通って**両方の経路で効くことの検証。
-//! **実際の上流には繋がない**（`wiremock` の偽物）。
+//! **本文が空なら最大2回引き直す**（[ADR-0059](../docs/adr/0059-thinking-and-response-room-in-the-upstream-profile.md)
+//! §決定3 / §決定4 の腕5 / 追記（2026-11-13）の決定1〜6 / 作業単位 A-18b・A-18c）が、**本番の入口（`App::bind` → `App::serve`）を通って**
+//! 両方の経路で効くことの検証。**実際の上流には繋がない**（`wiremock` の偽物）。
 //!
 //! # 何を見るか
 //!
 //! | 見張り番 | 経路 | 観測すること |
 //! |---|---|---|
-//! | [`a_blank_reply_is_retried_once_on_a_face_without_reasoning_effort`] | 非ストリーミング | 思考を書いていない面でも空なら1回だけ同じ要求で引き直し、2回目を返して保存する。使用量の清算は1回で2回目の値。分解の行の欄 |
-//! | [`a_reply_with_a_body_is_sent_once`] | 両方 | 空でない回は1往復だけ。分解の行の欄は 0 |
-//! | [`a_second_blank_reply_is_kept_without_a_third_request`] | 両方 | 2回目も空なら空として保存し、3回目は送らない |
+//! | [`a_blank_reply_is_retried_once_on_a_face_without_reasoning_effort`] | 非ストリーミング | 思考を書いていない面でも空なら同じ要求で引き直し、2回目を返して保存する。2回目が空でなければ3回目は送らない。使用量の清算は1回で2回目の値。分解の行の欄 |
+//! | [`a_reply_with_a_body_is_sent_once`] | 両方 | 空でない回は1往復だけ。分解の行の欄は 0。`finish_reason` がある回では `warn` を出さない |
 //! | [`a_failed_retry_keeps_the_first_blank_reply`] | 両方 | 2回目が失敗したら1回目の空を保存する。中継では `finish_reason` と `[DONE]` が最後に1回だけ流れる |
-//! | [`the_stream_is_retried_when_the_thought_came_in_a_separate_field`] | ストリーミング | 思考を別欄で返し本文が空のまま終わった回（実物の形）は引き直し、2回目を同じ応答の続きとして流す |
+//! | [`the_stream_is_retried_when_the_thought_came_in_a_separate_field`] | ストリーミング | 思考を別欄で返し本文が空のまま終わった回（実物の形）は引き直し、2回目を同じ応答の続きとして流す。2回目が空でなければ3回目は送らない |
 //! | [`the_stream_is_retried_after_a_closed_thought_or_whitespace`] | ストリーミング | 本文の中で閉じた思考だけ・空白だけの回も引き直す。思考の面（`low`）でも |
 //! | [`the_stream_is_not_retried_after_an_unclosed_thought`] | 両方 | 閉じない思考は、中継では引き直さない（非ストリーミングでは引き直す） |
+//! | [`a_third_attempt_is_sent_when_the_second_is_also_blank`] | 両方 | 2回目も空なら3回目を送り、3回目を採る。3回とも同じ要求。捨てた2回の欄は合計 |
+//! | [`three_blank_replies_are_kept_without_a_fourth_request`] | 両方 | 3回とも空なら3回目の空を保存し、4回目は送らない |
+//! | [`a_failed_third_attempt_keeps_the_second_blank_reply`] | 両方 | 3回目を開けなければ2回目の空を保存する（`empty_retries=2`・`failed=true`・捨てた回の欄は1回目） |
+//! | [`a_third_stream_that_breaks_midway_saves_nothing`] | ストリーミング | 3回目の途中で壊れたら error で終え、何も保存しない |
+//! | [`a_blank_cut_by_the_length_limit_allows_only_one_retry_in_either_order`] | 両方 | `length` の空が1回でもあれば、`stop`→`length`・`length`→`stop` のどちらでも3回目を送らない |
+//! | [`a_stream_that_ends_blank_without_a_finish_reason_is_retried`] | ストリーミング | `finish_reason` 無しで `[DONE]` で終わった空も引き直す。`warn` と `upstream_finish_missing` |
+//! | [`a_stream_without_a_finish_reason_is_not_retried_outside_the_rule`] | ストリーミング | 対照: 閉じない思考は引き直さない／開けなければ `[DONE]` だけで空を保存／`Truncated` は引き直さず保存もしない |
+//! | [`a_reply_with_a_body_but_no_finish_reason_is_warned_and_not_retried`] | 両方 | `finish_reason` 無しで本文がある回は `warn` を出すが引き直さない |
+//! | [`both_held_closing_tags_are_relayed_before_the_third_attempt`] | ストリーミング | 捨てる2回の終わりのチャンクの閉じタグが、両方とも下流に流れる |
+//! | [`the_discarded_completion_tokens_are_absent_when_only_some_attempts_report_usage`] | 両方 | 捨てた回の一部だけが `usage` を返したら、生成数の欄は無し |
+//!
+//! 3回目を開く待ちを番人が報告することは、仮想時計の要る見張り番なので `server::relay` の単体テストが見る。
 //!
 //! 偽の上流は本文の依頼（`# ペルソナ` を持つ）にだけ台本を返し、裏方（抽出・提案）には固定の答えを返す。
 //! **台本を使い切った後の本文の依頼には 500 を返す**（数えるのは届いた本文の依頼の件数）。
@@ -78,6 +89,8 @@ const SEAL_LINE: &str = "封を観測しました";
 const CROSSCHECK_LINE: &str = "トークン見積もりを実測と照合しました";
 /// 2回目の要求が失敗したことを言う行（`server::empty_retry::RETRY_FAILED_LINE` の先頭）。
 const RETRY_FAILED_LINE: &str = "空の本文の引き直しに失敗しました";
+/// `finish_reason` が無いまま終わった回を言う行（`server::empty_retry::FINISH_MISSING_LINE` の一部 / 作業単位 A-18c）。
+const FINISH_MISSING_LINE: &str = "finish_reason を返さないまま";
 
 /// 待つ上限。
 const WAIT_LIMIT: Duration = Duration::from_secs(20);
@@ -117,18 +130,30 @@ impl Respond for Script {
     }
 }
 
-/// 非ストリーミングの答え。
+/// 非ストリーミングの答え（`finish_reason` は `stop`）。
 fn completion(content: &str, usage: Option<(u32, u32)>) -> ResponseTemplate {
+    completion_ending(content, Some("stop"), usage)
+}
+
+/// 非ストリーミングの答え。**`finish` が `None` なら `finish_reason` の欄ごと持たない**（作業単位 A-18c）。
+fn completion_ending(
+    content: &str,
+    finish: Option<&str>,
+    usage: Option<(u32, u32)>,
+) -> ResponseTemplate {
+    let mut choice = json!({
+        "index": 0,
+        "message": {"role": "assistant", "content": content},
+    });
+    if let Some(finish) = finish {
+        choice["finish_reason"] = json!(finish);
+    }
     let mut body = json!({
         "id": "chatcmpl-1",
         "object": "chat.completion",
         "created": 1,
         "model": MAIN_MODEL,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": content},
-            "finish_reason": "stop",
-        }],
+        "choices": [choice],
     });
     if let Some(usage) = usage {
         body["usage"] = usage_json(usage);
@@ -157,6 +182,11 @@ fn chunk(delta: Value, finish_reason: Option<&str>, usage: Option<(u32, u32)>) -
 
 /// SSE の答え（`[DONE]` で閉じる。間に注釈の行を挟む —— 実物の形）。
 fn sse(chunks: &[Value]) -> ResponseTemplate {
+    sse_closing(chunks, true)
+}
+
+/// SSE の答え。**`done` が偽なら `[DONE]` を送らずに閉じる**（`llm` 層の `Truncated` になる形 / 作業単位 A-18c）。
+fn sse_closing(chunks: &[Value], done: bool) -> ResponseTemplate {
     let mut text = String::new();
     for (index, chunk) in chunks.iter().enumerate() {
         text.push_str(&format!("data: {chunk}\n\n"));
@@ -164,38 +194,83 @@ fn sse(chunks: &[Value]) -> ResponseTemplate {
             text.push_str(": keep-alive\n\n");
         }
     }
-    text.push_str("data: [DONE]\n\n");
+    if done {
+        text.push_str("data: [DONE]\n\n");
+    }
     ResponseTemplate::new(200).set_body_raw(text, "text/event-stream")
+}
+
+/// 役割だけの先頭チャンク（実物の形）。
+fn role_chunk() -> Value {
+    chunk(json!({"role": "assistant", "content": ""}), None, None)
+}
+
+/// 使用量だけのチャンク（`choices` が空）。
+fn usage_only_chunk(usage: (u32, u32)) -> Value {
+    json!({"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1,
+    "model": MAIN_MODEL, "choices": [], "usage": usage_json(usage)})
 }
 
 /// **思考を別欄（`reasoning_content`）で返し、本文が空のまま終わる**（測定で記録した実物の形。使用量は終わりのチャンク）。
 fn stream_thought_in_a_separate_field(usage: (u32, u32)) -> ResponseTemplate {
-    sse(&[
-        chunk(json!({"role": "assistant", "content": ""}), None, None),
+    stream_thought_ending(Some("stop"), Some(usage))
+}
+
+/// [`stream_thought_in_a_separate_field`] の、終わりの `finish_reason` と使用量を選ぶ形。
+///
+/// `finish` が `None` なら **`finish_reason` 付きのチャンクを1本も送らずに `[DONE]` で閉じる**（使用量は、あれば使用量だけのチャンクで）。
+fn stream_thought_ending(finish: Option<&str>, usage: Option<(u32, u32)>) -> ResponseTemplate {
+    let mut chunks = vec![
+        role_chunk(),
         chunk(json!({"reasoning_content": "The"}), None, None),
         chunk(json!({"reasoning_content": " user is home."}), None, None),
-        chunk(json!({}), Some("stop"), Some(usage)),
-    ])
+    ];
+    match finish {
+        Some(finish) => chunks.push(chunk(json!({}), Some(finish), usage)),
+        None => chunks.extend(usage.map(usage_only_chunk)),
+    }
+    sse(&chunks)
 }
 
 /// **本文を差分で流す**（使用量は終わりの後の使用量だけのチャンク）。
 fn stream_content(parts: &[&str], usage: (u32, u32)) -> ResponseTemplate {
-    let mut chunks = vec![chunk(
-        json!({"role": "assistant", "content": ""}),
-        None,
-        None,
-    )];
+    let mut chunks = vec![role_chunk()];
     chunks.extend(
         parts
             .iter()
             .map(|part| chunk(json!({"content": part}), None, None)),
     );
     chunks.push(chunk(json!({}), Some("stop"), None));
-    chunks.push(
-        json!({"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1,
-        "model": MAIN_MODEL, "choices": [], "usage": usage_json(usage)}),
-    );
+    chunks.push(usage_only_chunk(usage));
     sse(&chunks)
+}
+
+/// **本文を差分で流し、`finish_reason` 付きのチャンクを1本も送らずに閉じる**（marukei/personacore#47 の形）。
+///
+/// `done` が偽なら `[DONE]` も送らない（`Truncated`）。使用量は、あれば使用量だけのチャンクで。
+fn stream_content_without_finish(
+    parts: &[&str],
+    usage: Option<(u32, u32)>,
+    done: bool,
+) -> ResponseTemplate {
+    let mut chunks = vec![role_chunk()];
+    chunks.extend(
+        parts
+            .iter()
+            .map(|part| chunk(json!({"content": part}), None, None)),
+    );
+    chunks.extend(usage.map(usage_only_chunk));
+    sse_closing(&chunks, done)
+}
+
+/// **閉じタグが `finish_reason` のチャンクに載って届く**形（本文の中で閉じた思考だけ）。
+fn stream_closing_in_the_finish(thought: &str, close: &str, usage: (u32, u32)) -> ResponseTemplate {
+    sse(&[
+        role_chunk(),
+        chunk(json!({"content": thought}), None, None),
+        chunk(json!({"content": close}), Some("stop"), None),
+        usage_only_chunk(usage),
+    ])
 }
 
 /// 本文の依頼に `script` を順に返す上流（窓の照会にも答える）。
@@ -469,6 +544,11 @@ fn seen(body: &str) -> Seen {
 impl Seen {
     /// **`finish_reason` と `[DONE]` が最後に1回だけ**流れたこと（`finish_reason` の直後に `[DONE]`、それで終わり）。
     fn assert_finished_once_at_the_end(&self) {
+        self.assert_finished_once_at_the_end_with("stop");
+    }
+
+    /// [`Self::assert_finished_once_at_the_end`] の、`finish_reason` の値を選ぶ形。
+    fn assert_finished_once_at_the_end_with(&self, reason: &str) {
         assert_eq!(
             self.dones,
             vec![self.events - 1],
@@ -476,8 +556,22 @@ impl Seen {
         );
         assert_eq!(
             self.finishes,
-            vec![(self.events - 2, "stop".to_owned())],
+            vec![(self.events - 2, reason.to_owned())],
             "finish_reason は [DONE] の直前に1回だけ: {self:?}"
+        );
+        assert_eq!(self.roles, 1, "役割は1回だけ: {self:?}");
+    }
+
+    /// **`finish_reason` は一度も流れず、`[DONE]` が最後に1回だけ**（`finish_reason` 無しで終わった回を採用した形）。
+    fn assert_done_once_without_a_finish(&self) {
+        assert_eq!(
+            self.dones,
+            vec![self.events - 1],
+            "[DONE] は最後に1回だけ: {self:?}"
+        );
+        assert!(
+            self.finishes.is_empty(),
+            "finish_reason は流れない: {self:?}"
         );
         assert_eq!(self.roles, 1, "役割は1回だけ: {self:?}");
     }
@@ -496,13 +590,19 @@ async fn a_blank_reply_is_retried_once_on_a_face_without_reasoning_effort() {
         vec![
             completion("", Some((FIRST_PROMPT, FIRST_COMPLETION))),
             completion(SECOND, Some((SECOND_PROMPT, SECOND_COMPLETION))),
+            // **3回目の台本も置く**（2回目が空でなければ3回目を送らないこと / 作業単位 A-18c）。
+            completion("余分", None),
         ],
         &json!({}),
         false,
     )
     .await;
 
-    assert_eq!(turn.requests.len(), 2, "1回だけ引き直すこと");
+    assert_eq!(
+        turn.requests.len(),
+        2,
+        "2回目が空でなければ3回目を送らないこと"
+    );
     turn.assert_requests_are_identical();
     assert!(
         turn.requests[0].get("reasoning_effort") == Some(&json!("none")),
@@ -521,6 +621,7 @@ async fn a_blank_reply_is_retried_once_on_a_face_without_reasoning_effort() {
         "discarded_reply_chars=0",
         "discarded_reply_unclosed=false",
         &format!("discarded_completion_tokens=Some({FIRST_COMPLETION})"),
+        "upstream_finish_missing=false",
     ] {
         assert!(has_field(line, field), "{field}: {line:?}");
     }
@@ -569,12 +670,18 @@ async fn a_reply_with_a_body_is_sent_once() {
             "discarded_reply_chars=0",
             "discarded_reply_unclosed=false",
             "discarded_completion_tokens=None",
+            // **`finish_reason` がある回では言わない**（対照 / 作業単位 A-18c）。
+            "upstream_finish_missing=false",
         ] {
             assert!(
                 has_field(line, field),
                 "streaming={streaming}: {field}: {line:?}"
             );
         }
+        assert!(
+            turn.lines(FINISH_MISSING_LINE).is_empty(),
+            "streaming={streaming}: finish_reason がある回では warn を出さないこと"
+        );
         if streaming {
             let seen = seen(&turn.response);
             seen.assert_finished_once_at_the_end();
@@ -583,31 +690,193 @@ async fn a_reply_with_a_body_is_sent_once() {
     }
 }
 
-/// **2回目も空なら空として保存し、3回目は送らない**（両方の経路）。保存するのは2回目の生の出力。
+// ------------------------------------------- 引き直しを最大2回にする（作業単位 A-18c）
+
+/// 1回目の空（空白1文字）。**2回目（[`SECOND_BLANK`]）と文字数が違う** —— 捨てた回の文字数の合計を見分ける。
+const FIRST_BLANK_SPACE: &str = " ";
+/// 2回目の空（本文の中で閉じた思考だけ。16 文字）。
+const SECOND_BLANK: &str = "<think>b</think>";
+/// 2回目の生成数。**1回目（[`FIRST_COMPLETION`]）・3回目（[`SECOND_COMPLETION`]）と違える。**
+const MIDDLE_COMPLETION: u32 = 23;
+/// 2回目のプロンプトの数（清算がどの回の値かを見分ける）。
+const MIDDLE_PROMPT: u32 = 702;
+
+/// 1回目と2回目が空の台本（使用量は両方あり）。3回目は `third`、4回目は余分の本文。
+fn two_blanks_then(third: ResponseTemplate, streaming: bool) -> Vec<ResponseTemplate> {
+    if streaming {
+        vec![
+            stream_content(&[FIRST_BLANK_SPACE], (FIRST_PROMPT, FIRST_COMPLETION)),
+            stream_content(&[SECOND_BLANK], (MIDDLE_PROMPT, MIDDLE_COMPLETION)),
+            third,
+            stream_content(&["余分"], (1, 1)),
+        ]
+    } else {
+        vec![
+            completion(FIRST_BLANK_SPACE, Some((FIRST_PROMPT, FIRST_COMPLETION))),
+            completion(SECOND_BLANK, Some((MIDDLE_PROMPT, MIDDLE_COMPLETION))),
+            third,
+            completion("余分", None),
+        ]
+    }
+}
+
+/// **2回目も空なら3回目を送り、3回目が空でなければそれを採る**（両方の経路 / ADR-0059 追記（2026-11-13）の決定1・決定6）。
+///
+/// 3回とも同じ要求。保存・清算は3回目、捨てた2回の欄は**合計**（文字数 1＋16、生成数 41＋23）。
 #[tokio::test]
-async fn a_second_blank_reply_is_kept_without_a_third_request() {
+async fn a_third_attempt_is_sent_when_the_second_is_also_blank() {
     let _serial = SERIAL.lock().await;
-    /// 2回目（本文の中で閉じた思考だけ）。1回目（空）と別の綴り。
-    const SECOND_BLANK: &str = "<think>\nStill thinking.\n</think>";
+    for streaming in [false, true] {
+        let third = if streaming {
+            stream_content(&SECOND_PARTS, (SECOND_PROMPT, SECOND_COMPLETION))
+        } else {
+            completion(SECOND, Some((SECOND_PROMPT, SECOND_COMPLETION)))
+        };
+        let turn = one_turn(two_blanks_then(third, streaming), &json!({}), streaming).await;
+        assert_eq!(
+            turn.requests.len(),
+            3,
+            "streaming={streaming}: 3回目を送ること"
+        );
+        turn.assert_requests_are_identical();
+        assert_eq!(turn.saved_raw_reply(), SECOND, "streaming={streaming}");
+
+        let line = turn.parse_line();
+        for field in [
+            "outcome=structured",
+            "empty_retries=2",
+            "empty_retry_failed=false",
+            &format!(
+                "discarded_reply_chars={}",
+                FIRST_BLANK_SPACE.chars().count() + SECOND_BLANK.chars().count()
+            ),
+            "discarded_reply_unclosed=false",
+            &format!(
+                "discarded_completion_tokens=Some({})",
+                FIRST_COMPLETION + MIDDLE_COMPLETION
+            ),
+            "upstream_finish_missing=false",
+        ] {
+            assert!(
+                has_field(line, field),
+                "streaming={streaming}: {field}: {line:?}"
+            );
+        }
+        let seals = turn.lines(SEAL_LINE);
+        assert_eq!(seals.len(), 1, "清算は1回だけ: {seals:?}");
+        assert!(
+            has_field(
+                seals[0],
+                &format!("usage_prompt_tokens=Some({SECOND_PROMPT})")
+            ),
+            "清算は3回目の値: {}",
+            seals[0]
+        );
+        let checks = turn.lines(CROSSCHECK_LINE);
+        assert_eq!(checks.len(), 1, "答え合わせは1回だけ: {checks:?}");
+        if streaming {
+            let seen = seen(&turn.response);
+            seen.assert_finished_once_at_the_end();
+            assert_eq!(
+                seen.content,
+                format!("{FIRST_BLANK_SPACE}{SECOND_BLANK}{SECOND}"),
+                "3回目が同じ応答の続きとして流れる"
+            );
+        } else {
+            let returned: Value = serde_json::from_str(&turn.response).expect("JSON");
+            assert_eq!(returned["choices"][0]["message"]["content"], json!(SECOND));
+        }
+    }
+}
+
+/// **3回とも空なら空として保存し、4回目は送らない**（両方の経路）。保存と清算は3回目。
+///
+/// 中継の1回目・2回目は思考を別欄で返す実物の形。
+#[tokio::test]
+async fn three_blank_replies_are_kept_without_a_fourth_request() {
+    let _serial = SERIAL.lock().await;
+    /// 3回目の空（1回目・2回目と別の綴り）。
+    const THIRD_BLANK: &str = "<think>\nStill thinking.\n</think>";
+    /// 3回目のプロンプトの数。
+    const THIRD_PROMPT: u32 = 704;
     for streaming in [false, true] {
         let script = if streaming {
             vec![
                 stream_thought_in_a_separate_field((FIRST_PROMPT, FIRST_COMPLETION)),
-                stream_content(&[SECOND_BLANK], (SECOND_PROMPT, SECOND_COMPLETION)),
+                stream_thought_in_a_separate_field((MIDDLE_PROMPT, MIDDLE_COMPLETION)),
+                stream_content(&[THIRD_BLANK], (THIRD_PROMPT, 5)),
                 stream_content(&SECOND_PARTS, (1, 1)),
             ]
         } else {
             vec![
-                completion("", None),
-                completion(SECOND_BLANK, None),
+                completion("", Some((FIRST_PROMPT, FIRST_COMPLETION))),
+                completion(" ", Some((MIDDLE_PROMPT, MIDDLE_COMPLETION))),
+                completion(THIRD_BLANK, Some((THIRD_PROMPT, 5))),
                 completion(SECOND, None),
             ]
         };
         let turn = one_turn(script, &json!({}), streaming).await;
         assert_eq!(
             turn.requests.len(),
-            2,
-            "streaming={streaming}: 3回目を送らない"
+            3,
+            "streaming={streaming}: 4回目を送らない"
+        );
+        turn.assert_requests_are_identical();
+        assert_eq!(
+            turn.saved_raw_reply(),
+            THIRD_BLANK,
+            "streaming={streaming}: 3回目の空を保存する"
+        );
+        let line = turn.parse_line();
+        for field in [
+            "outcome=empty",
+            "empty_retries=2",
+            "empty_retry_failed=false",
+        ] {
+            assert!(
+                has_field(line, field),
+                "streaming={streaming}: {field}: {line:?}"
+            );
+        }
+        let seals = turn.lines(SEAL_LINE);
+        assert_eq!(seals.len(), 1, "清算は1回だけ: {seals:?}");
+        assert!(
+            has_field(
+                seals[0],
+                &format!("usage_prompt_tokens=Some({THIRD_PROMPT})")
+            ),
+            "{}",
+            seals[0]
+        );
+        if streaming {
+            seen(&turn.response).assert_finished_once_at_the_end();
+        }
+    }
+}
+
+/// **3回目を開けなければ、2回目の空を保存する**（両方の経路）。`empty_retries=2`・`failed=true`、捨てた回の欄は1回目の値。
+///
+/// 中継では、2回目の保留チャンクと `[DONE]` が最後に1回ずつ流れる。清算は1回で2回目の値。
+/// **非ストリーミングでは「3回目の途中で壊れた」も同じ扱い**（応答を最後まで受け取ってから保存するので、
+/// 壊れた回は開けなかった回と区別されない / 作業単位 A-18c の解釈）—— 本文が壊れた JSON の腕で見る。
+#[tokio::test]
+async fn a_failed_third_attempt_keeps_the_second_blank_reply() {
+    let _serial = SERIAL.lock().await;
+    for (streaming, third) in [
+        (false, ResponseTemplate::new(500)),
+        (
+            false,
+            ResponseTemplate::new(200).set_body_raw("{\"choices\":[{\"mess", "application/json"),
+        ),
+        (true, ResponseTemplate::new(500)),
+    ] {
+        let mut script = two_blanks_then(third, streaming);
+        script.truncate(3);
+        let turn = one_turn(script, &json!({}), streaming).await;
+        assert_eq!(
+            turn.requests.len(),
+            3,
+            "streaming={streaming}: 3回目を送った"
         );
         assert_eq!(
             turn.saved_raw_reply(),
@@ -615,10 +884,360 @@ async fn a_second_blank_reply_is_kept_without_a_third_request() {
             "streaming={streaming}: 2回目の空を保存する"
         );
         let line = turn.parse_line();
-        assert!(has_field(line, "outcome=empty"), "{line:?}");
-        assert!(has_field(line, "empty_retries=1"), "{line:?}");
+        for field in [
+            "outcome=empty",
+            "empty_retries=2",
+            "empty_retry_failed=true",
+            &format!(
+                "discarded_reply_chars={}",
+                FIRST_BLANK_SPACE.chars().count()
+            ),
+            &format!("discarded_completion_tokens=Some({FIRST_COMPLETION})"),
+        ] {
+            assert!(
+                has_field(line, field),
+                "streaming={streaming}: {field}: {line:?}"
+            );
+        }
+        let failures = turn.lines(RETRY_FAILED_LINE);
+        assert_eq!(failures.len(), 1, "失敗は1本の warn: {failures:?}");
+        let seals = turn.lines(SEAL_LINE);
+        assert_eq!(seals.len(), 1, "清算は1回だけ: {seals:?}");
+        assert!(
+            has_field(
+                seals[0],
+                &format!("usage_prompt_tokens=Some({MIDDLE_PROMPT})")
+            ),
+            "清算は2回目の値: {}",
+            seals[0]
+        );
         if streaming {
-            seen(&turn.response).assert_finished_once_at_the_end();
+            let seen = seen(&turn.response);
+            seen.assert_finished_once_at_the_end();
+            assert_eq!(seen.content, format!("{FIRST_BLANK_SPACE}{SECOND_BLANK}"));
+        }
+    }
+}
+
+/// **中継で3回目の途中で上流が壊れたら、error で終えて何も保存しない**（A-18b の追記のまま）。
+///
+/// 3回目は本文を1つ流した後、`[DONE]` を送らずに閉じる（`Truncated`）。
+#[tokio::test]
+async fn a_third_stream_that_breaks_midway_saves_nothing() {
+    let _serial = SERIAL.lock().await;
+    let third = sse_closing(
+        &[
+            role_chunk(),
+            chunk(json!({"content": SECOND_PARTS[0]}), None, None),
+        ],
+        false,
+    );
+    let mut script = two_blanks_then(third, true);
+    script.truncate(3);
+    let turn = one_turn(script, &json!({}), true).await;
+    assert_eq!(turn.requests.len(), 3, "前提: 3回目を開いたこと");
+    assert!(turn.saved.is_empty(), "何も保存しない: {:?}", turn.saved);
+    assert!(
+        turn.lines(PARSE_LINE).is_empty(),
+        "分解の行も出ない（保存の入口に来ない）"
+    );
+    let lines = data_lines(&turn.response);
+    assert!(
+        !lines.iter().any(|data| data == "[DONE]"),
+        "[DONE] を流さない: {lines:?}"
+    );
+    let last: Value = serde_json::from_str(lines.last().expect("1件はあること")).expect("JSON");
+    assert!(
+        last.get("error").is_some(),
+        "最後は error オブジェクト: {last}"
+    );
+}
+
+/// **上限（`length`）で切れた空が1回でもあれば、引き直しは合わせて1回まで**（両方の経路・両方の順）。
+///
+/// `stop`→`length` でも `length`→`stop` でも3回目を送らず、2回目の空を保存する。中継の空は思考を別欄で返す形
+/// （本文に漏れる上流の `length` は閉じない思考になり、もともと引き直さない / 決定1）。
+#[tokio::test]
+async fn a_blank_cut_by_the_length_limit_allows_only_one_retry_in_either_order() {
+    let _serial = SERIAL.lock().await;
+    for streaming in [false, true] {
+        for (first, second) in [("stop", "length"), ("length", "stop")] {
+            let script = if streaming {
+                vec![
+                    stream_thought_ending(Some(first), Some((FIRST_PROMPT, FIRST_COMPLETION))),
+                    stream_thought_ending(Some(second), Some((MIDDLE_PROMPT, MIDDLE_COMPLETION))),
+                    stream_content(&SECOND_PARTS, (SECOND_PROMPT, SECOND_COMPLETION)),
+                ]
+            } else {
+                vec![
+                    completion_ending("", Some(first), Some((FIRST_PROMPT, FIRST_COMPLETION))),
+                    completion_ending(" ", Some(second), Some((MIDDLE_PROMPT, MIDDLE_COMPLETION))),
+                    completion(SECOND, Some((SECOND_PROMPT, SECOND_COMPLETION))),
+                ]
+            };
+            let turn = one_turn(script, &json!({}), streaming).await;
+            let case = format!("streaming={streaming} {first}→{second}");
+            assert_eq!(turn.requests.len(), 2, "{case}: 3回目を送らない");
+            let expected = if streaming { "" } else { " " };
+            assert_eq!(
+                turn.saved_raw_reply(),
+                expected,
+                "{case}: 2回目の空を保存する"
+            );
+            let line = turn.parse_line();
+            for field in [
+                "outcome=empty",
+                "empty_retries=1",
+                "empty_retry_failed=false",
+            ] {
+                assert!(has_field(line, field), "{case}: {field}: {line:?}");
+            }
+            if streaming {
+                seen(&turn.response).assert_finished_once_at_the_end_with(second);
+            }
+        }
+    }
+}
+
+/// **中継で、`finish_reason` 付きのチャンクが一度も無いまま `[DONE]` で終わった空も引き直す**（決定2 / marukei/personacore#47）。
+///
+/// その回の `[DONE]` は流さず、2回目を続きとして流す。下流の `finish_reason` と `[DONE]` は2回目のもの。
+/// `finish_reason` が無いまま終わった回は `warn` で言い、分解の行の `upstream_finish_missing` が立つ。
+#[tokio::test]
+async fn a_stream_that_ends_blank_without_a_finish_reason_is_retried() {
+    let _serial = SERIAL.lock().await;
+    let turn = one_turn(
+        vec![
+            stream_content_without_finish(&[], None, true),
+            stream_content(&SECOND_PARTS, (SECOND_PROMPT, SECOND_COMPLETION)),
+            stream_content(&["余分"], (1, 1)),
+        ],
+        &json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(turn.requests.len(), 2, "引き直すこと");
+    turn.assert_requests_are_identical();
+    let seen = seen(&turn.response);
+    seen.assert_finished_once_at_the_end();
+    assert_eq!(seen.content, SECOND);
+    assert_eq!(turn.saved_raw_reply(), SECOND);
+    let line = turn.parse_line();
+    for field in [
+        "outcome=structured",
+        "empty_retries=1",
+        "empty_retry_failed=false",
+        "discarded_reply_chars=0",
+        // **使用量を返さなかった回を捨てた**ので無し。
+        "discarded_completion_tokens=None",
+        "upstream_finish_missing=true",
+    ] {
+        assert!(has_field(line, field), "{field}: {line:?}");
+    }
+    let warns = turn.lines(FINISH_MISSING_LINE);
+    assert_eq!(warns.len(), 1, "1回目だけを言う: {warns:?}");
+    assert!(warns[0].contains("WARN"), "{}", warns[0]);
+    assert!(has_field(warns[0], "streaming=true"), "{}", warns[0]);
+}
+
+/// **`finish_reason` 無しで `[DONE]` で終わった回の対照**（中継）: 閉じない思考は引き直さない／
+/// 引き直しを開けなければ `[DONE]` だけを流して空を保存する／`[DONE]` 無しで尽きた回（`Truncated`）は引き直さず保存もしない。
+#[tokio::test]
+async fn a_stream_without_a_finish_reason_is_not_retried_outside_the_rule() {
+    let _serial = SERIAL.lock().await;
+    /// 閉じない思考。
+    const UNCLOSED: &str = "<think>\nThe user is asking";
+
+    // 閉じない思考 → 引き直さない。
+    let turn = one_turn(
+        vec![
+            stream_content_without_finish(&["<think>\nThe user", " is asking"], None, true),
+            stream_content(&SECOND_PARTS, (SECOND_PROMPT, SECOND_COMPLETION)),
+        ],
+        &json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(turn.requests.len(), 1, "閉じない思考は引き直さない");
+    seen(&turn.response).assert_done_once_without_a_finish();
+    assert_eq!(turn.saved_raw_reply(), UNCLOSED);
+    let line = turn.parse_line();
+    assert!(has_field(line, "empty_retries=0"), "{line:?}");
+    assert!(has_field(line, "upstream_finish_missing=true"), "{line:?}");
+
+    // 引き直しを開けない → `[DONE]` だけを流して、その空の回を保存する。
+    let turn = one_turn(
+        vec![stream_content_without_finish(&[], None, true)],
+        &json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(turn.requests.len(), 2, "引き直しを試みたこと");
+    let seen_failed = seen(&turn.response);
+    seen_failed.assert_done_once_without_a_finish();
+    assert_eq!(seen_failed.content, "");
+    assert_eq!(turn.saved_raw_reply(), "");
+    let line = turn.parse_line();
+    for field in [
+        "outcome=empty",
+        "empty_retries=1",
+        "empty_retry_failed=true",
+        "upstream_finish_missing=true",
+    ] {
+        assert!(has_field(line, field), "{field}: {line:?}");
+    }
+
+    // `[DONE]` 無しで尽きた（`Truncated`）→ 引き直さず、error で終えて保存しない。
+    let turn = one_turn(
+        vec![
+            stream_content_without_finish(&[], None, false),
+            stream_content(&SECOND_PARTS, (SECOND_PROMPT, SECOND_COMPLETION)),
+        ],
+        &json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(turn.requests.len(), 1, "Truncated は引き直さない");
+    assert!(turn.saved.is_empty(), "保存しない: {:?}", turn.saved);
+    // 途中で壊れた回は「終わった回」ではないので、`finish_reason` 無しの `warn` は出さない（壊れたことは別の行が言う）。
+    assert!(
+        turn.lines(FINISH_MISSING_LINE).is_empty(),
+        "Truncated では warn しない"
+    );
+    let lines = data_lines(&turn.response);
+    assert!(!lines.iter().any(|data| data == "[DONE]"), "{lines:?}");
+    let last: Value = serde_json::from_str(lines.last().expect("1件はあること")).expect("JSON");
+    assert!(
+        last.get("error").is_some(),
+        "最後は error オブジェクト: {last}"
+    );
+}
+
+/// **`finish_reason` が無いまま終わったが本文がある回は、`warn` は出るが引き直さない**（両方の経路 / 決定3）。
+#[tokio::test]
+async fn a_reply_with_a_body_but_no_finish_reason_is_warned_and_not_retried() {
+    let _serial = SERIAL.lock().await;
+    for streaming in [false, true] {
+        let script = if streaming {
+            vec![
+                stream_content_without_finish(
+                    &SECOND_PARTS,
+                    Some((SECOND_PROMPT, SECOND_COMPLETION)),
+                    true,
+                ),
+                stream_content(&["余分"], (1, 1)),
+            ]
+        } else {
+            vec![
+                completion_ending(SECOND, None, Some((SECOND_PROMPT, SECOND_COMPLETION))),
+                completion("余分", None),
+            ]
+        };
+        let turn = one_turn(script, &json!({}), streaming).await;
+        assert_eq!(
+            turn.requests.len(),
+            1,
+            "streaming={streaming}: 引き直さない"
+        );
+        assert_eq!(turn.saved_raw_reply(), SECOND, "streaming={streaming}");
+        let line = turn.parse_line();
+        for field in ["empty_retries=0", "upstream_finish_missing=true"] {
+            assert!(
+                has_field(line, field),
+                "streaming={streaming}: {field}: {line:?}"
+            );
+        }
+        let warns = turn.lines(FINISH_MISSING_LINE);
+        assert_eq!(warns.len(), 1, "streaming={streaming}: {warns:?}");
+        assert!(warns[0].contains("WARN"), "{}", warns[0]);
+        assert!(
+            has_field(warns[0], &format!("streaming={streaming}")),
+            "{}",
+            warns[0]
+        );
+        if streaming {
+            let seen = seen(&turn.response);
+            seen.assert_done_once_without_a_finish();
+            assert_eq!(seen.content, SECOND);
+        }
+    }
+}
+
+/// **捨てる回が2つとも終わりのチャンクに閉じタグを持つとき、両方の閉じタグが下流に流れる**（中継 / 決定4）。
+///
+/// どちらかを捨てると、使い手の側で「閉じない思考＋続き」になり、3回目の本文まで思考として剥がされる。
+#[tokio::test]
+async fn both_held_closing_tags_are_relayed_before_the_third_attempt() {
+    let _serial = SERIAL.lock().await;
+    const CLOSE: &str = "</think>";
+    const FIRST_THOUGHT: &str = "<think>\nFirst.\n";
+    const SECOND_THOUGHT: &str = "<think>\nSecond try.\n";
+    let turn = one_turn(
+        vec![
+            stream_closing_in_the_finish(FIRST_THOUGHT, CLOSE, (FIRST_PROMPT, FIRST_COMPLETION)),
+            stream_closing_in_the_finish(SECOND_THOUGHT, CLOSE, (MIDDLE_PROMPT, MIDDLE_COMPLETION)),
+            stream_content(&SECOND_PARTS, (SECOND_PROMPT, SECOND_COMPLETION)),
+        ],
+        &json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(turn.requests.len(), 3);
+    let seen = seen(&turn.response);
+    seen.assert_finished_once_at_the_end();
+    assert_eq!(
+        seen.content,
+        format!("{FIRST_THOUGHT}{CLOSE}{SECOND_THOUGHT}{CLOSE}{SECOND}"),
+        "両方の閉じタグを落とさずに、3回目を続けること"
+    );
+    assert_eq!(turn.saved_raw_reply(), SECOND);
+    let line = turn.parse_line();
+    assert!(
+        has_field(
+            line,
+            &format!(
+                "discarded_reply_chars={}",
+                format!("{FIRST_THOUGHT}{CLOSE}{SECOND_THOUGHT}{CLOSE}")
+                    .chars()
+                    .count()
+            )
+        ),
+        "{line:?}"
+    );
+}
+
+/// **捨てた回の一部だけが `usage` を返したら、`discarded_completion_tokens` は無し**（両方の経路・両方の順 / 決定5）。
+///
+/// 一部だけの合計（返した回だけ・最後の回だけ）を出す実装は、どちらかの順で赤になる。
+#[tokio::test]
+async fn the_discarded_completion_tokens_are_absent_when_only_some_attempts_report_usage() {
+    let _serial = SERIAL.lock().await;
+    for streaming in [false, true] {
+        for usage_on_first in [true, false] {
+            let usage_of = |reported: bool, usage: (u32, u32)| reported.then_some(usage);
+            let first = usage_of(usage_on_first, (FIRST_PROMPT, FIRST_COMPLETION));
+            let middle = usage_of(!usage_on_first, (MIDDLE_PROMPT, MIDDLE_COMPLETION));
+            let script = if streaming {
+                vec![
+                    stream_thought_ending(Some("stop"), first),
+                    stream_thought_ending(Some("stop"), middle),
+                    stream_content(&SECOND_PARTS, (SECOND_PROMPT, SECOND_COMPLETION)),
+                ]
+            } else {
+                vec![
+                    completion("", first),
+                    completion(" ", middle),
+                    completion(SECOND, Some((SECOND_PROMPT, SECOND_COMPLETION))),
+                ]
+            };
+            let turn = one_turn(script, &json!({}), streaming).await;
+            let case = format!("streaming={streaming} usage_on_first={usage_on_first}");
+            assert_eq!(turn.requests.len(), 3, "{case}: 前提");
+            assert_eq!(turn.saved_raw_reply(), SECOND, "{case}");
+            let line = turn.parse_line();
+            for field in ["empty_retries=2", "discarded_completion_tokens=None"] {
+                assert!(has_field(line, field), "{case}: {field}: {line:?}");
+            }
         }
     }
 }
@@ -705,12 +1324,18 @@ async fn the_stream_is_retried_when_the_thought_came_in_a_separate_field() {
         vec![
             stream_thought_in_a_separate_field((FIRST_PROMPT, FIRST_COMPLETION)),
             stream_content(&SECOND_PARTS, (SECOND_PROMPT, SECOND_COMPLETION)),
+            // **3回目の台本も置く**（2回目が空でなければ3回目を送らないこと / 作業単位 A-18c）。
+            stream_content(&["余分"], (1, 1)),
         ],
         &json!({}),
         true,
     )
     .await;
-    assert_eq!(turn.requests.len(), 2, "1回だけ引き直すこと");
+    assert_eq!(
+        turn.requests.len(),
+        2,
+        "2回目が空でなければ3回目を送らないこと"
+    );
     turn.assert_requests_are_identical();
     let seen = seen(&turn.response);
     seen.assert_finished_once_at_the_end();

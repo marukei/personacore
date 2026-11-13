@@ -289,11 +289,17 @@ upstream finished normally; **if the client stops the stream, nothing is stored.
 The reply text is returned exactly as the model produced it.
 
 **If the reply comes back empty** (nothing but whitespace once any leaked thinking is
-removed), personacore asks the upstream once more with the same request and uses the
-second reply, so that turn can take about twice as long. In streaming mode the second
-reply continues the same response: chunks already sent from the first attempt (for
-example whitespace or a closed thinking block) stay, and only the second attempt is
-stored. If the second attempt is also empty, the turn is stored empty.
+removed), personacore asks the upstream again with the same request, up to two more
+times, and stops at the first reply that is not empty; each extra attempt adds its own
+time to the turn. If an empty attempt was cut by the token limit (`finish_reason`
+`length`), only one extra attempt is made in that turn. In streaming mode each new
+attempt continues the same response: chunks already sent from earlier attempts (for
+example whitespace or a closed thinking block) stay, the `finish_reason` and
+`data: [DONE]` sent are those of the attempt that was used, and only that attempt is
+stored. A stream that ends with `[DONE]` but never sent a `finish_reason` also counts as
+empty when it carried no reply text. If the last attempt is also empty, the turn is
+stored empty. If an extra attempt cannot be started, the empty attempt before it is
+stored as if no retry had been made.
 
 **If the upstream fails in the middle of a stream**, the 200 status has already been
 sent. personacore then sends one final event whose `data` is an error object (the same

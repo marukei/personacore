@@ -178,7 +178,7 @@ pub enum ReplyBody {
     },
 }
 
-/// **本文が空の回か**を決める（ADR-0059 §決定3 —— 空の本文を1回引き直す判定の材料）。**panic しない。**
+/// **本文が空の回か**を決める（ADR-0059 §決定3 —— 空の本文を引き直す（最大2回）判定の材料）。**panic しない。**
 ///
 /// [`strip_leaked_thinking`] で剥がした後の文字列が、空か空白だけなら [`ReplyBody::Blank`]。
 /// 空白は `TRIMMABLE` と `LINE_BREAKS`（剥がしの空行と同じ集合 / `domain::text` の doc。広げない）。
