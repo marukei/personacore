@@ -75,8 +75,8 @@ pub use memory::{
 };
 pub use message::{Message, MessageId, NewMessage, Role};
 pub use runaway::{
-    FoldedRunaway, RUNAWAY_MAX_PERIOD, RUNAWAY_MIN_CHARS, RUNAWAY_MIN_COPIES, RunawayRun,
-    fold_runaway_repetition,
+    FoldedRunaway, RUNAWAY_CUT_CHARS, RUNAWAY_MAX_PERIOD, RUNAWAY_MIN_CHARS, RUNAWAY_MIN_COPIES,
+    RunawayCounter, RunawayRun, fold_runaway_repetition,
 };
 pub use selector::{ModelSelector, SelectorError, SessionRef};
 pub use session::SessionId;

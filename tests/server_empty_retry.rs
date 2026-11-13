@@ -22,6 +22,9 @@
 //! | [`a_reply_with_a_body_but_no_finish_reason_is_warned_and_not_retried`] | 両方 | `finish_reason` 無しで本文がある回は `warn` を出すが引き直さない |
 //! | [`both_held_closing_tags_are_relayed_before_the_third_attempt`] | ストリーミング | 捨てる2回の終わりのチャンクの閉じタグが、両方とも下流に流れる |
 //! | [`the_discarded_completion_tokens_are_absent_when_only_some_attempts_report_usage`] | 両方 | 捨てた回の一部だけが `usage` を返したら、生成数の欄は無し |
+//! | [`a_runaway_stream_is_cut_and_stored_but_a_complete_reply_is_not_cut`] | 両方 | 暴走の区間の合計が 256 文字に達したチャンクで中継を打ち切り、`length` と `[DONE]` で終えて保存する（引き直さない / ADR-0062 §決定4 / 作業単位 A-21b）。非ストリーミングは打ち切らない |
+//!
+//! 打ち切りの境目（255 / 256）・切れ目を変えたときの一致・引き直しで合計を捨てることは `server::relay` の単体テストが見る。
 //!
 //! 3回目を開く待ちを番人が報告することは、仮想時計の要る見張り番なので `server::relay` の単体テストが見る。
 //!
@@ -1472,4 +1475,101 @@ async fn the_stream_is_not_retried_after_an_unclosed_thought() {
     ] {
         assert!(has_field(line, field), "{field}: {line:?}");
     }
+}
+
+// ------------------------------------------- 暴走の打ち切り（ADR-0062 §決定4 / 作業単位 A-21b）
+
+/// 打ち切りの行（`server::relay::RUNAWAY_CUT_LINE` の先頭）。
+const RUNAWAY_CUT_LINE: &str = "返答の暴走が続いたので、上流の生成を打ち切りました";
+
+/// **暴走した本文の中継は、区間の合計が 256 文字に達したチャンクで打ち切られ、`length` と `[DONE]` で終わって保存される。
+/// 非ストリーミングは打ち切らない**（返す本文も保存も全文 / ADR-0062 §決定4 / 作業単位 A-21b）。
+///
+/// どこで打ち切るかの期待値は、差分ごとに積み上げた全文へ `fold_runaway_repetition` を当てて決める（権威は純粋関数）。
+/// 手で数えると、単位（`「好き」……`、6 文字）の 43 回目で 258 文字（42 回目は 252 文字）。打ち切った回は引き直さず
+/// （本文がある）、`usage` が届かないので封の清算は `usage` 無し。保存した返答の分解は畳んだ本文で行う（ADR-0062 §決定2）。
+#[tokio::test]
+async fn a_runaway_stream_is_cut_and_stored_but_a_complete_reply_is_not_cut() {
+    const OPENING: &str = "「おかえり」";
+    const UNIT: &str = "「好き」……";
+    let _serial = SERIAL.lock().await;
+
+    let mut parts = vec![OPENING];
+    parts.extend(std::iter::repeat_n(UNIT, 60));
+    let whole = parts.concat();
+    let total = |text: &str| -> usize {
+        personacore::domain::fold_runaway_repetition(text)
+            .runs
+            .iter()
+            .map(|run| run.length)
+            .sum()
+    };
+    let mut prefix = String::new();
+    let mut expected = None;
+    for part in &parts {
+        prefix.push_str(part);
+        if total(&prefix) >= personacore::domain::RUNAWAY_CUT_CHARS {
+            expected = Some(prefix.clone());
+            break;
+        }
+    }
+    let expected = expected.expect("前提: どこかで 256 に達する");
+    assert_eq!(
+        expected,
+        format!("{OPENING}{}", UNIT.repeat(43)),
+        "前提: 手で数えた位置と一致する"
+    );
+
+    // ---- ストリーミング: 打ち切る。
+    let turn = one_turn(
+        vec![
+            stream_content(&parts, (FIRST_PROMPT, FIRST_COMPLETION)),
+            stream_content(&SECOND_PARTS, (SECOND_PROMPT, SECOND_COMPLETION)),
+        ],
+        &json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(turn.requests.len(), 1, "打ち切った回は引き直さない");
+    let shown = seen(&turn.response);
+    shown.assert_finished_once_at_the_end_with("length");
+    assert_eq!(shown.content, expected, "検出したチャンクまでを流すこと");
+    assert_eq!(
+        turn.saved_raw_reply(),
+        expected,
+        "保存は流した生の出力と同じ"
+    );
+    let cut = turn.lines(RUNAWAY_CUT_LINE);
+    assert_eq!(cut.len(), 1, "打ち切りの行は1本: {cut:?}");
+    for field in [
+        "runs=1",
+        "longest_run_period=6",
+        "longest_run_chars=258",
+        "runaway_total_chars=258",
+    ] {
+        assert!(has_field(cut[0], field), "{field}: {}", cut[0]);
+    }
+    let seals = turn.lines(SEAL_LINE);
+    assert_eq!(seals.len(), 1, "封の清算は1回: {seals:?}");
+    assert!(
+        has_field(seals[0], "usage_prompt_tokens=None"),
+        "打ち切った回は usage が届かない: {}",
+        seals[0]
+    );
+    let line = turn.parse_line();
+    for field in ["runaway_runs_folded=1", "empty_retries=0"] {
+        assert!(has_field(line, field), "{field}: {line:?}");
+    }
+
+    // ---- 非ストリーミング: 打ち切らない（返す本文は変えない）。
+    let turn = one_turn(
+        vec![completion(&whole, Some((FIRST_PROMPT, FIRST_COMPLETION)))],
+        &json!({}),
+        false,
+    )
+    .await;
+    let returned: Value = serde_json::from_str(&turn.response).expect("JSON");
+    assert_eq!(returned["choices"][0]["message"]["content"], json!(whole));
+    assert_eq!(turn.saved_raw_reply(), whole, "保存も全文");
+    assert!(turn.lines(RUNAWAY_CUT_LINE).is_empty());
 }
