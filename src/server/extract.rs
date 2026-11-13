@@ -61,7 +61,7 @@ use tokio::task::JoinHandle;
 use crate::domain::{
     AxisDiscoveryMemories, AxisDiscoverySlots, AxisTrialRule, Character, CharacterId, DisplayName,
     DriftForm, DriftNote, DriftTuning, MessageId, ResolvedDriftMode, SessionId, StatDriftMode,
-    StatScale, strip_leaked_thinking,
+    StatScale, fold_runaway_repetition, strip_leaked_thinking,
 };
 use crate::llm::{ChatMessage, ChatRequest, FinishReason, LlmClient};
 use crate::parse::extraction::{Completeness, DiscardCounts, parse_extraction};
@@ -495,8 +495,8 @@ pub(in crate::server) struct TurnJob {
     pub(in crate::server) reply_id: MessageId,
     /// 今回の利用者の発言。
     pub(in crate::server) user_message: String,
-    /// 今回のキャラクターの応答。**生出力から、上流が漏らした思考だけを剥がしたもの**
-    /// （分解結果を組み直さない / 剥がすのは [`Extraction::start`]。ADR-0053 §決定4）。
+    /// 今回のキャラクターの応答。**生出力から、上流が漏らした思考を剥がし、返答の中の暴走を畳んだもの**
+    /// （分解結果を組み直さない / 剥がして畳むのは [`Extraction::start`]。ADR-0053 §決定4・ADR-0062 §決定2）。
     pub(in crate::server) character_message: String,
     /// **その往復で効いているサブモデルの窓**（作業単位 B-7 / ADR-0020）。
     ///
@@ -1012,10 +1012,14 @@ impl Extraction {
             session_id,
             reply_id,
             user_message: user_message.to_owned(),
-            // **上流が漏らした思考を剥がしてから渡す**（ADR-0053 §決定4 / 作業単位 B-61）。
+            // **上流が漏らした思考を剥がし、暴走を畳んでから渡す**（ADR-0053 §決定4 / 作業単位 B-61・A-21a）。
             // 抽出・変容・試用・約束の提案は、**全部この1つの値を読む**（[`TurnJob::character_message`]）。
             // 思考だけの回は空になり、各依頼は既存の「本文が空なら節を出さない」に入る。
-            character_message: strip_leaked_thinking(raw_reply).text.into_owned(),
+            // **剥がした後に、返答の中の暴走を畳む**（ADR-0062 §決定2 / 作業単位 A-21a）。
+            // 剥がす前に畳むと、思考を挟んで割れたループを見落とす。
+            character_message: fold_runaway_repetition(&strip_leaked_thinking(raw_reply).text)
+                .text
+                .into_owned(),
             // **窓は往復の入口で1回だけ読む**（作業単位 B-7 / [`TurnJob::sub_context`]）。
             // ここから先（抽出も変容も）は、この1つの値だけを見る。
             sub_context: self.extractor.current_sub_context(),

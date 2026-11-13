@@ -179,6 +179,10 @@ pub const TRIMMABLE: [char; 8] = [
 ///    `TRIMMABLE` のうち行区切りでない4点と合わせて「空行」を定義する。
 ///    固定: `tests/thinking_corpus.rs` と `web/tests/thinking-corpus.test.ts`
 ///    （**同じ1つの手書きの表**。行区切り7点＋CRLF・空白4点・JavaScript だけが空白と認める2点を1行ずつ持つ）。
+/// 7. `src/domain/runaway.rs` — 暴走を数えるときに**除く空白**（`TRIMMABLE` と合わせて / 作業単位 A-21a / ADR-0062）。
+///    行の数え方には使わない（改行は空白の1つとして読み飛ばすだけ）。
+///    固定: `domain::runaway::tests::every_blank_is_left_out_of_the_count`（全文字ループ）と、
+///    改行をまたぐループ（LF と CRLF）の2本。
 ///
 /// **2 と 4 がずれると**、`parse` を通った値がプロンプトで空になる
 /// （0009 が狙った穴。ただし**塞ぎ切れていたのは行区切りだけ**で、

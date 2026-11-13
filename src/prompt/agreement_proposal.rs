@@ -117,7 +117,7 @@ pub const PROPOSAL_MAX_TOKENS: u32 = 320;
 pub const MAX_LISTED_PROPOSALS: usize = 16;
 
 /// **会話の1往復**（利用者の発言と、それへのキャラクターの応答。応答は**生の出力から、
-/// 上流が漏らした思考だけを剥がしたもの** / ADR-0053 §決定4）。
+/// 上流が漏らした思考を剥がし、返答の中の暴走も畳んだもの** / ADR-0053 §決定4・ADR-0062 §決定2）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposalTurn {
     /// 往復番号（**その会話の最初の往復が 1**）。
@@ -125,7 +125,7 @@ pub struct ProposalTurn {
     /// 利用者の発言。
     pub user: String,
     /// キャラクターの応答（`server::extract::TurnJob::character_message` —— `message.raw_content` から
-    /// 漏れた思考を剥がしたもの）。
+    /// 漏れた思考を剥がし、暴走も畳んだもの / ADR-0062 §決定2）。
     pub character: String,
 }
 

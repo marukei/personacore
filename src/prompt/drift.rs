@@ -346,8 +346,8 @@ pub struct DriftInput<'a> {
     /// 今回の利用者の発言。
     pub user_message: &'a str,
     /// 今回のキャラクターの応答。**生出力（`message.raw_content` と同じ文字列）から、
-    /// 上流が漏らした思考だけを剥がしたものを渡す**（`server::extract::TurnJob::character_message` /
-    /// ADR-0053 §決定4）。
+    /// 上流が漏らした思考を剥がし、返答の中の暴走も畳んだものを渡す**（`server::extract::TurnJob::character_message` /
+    /// ADR-0053 §決定4・ADR-0062 §決定2）。
     ///
     /// 分解後の `dialogue` / `narration` を組み直すと、地の文と台詞の境目が元と変わる。
     pub character_message: &'a str,

@@ -1445,3 +1445,50 @@ async fn the_streaming_path_strips_a_thought_split_across_chunks() {
 
     server.stop().await;
 }
+
+/// 暴走の単位（8 文字）。`、` で終える（前の本文の `。` と周期が合わないように / 作業単位 A-21a）。
+const RUNAWAY_UNIT: &str = "ずっと一緒だよ、";
+
+/// **畳んだ区間の数と最長の区間の長さが、保存の経路を通った分解の記録と同じ1行に載る**
+/// （ADR-0062 §決定7 / 作業単位 A-21a）。
+///
+/// `server::turn` の単体テストは `log_outcome` を直に呼ぶので、**`TurnSink::persist` が数えを
+/// 渡しているか**はここでしか見えない。区間の長さ（96）は手で数えた値。
+#[tokio::test]
+async fn the_folded_runaway_is_recorded_in_the_parse_line_of_a_real_turn() {
+    let log = LogSection::enter().await;
+
+    let raw = format!("「おかえり」と彼女は笑った。{}", RUNAWAY_UNIT.repeat(12));
+    let llm = MockLlm::replying(&raw);
+    let server = TestServer::start_with(llm.clone()).await;
+
+    let body = server
+        .chat(&json!({
+            "model": "aoi",
+            "messages": [{"role": "user", "content": "ただいま"}],
+        }))
+        .await;
+    let session = session_id_of(&body);
+    let saved = server.saved_messages(session).await;
+    assert_eq!(saved.len(), 2, "往復2件が入ること: {saved:?}");
+    assert_eq!(saved[1].raw_content, raw, "生出力を丸ごと残すこと");
+    assert_eq!(
+        saved[1].narration.as_deref(),
+        Some("と彼女は笑った。ずっと一緒だよ、")
+    );
+
+    let logged = log.mine();
+    let line = line_with_field(&logged, &format!("session_id={session}"));
+    assert!(
+        line.contains(PARSE_MARKER),
+        "分解の記録であること: {line:?}"
+    );
+    assert!(has_field(line, "runaway_runs_folded=1"), "{line:?}");
+    assert!(has_field(line, "runaway_longest_run_chars=96"), "{line:?}");
+    assert!(
+        !log.everything().contains(&RUNAWAY_UNIT.repeat(2)),
+        "暴走の中身をログに出さないこと"
+    );
+
+    server.stop().await;
+}
