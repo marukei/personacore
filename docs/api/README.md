@@ -201,7 +201,7 @@ itself. It is served with `--no-ui` too, because it is part of the API, not of t
 carries the API version:
 
 ```
-x-personacore-api-version: 1.9
+x-personacore-api-version: 1.10
 ```
 
 That includes errors, 404 and 405 responses, the event stream and `/openapi.json`.
@@ -285,8 +285,23 @@ entries first.
 
 After the reply is complete, the pair (your message, the reply) is stored and memory
 extraction starts in the background. In streaming mode the pair is stored only when the
-upstream finished normally; **if the client stops the stream, nothing is stored.**
-The reply text is returned exactly as the model produced it.
+stream ended with `data: [DONE]`: when the upstream finished normally, or when
+personacore cut a runaway reply (below); **if the client stops the stream, nothing is
+stored.** The reply text is returned exactly as the model produced it, except that a
+streamed reply cut for running away ends where it was cut.
+
+**If a streamed reply runs away** (a unit of 2 to 64 characters repeated verbatim at
+least three times in a row, spanning at least 64 characters; whitespace is ignored),
+personacore adds up the length of those stretches as the reply arrives, counting the text
+as received (including any thinking leaked into it). When the total reaches 256
+characters, it sends the chunk in which that happened, stops reading from the upstream
+and closes that connection, then sends a final chunk with an empty `content` and
+`finish_reason` `length`, followed by `data: [DONE]`. The turn is stored with the reply as
+it was sent up to that point, and it is not retried. The rest of the generation is never
+sent or stored. Once the upstream has sent a chunk with a `finish_reason` in an attempt
+(it has already ended that attempt), the reply is not cut, even if more text follows.
+When an empty reply is retried (below), each attempt is counted from zero.
+A non-streaming reply is not cut: it is returned and stored in full.
 
 **If the reply comes back empty** (nothing but whitespace once any leaked thinking is
 removed), personacore asks the upstream again with the same request, up to two more
@@ -881,7 +896,7 @@ header.
 
 ## Versioning and compatibility
 
-The current API version is `1.9`.
+The current API version is `1.10`.
 
 The API version is kept separately from the application version and is stated in the
 OpenAPI document (`info.version`) and in the `X-Personacore-Api-Version` header. The
@@ -917,6 +932,20 @@ segment (such as `v1`) into the paths under `/admin`.
   working; requests that reached personacore some other way (for example through another
   host name) may start to be refused within `1.x`. The `Host` / `Origin` checks were added
   this way.
+
+Changes in `1.10` (from `1.9`): no route, field or `enum` value was added or removed.
+A streamed reply that runs away is now cut by personacore: the stream ends with
+`finish_reason` `length` and `data: [DONE]`, and the turn is stored with the reply as sent
+up to that point (see
+[Chat: the OpenAI-compatible endpoint](#chat-the-openai-compatible-endpoint)). So the reply
+text of such a stream is no longer all that the model produced: it ends where it was cut.
+This also changes the earlier rule that a streamed turn is stored only when the upstream
+finished normally; a stream that ends with `length` and `data: [DONE]` is still stored, as
+it was when the upstream's own token limit cut it, and a stream the client stopped or the
+upstream broke is still not stored. In
+`GET /admin/characters/{handle}/sessions/{session_id}/messages`, the `dialogue` and
+`narration` of replies written from now on have each runaway stretch folded down to one
+copy of its unit; `raw_content` is still the reply as received.
 
 Changes in `1.9` (from `1.8`): each side in the profile list (and in the response to a
 save) has two new fields, `sampling` (an object with only the keys written, or `null`) and

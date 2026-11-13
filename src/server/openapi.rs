@@ -169,7 +169,16 @@ const STABILITY_EXTENSION: &str = "x-personacore-stability";
 /// `sampling` / `response_tokens`、`reason` に `sampling_unusable` / `unknown_sampling_key` / `response_tokens_unusable` /
 /// `main_face_only` を返しうる（どの値も `1.7` / `1.8` で `enum` に入っている）。応答の欄の追加と、要求の任意の欄の
 /// 追加だけなので小さい側。**省いた依頼の意味（残す）は変えていない**（API `1.8` までの使い手の保存は、手で書いた値を消さない）。
-pub const API_VERSION: &str = "1.9";
+///
+/// **`1.10`**（作業単位 A-21a・A-21b / ADR-0062 §決定9）: 口・欄・`enum` の値は増減していない（形の指紋は `1.9` と同じ）。
+/// `/v1/chat/completions` のストリーミングは、返答の暴走の区間の合計が 256 文字に達すると personacore が打ち切り、
+/// `finish_reason: "length"`（既にある値）と `[DONE]` で終えて、その回を**保存する**（英語のガイドの「保存は上流が正常に
+/// 終わった回だけ」「返す本文はモデルが生成したとおり」に、打ち切りの例外を足した）。`GET …/messages` の `dialogue` /
+/// `narration` は、新しく書く行で暴走の区間が畳まれる（`raw_content` はそのまま。`1.4` の B-61 と同じ扱い）。
+/// 打ち切った回の保存は ADR-0047 の「意味の変更」との境目に当たるが小さい側とした（理由は ADR-0062 §決定9 の3つ ——
+/// 上流の `max_tokens` で `"length"` に終わった回は前から保存されていた／`"length"` は既にある値／使い手が切った回・上流が
+/// 壊れた回を保存しないことは変わらない）。
+pub const API_VERSION: &str = "1.10";
 
 /// **ルータに届いた要求への全部の応答に付ける、API の版のヘッダの名前**
 /// （HTTP では大文字小文字を区別しない。仕様書の `headers` の鍵もこの綴り）。
@@ -536,7 +545,7 @@ pub(super) fn closed_string_array(values: impl IntoIterator<Item = &'static str>
 /// |---|---|
 /// | [`ChatCompletionChunk`] の JSON | 本文の増分 |
 /// | `ErrorBody` の JSON | 途中で失敗した（その後に `[DONE]` は来ない） |
-/// | `[DONE]`（JSON ではない） | 上流が尽きた |
+/// | `[DONE]`（JSON ではない） | 上流が尽きた。または personacore が暴走で打ち切った（直前の終わりのチャンクの `finish_reason` は `"length"` / ADR-0062 §決定4） |
 pub(super) struct ChatCompletionEvent;
 
 impl PartialSchema for ChatCompletionEvent {

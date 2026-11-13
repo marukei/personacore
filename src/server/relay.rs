@@ -68,15 +68,41 @@
 //! つまりクライアントから見た成否の判定は**2つの独立した手掛かり**で付く
 //! （error オブジェクトが流れたか／`[DONE]` が来たか）。
 //!
-//! # 保存するのは「完結した回」だけ（11b-2）
+//! # 保存するのは「完結した回」だけ（11b-2 → ADR-0062 §決定4 / 作業単位 A-21b）
 //!
-//! **`[DONE]` を流す枝でだけ [`TurnSink::persist`] を呼ぶ。** 途中で壊れた枝では
+//! **`[DONE]` を流す枝でだけ [`TurnSink::persist`] を呼ぶ。** `[DONE]` を流すのは、上流が正常に終わった回と、
+//! **personacore が暴走で打ち切った回**（下の節）。途中で壊れた枝では
 //! **利用者の発言も含めて1行も書かない。** 部分的な応答を履歴に混ぜると以後の文脈が汚れ、
 //! しかも**クライアント側はその回を失敗として扱っている**（`[DONE]` を受けていない）ので、
-//! こちらだけが「途中まで喋った」ことを覚えていると食い違う。
+//! こちらだけが「途中まで喋った」ことを覚えていると食い違う。利用者が切った回も同じく書かない。
+//!
+//! > **⚠ A-21b の前は「保存するのは上流が正常に終わった回だけ」だった**（ADR-0062 §決定4 で改めた）。
+//! > 打ち切った回は失敗した回ではなく、personacore が返答を終えた回である（`finish_reason: "length"` と `[DONE]` が届く）。
+//! > 暴走した後半は保存されても、読み手（分解・履歴・裏方）には畳んで渡る（ADR-0062 §決定2）。
 //!
 //! 分解・保存・パース成功率のログは `super::turn` が持つ。**保存の失敗で中継は壊さない**
 //! （そもそも `[DONE]` の直前なので、もう応答の成否は変えられない）。
+//!
+//! # 暴走が十分に長くなったら打ち切る（ADR-0062 §決定4・§決定5 / 作業単位 A-21b）
+//!
+//! 上流から受けた**生の**差分（漏れた思考を剥がす前）を、蓄積のすぐ隣（[`Relay::relay`]）で `domain::RunawayCounter` に数え足し、
+//! **畳む区間の長さの合計**（`domain::fold_runaway_repetition` と同じ区間 / §決定1）が `domain::RUNAWAY_CUT_CHARS`
+//! （256 文字）に達したら、**そのチャンクを流したうえで上流のストリームを落とし**、`finish_reason: "length"` の
+//! 終わりのチャンクと `[DONE]` を流して、その回を保存する（`RelayState::cut_if_runaway`）。終わりのチャンクの差分は
+//! 空になる —— 打ち切るのはその回で `finish_reason` 付きのチャンクを受ける前だけなので、空の本文の引き直しのために
+//! 保留している差分は、打ち切る時点では無い（下の箇条の「`finish_reason` 付きのチャンクを受けた後は打ち切らない」）。
+//!
+//! * 保存する `raw_content` は、打ち切るまでに受けて流した生の出力と同じ（打ち切った後の上流の出力は読まない）。
+//! * **引き直さない**（§決定5。`length` で終わった本文のある回にあたる）。上流を落とした後は、その回の終わり
+//!   （`RelayState::end_of_attempt`）を通らないので、引き直しの判定そのものが走らない。
+//!   空の本文の引き直しで次の回へ移るときは、積み上げた本文と一緒に合計も捨てる（[`Relay::restart`]）。
+//! * `usage` は届かない（上流が `usage` を返さなかった回と同じ: 答え合わせは記録だけ、封は `Unjudged`）。
+//! * 打ち切りは別の1行（[`RUNAWAY_CUT_LINE`]。区間の数・最長の区間の周期と長さ・合計・何回目の回か（`attempt`））で言う。
+//! * **その回で `finish_reason` 付きのチャンクを一度でも受けた後は打ち切らない**（流したものも、保留したものも。
+//!   そのチャンク自身で 256 に達したときも）。上流がもうその回を終えていて、`length` の終わりのチャンクを足すと
+//!   `finish_reason` が2回流れる。
+//! * **時間の値で打ち切るのではない**（ADR-0035 とは別の話）。生成された中身を見て打ち切る。
+//! * 非ストリーミング（`super::chat`）は打ち切らない（上流が返し切ってから受けるので）。
 //!
 //! # 中継中の無通信は**報告する。打ち切らない**（11c-3a → ADR-0035 / 作業単位 B-6）
 //!
@@ -150,10 +176,14 @@ use super::empty_retry::{self, Delivery, EmptyRetry};
 use super::seal::Sealed;
 use super::turn::TurnSink;
 use super::usage;
+use crate::domain::{RUNAWAY_CUT_CHARS, RunawayCounter, RunawayRun};
 use crate::llm::{
     ChatChunk, ChatRequest, ChatStream, FinishReason, LlmClient, LlmError, LlmFuture, TokenUsage,
 };
 use crate::prompt::{BudgetPlan, TokenBudget};
+
+/// **暴走が続いたので上流の生成を打ち切った**ことを言う行（ADR-0062 §決定4 / 作業単位 A-21b）。**テストが綴りを照合する。**
+const RUNAWAY_CUT_LINE: &str = "返答の暴走が続いたので、上流の生成を打ち切りました（finish_reason: length で終えて保存します）";
 
 /// `object` フィールドの定数（OpenAI 互換のストリーミング）。
 ///
@@ -208,6 +238,11 @@ pub(super) struct Relay {
     /// **最終チャンクにしか載らない**（載せない実装もある）ので、
     /// 受け取った最後の値を持ち続ける。
     usage: Option<TokenUsage>,
+    /// **蓄積した本文（生の差分）の暴走の区間を数え足したもの**（ADR-0062 §決定4 / 作業単位 A-21b）。
+    ///
+    /// [`Self::content`] への蓄積の**すぐ隣**（[`Self::relay`]）で数え足し、[`Self::restart`] で一緒に捨てる
+    /// —— 数えるのは、保存する本文と同じもの。
+    runaway: RunawayCounter,
 }
 
 impl Relay {
@@ -220,6 +255,7 @@ impl Relay {
             content: String::new(),
             started: false,
             usage: None,
+            runaway: RunawayCounter::new(),
         }
     }
 
@@ -245,6 +281,8 @@ impl Relay {
     pub(super) fn relay(&mut self, chunk: &ChatChunk) -> Option<String> {
         // **蓄積は中継と同じ1行。** ここが「ストリームを止めない」の実装そのもの。
         self.content.push_str(&chunk.delta);
+        // **暴走の区間も、蓄積と同じ生の差分で数え足す**（剥がす前 / ADR-0062 §決定4）。
+        self.runaway.push_str(&chunk.delta);
         // **最終チャンクの `usage` を落とさない。** 無ければ持っている値のまま。
         self.note_usage(chunk.usage);
 
@@ -294,9 +332,17 @@ impl Relay {
     ///
     /// 保存するのは採用した回（最後に送った回）の生の出力、清算するのはその回の `usage`。**役割を載せたか（`started`）は
     /// 捨てない** —— 次の回は同じ応答の続きなので、役割をもう一度載せない。
+    ///
+    /// **暴走の区間の数え足しも捨てる**（ADR-0062 §決定4。積み上げた本文を捨てるのに合わせて合計も捨てる）。
     fn restart(&mut self) {
         self.content.clear();
         self.usage = None;
+        self.runaway = RunawayCounter::new();
+    }
+
+    /// 蓄積した本文の暴走の区間（[`RunawayCounter::runs`]）。
+    fn runaway_runs(&self) -> Vec<RunawayRun> {
+        self.runaway.runs()
     }
 
     /// ここまでに蓄積した本文。**完結したときに保存する本文そのもの。**
@@ -404,9 +450,15 @@ struct RelayState {
     /// **その回の `finish_reason`**（後勝ち。保留したものも流したものも / 作業単位 A-18c）。
     ///
     /// 回の終わりに `length` の規則と「`finish_reason` 無しで終わった空」の判定に使い、次の回を開いたら `None` に戻す。
+    /// **`Some` の間は暴走で打ち切らない**（上流がもうその回を終えている / ADR-0062 §決定4 / [`RelayState::cut_if_runaway`]）。
     attempt_finish: Option<FinishReason>,
-    /// **引き直さずに終えるので、次の1件で `[DONE]` を流して終わる**（保留したチャンクを流した後）。
+    /// **次の1件で `[DONE]` を流して保存し、終わる。** 立つのは2つの経路: 空の本文の回を引き直さずに終えるとき
+    /// （保留したチャンクを流した後 / ADR-0059 §決定3）と、暴走で打ち切った回の `length` の終わりのチャンクを流した後
+    /// （[`Self::cut_next`] の次 / ADR-0062 §決定4）。
     finish_next: bool,
+    /// **暴走で打ち切ったので、次の1件で `finish_reason: "length"` の終わりのチャンクを流す**（その次が `[DONE]` /
+    /// ADR-0062 §決定4 / [`RelayState::cut_if_runaway`]）。上流はもう落としてある。
+    cut_next: bool,
     /// 引き直しの記録（分解の行の欄 / `super::empty_retry::EmptyRetry`）。
     retry: EmptyRetry,
 }
@@ -456,6 +508,7 @@ pub(super) fn relay_response(
         held: None,
         attempt_finish: None,
         finish_next: false,
+        cut_next: false,
         retry: EmptyRetry::default(),
     }))
     .into_response()
@@ -572,6 +625,62 @@ impl RelayState {
         }
     }
 
+    /// **暴走が十分に長くなったら、上流をその場で落とす**（ADR-0062 §決定4 / 作業単位 A-21b）。
+    ///
+    /// その回でまだ `finish_reason` 付きのチャンクを受けていない（`attempt_finish` が `None`）とき、本文のチャンクを
+    /// [`Relay::relay`] で流した（蓄積した）**直後**に呼ぶ。積み上げた生の本文の
+    /// 区間の長さの合計（[`RunawayCounter`]）が [`RUNAWAY_CUT_CHARS`] に達していたら:
+    ///
+    /// 1. 上流のストリームを落とす（接続が閉じる / モジュールの doc の「切断時のキャンセル」）。そのチャンクは呼び出し側が流す。
+    /// 2. **引き直さない**（ADR-0062 §決定4・§決定5。ADR-0059 の追記の決定1 では `length` で終わった回 —— 本文がある回なので
+    ///    引き直しの対象にならない）。上流を落とした後は [`Self::end_of_attempt`] を**通らない**ので、引き直しの判定そのものが
+    ///    走らない。その回の `finish_reason`（`attempt_finish`）と `EmptyRetry::note_ending` に `length` を記録する行は
+    ///    **置かない** —— 読む場所が `end_of_attempt` しか無く、外しても全部緑の等価変異だった（A-21b の変異 R9）。
+    /// 3. 次の1件で `finish_reason: "length"` の終わりのチャンクを、その次で `[DONE]` を流して保存する（[`Self::complete`]）。
+    ///    `usage` は届いていない（届かない回と同じ扱い / ADR-0062 §決定4）。
+    /// 4. 打ち切りの行を1本出す（区間の数・最長の区間の周期と長さ・合計・何回目の回か（`attempt`。空の本文の引き直しの
+    ///    2回目・3回目なら 2・3））。
+    ///
+    /// **その回で `finish_reason` 付きのチャンクを一度でも受けた後（流したものも保留したものも、そのチャンク自身も）は
+    /// 呼ばない** —— 上流がもうその回を終えているので打ち切るものが無く、`length` の終わりのチャンクを足すと
+    /// `finish_reason` が2回流れる（A-21b のレビュー）。
+    fn cut_if_runaway(&mut self) {
+        let runs = self.relay.runaway_runs();
+        let total: usize = runs.iter().map(|run| run.length).sum();
+        if total < RUNAWAY_CUT_CHARS {
+            return;
+        }
+        self.upstream = None;
+        self.cut_next = true;
+
+        // 最長の区間（同じ長さなら前にあるもの）。区間そのもの（本文）はログに出さない。
+        let longest = runs
+            .iter()
+            .copied()
+            .reduce(|best, run| if run.length > best.length { run } else { best });
+        tracing::warn!(
+            runs = runs.len(),
+            longest_run_period = longest.map_or(0, |run| run.period),
+            longest_run_chars = longest.map_or(0, |run| run.length),
+            runaway_total_chars = total,
+            attempt = u32::from(self.retry.retries()) + 1,
+            "{RUNAWAY_CUT_LINE}"
+        );
+    }
+
+    /// **暴走で打ち切った回の終わりのチャンク**（`finish_reason: "length"` / [`Self::cut_if_runaway`]）。**差分は空。**
+    ///
+    /// 打ち切るのはその回で `finish_reason` 付きのチャンクを受ける前だけなので、空の本文の引き直しのために保留している
+    /// チャンク（[`Self::held`]）は、打ち切る時点では無い（保留すると `attempt_finish` が立つ / [`Self::hold`]）。
+    /// 保留の差分を載せる形にしていた時期があるが、外しても全部緑の等価変異だった（A-21b のレビューの変異 R8b）。
+    const fn cut_chunk() -> ChatChunk {
+        ChatChunk {
+            delta: String::new(),
+            finish_reason: Some(FinishReason::Length),
+            usage: None,
+        }
+    }
+
     /// **完結した回の締め**: 答え合わせと封の清算（採用した回の `usage` で1回）、保存、`[DONE]`。
     async fn complete(&mut self) -> String {
         self.upstream = None;
@@ -583,7 +692,7 @@ impl RelayState {
             &self.sealed,
             "SSE 中継を完了しました",
         );
-        // **応答が完全に返り切った回だけ保存する。**
+        // **応答が完全に返り切った回（暴走で打ち切った回を含む / ADR-0062 §決定4）だけ保存する。**
         // `[DONE]` の直前なので、失敗しても中継の成否は変えられない
         // （`super::turn` は `Result` を返さない）。
         self.turn
@@ -598,12 +707,13 @@ impl RelayState {
 /// `unfold` は**次が要求されるまで上流を読まない**ので、下流の消費速度がそのまま
 /// 反映される（`llm::lmstudio::chunk_stream` と同じ作法）。
 ///
-/// 終わり方は2通り。**どちらも必ず終端する**（接続を宙吊りにしない）。
+/// 終わり方は下の表のとおり。**どれも必ず終端する**（接続を宙吊りにしない）。
 ///
 /// | 上流の様子 | 下流に見えるもの | 保存 |
 /// |---|---|---|
 /// | 尽きた（`[DONE]` を受けた） | `data: [DONE]` を流して終端 | **する** |
 /// | **本文が空のまま尽きた**（ADR-0059 §決定3。`finish_reason` 無しで `[DONE]` を受けた空も） | 次の回の上流を開いて続ける（最大2回 / モジュールの doc の表）。終端は「尽きた」か「途中で失敗した」の行と同じ | 最後に送った回（開けなければその手前の回） |
+/// | **暴走の区間の合計が 256 文字に達した**（ADR-0062 §決定4） | そのチャンクを流して上流を落とし、`finish_reason: "length"` の終わりのチャンク → `data: [DONE]` | **する**（打ち切るまでに流した生の出力） |
 /// | 途中で失敗した（**天井に当たった回を含む**） | error オブジェクトを1件流して終端（**`[DONE]` は送らない**） | **しない** |
 /// | **黙り込んだ** | **何も見えない**（`warn` がログに出るだけ。中継は続く） | — |
 ///
@@ -632,6 +742,17 @@ fn chunk_events(state: RelayState) -> impl Stream<Item = Result<Event, Infallibl
                 return Some((Ok(Event::default().data(data)), state));
             }
 
+            // **暴走で打ち切った回の終わりのチャンク**（上流は落としてある / ADR-0062 §決定4 /
+            // `RelayState::cut_if_runaway`）。次の1件で `[DONE]` を流して保存する。
+            if std::mem::take(&mut state.cut_next) {
+                state.finish_next = true;
+                match state.relay.relay(&RelayState::cut_chunk()) {
+                    Some(data) => return Some((Ok(Event::default().data(data)), state)),
+                    // 来ない（`finish_reason` 付きは使用量だけのチャンクではない）。来たら次で締める。
+                    None => continue,
+                }
+            }
+
             // 終端済み。**`fuse` 相当**（もう一度読まれても `None` を返し続ける）。
             let events = state.upstream.as_mut()?;
 
@@ -655,7 +776,16 @@ fn chunk_events(state: RelayState) -> impl Stream<Item = Result<Event, Infallibl
                     if chunk.finish_reason.is_some() {
                         state.attempt_finish = chunk.finish_reason;
                     }
-                    match state.relay.relay(&chunk) {
+                    let relayed = state.relay.relay(&chunk);
+                    // **暴走が十分に長くなったら、このチャンクを流したうえで打ち切る**（ADR-0062 §決定4）。
+                    // **その回で `finish_reason` 付きのチャンクを一度でも受けた後（流したものも保留したものも）は
+                    // 打ち切らない** —— 上流がもうその回を終えていて、`length` の終わりのチャンクを足すと
+                    // `finish_reason` が2回流れる（A-21b のレビュー）。このチャンク自身の `finish_reason` も上で
+                    // `attempt_finish` に入っている。空の差分では合計が変わらないので数え直さない。
+                    if state.attempt_finish.is_none() && !chunk.delta.is_empty() {
+                        state.cut_if_runaway();
+                    }
+                    match relayed {
                         Some(data) => data,
                         // 蓄積と答え合わせには使った。下流へは流さない。
                         None => continue,
@@ -980,6 +1110,7 @@ mod tests {
                     held: None,
                     attempt_finish: None,
                     finish_next: false,
+                    cut_next: false,
                     retry: EmptyRetry::default(),
                 };
 
@@ -3457,5 +3588,427 @@ mod tests {
             vec![STALL.as_secs()],
             "開く間の沈黙を、通算の秒数で1本言うこと: {lines:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // **暴走が十分に長くなったら打ち切る**（ADR-0062 §決定4・§決定7 / 作業単位 A-21b）
+    //
+    // 本番の入口からの見張り番は `tests/server_empty_retry.rs`。ここは中継の中の形（どのチャンクで上流を落とすか・
+    // 終わりのチャンク・保存・引き直しとの関係）を見る。
+    // ------------------------------------------------------------------
+
+    /// 暴走の前に置く本文（どの単位とも続かない文字で終わる）。
+    const BEFORE_RUNAWAY: &str = "前置き：";
+
+    /// **打ち切った後に上流が送る囮。** 下流にも保存にも現れないこと（読まずに落とすこと）を見る。
+    const AFTER_CUT: &str = "囮の続き";
+
+    /// 下流の、最後から2件目（終わりのチャンク）の `finish_reason`。
+    fn last_finish(events: &[String]) -> Value {
+        let data = events
+            .len()
+            .checked_sub(2)
+            .and_then(|index| events.get(index))
+            .expect("終わりのチャンクがあること");
+        let value: Value = serde_json::from_str(data).expect("JSON として読めること");
+        value["choices"][0]["finish_reason"].clone()
+    }
+
+    /// 差分の列を、本文の差分だけの台本にする（`finish_reason` 無し）。
+    fn body_steps(parts: &[String]) -> Vec<Step> {
+        parts
+            .iter()
+            .map(|part| Step::Chunk(Ok(chunk(part, None))))
+            .collect()
+    }
+
+    /// 積み上げた全文に純粋関数を当てた、区間の長さの合計（打ち切りの権威 / §決定1）。
+    fn folded_total(text: &str) -> usize {
+        crate::domain::fold_runaway_repetition(text)
+            .runs
+            .iter()
+            .map(|run| run.length)
+            .sum()
+    }
+
+    /// 128 文字（`あい`×64）と 127 文字（`かき`×63 ＋ `か`）の2つの区間で合計 255 になる差分の列（2 文字ずつ）。
+    /// **手で数えた**（`domain::runaway` の `the_cut_is_256_and_a_total_of_255_falls_short` と同じ形）。
+    fn parts_totalling_255() -> Vec<String> {
+        let mut parts = vec![BEFORE_RUNAWAY.to_owned()];
+        parts.extend(std::iter::repeat_n("あい".to_owned(), 64));
+        parts.push("！".to_owned());
+        parts.extend(std::iter::repeat_n("かき".to_owned(), 63));
+        parts.push("か".to_owned());
+        parts
+    }
+
+    /// **合計 255 では打ち切らず、256 に達したチャンクで打ち切る**（§決定4・§決定7 の境目）。
+    ///
+    /// 打ち切った腕では: 検出したチャンクまでが下流へ流れ、**そのチャンクを流した時点で上流が落ちている**（その前は
+    /// 落ちていない）。続いて `finish_reason: "length"` の空の差分と `[DONE]`。囮は読まれない。保存する `raw_content` は
+    /// 流したものと同じ。打ち切りの行は区間の数・最長の区間（周期・長さ）・合計を持つ。封の清算は `usage` 無し。
+    ///
+    /// 合計は**2つの区間の和**なので、最長の区間（128）や区間の数で比べる実装もここで赤になる。
+    #[test]
+    fn a_runaway_is_cut_at_the_chunk_where_the_total_reaches_256_but_not_at_255() {
+        let short = parts_totalling_255();
+        assert_eq!(folded_total(&short.concat()), 255, "前提: 合計 255");
+
+        // ---- 255: 打ち切らない（畳むが打ち切らない長さ / 対照）。
+        let mut steps = body_steps(&short);
+        steps.push(Step::Chunk(Ok(chunk(" 彼女は微笑んだ。", None))));
+        steps.push(Step::Chunk(Ok(chunk("", Some(FinishReason::Stop)))));
+        let mut relayed = None;
+        let output = captured_under_default_filter(|| {
+            relayed = Some(run_relay_with(steps, plan(), None, unreachable_redo()));
+        });
+        let relayed = relayed.expect("走ったこと");
+        let seen = downstream(&relayed.events);
+        let whole = format!("{} 彼女は微笑んだ。", short.concat());
+        assert_eq!(seen.content, whole, "全部流れること");
+        assert!(seen.finished_once_at_the_end(), "{:?}", relayed.events);
+        assert_eq!(last_finish(&relayed.events), json!("stop"));
+        assert_eq!(relayed.saved[1].raw_content, whole);
+        assert!(
+            report_lines(&output, RUNAWAY_CUT_LINE).is_empty(),
+            "255 では打ち切りの行を出さないこと: {output:?}"
+        );
+
+        // ---- 256: 打ち切る。
+        let mut long = short.clone();
+        long.push("き".to_owned());
+        assert_eq!(folded_total(&long.concat()), 256, "前提: 合計 256");
+        let mut steps = body_steps(&long);
+        steps.push(Step::Chunk(Ok(chunk(AFTER_CUT, None))));
+        steps.push(Step::Chunk(Ok(chunk("", Some(FinishReason::Stop)))));
+        let mut relayed = None;
+        let output = captured_under_default_filter(|| {
+            relayed = Some(run_relay_with(steps, plan(), None, unreachable_redo()));
+        });
+        let relayed = relayed.expect("走ったこと");
+        let seen = downstream(&relayed.events);
+        assert_eq!(
+            seen.content,
+            long.concat(),
+            "検出したチャンクまでを流し、囮は流さないこと"
+        );
+        assert_eq!(
+            relayed.events.len(),
+            long.len() + 2,
+            "差分ごとに1件 ＋ 終わりのチャンク ＋ [DONE]: {:?}",
+            relayed.events
+        );
+        assert!(seen.finished_once_at_the_end(), "{:?}", relayed.events);
+        assert_eq!(last_finish(&relayed.events), json!("length"));
+        assert_eq!(
+            delta_of(&relayed.events[relayed.events.len() - 2]),
+            "",
+            "終わりのチャンクは空の差分"
+        );
+        let detected = long.len() - 1;
+        assert!(
+            !relayed.dropped_by_event[detected - 1],
+            "検出の前のチャンクでは、まだ上流を落としていないこと"
+        );
+        assert!(
+            relayed.dropped_by_event[detected],
+            "検出したチャンクを流した時点で上流を落としていること"
+        );
+        assert_eq!(relayed.saved.len(), 2, "打ち切った回は保存すること");
+        assert_eq!(
+            relayed.saved[1].raw_content,
+            long.concat(),
+            "保存は流した生の出力と同じ"
+        );
+
+        let cut = report_lines(&output, RUNAWAY_CUT_LINE);
+        assert_eq!(cut.len(), 1, "打ち切りの行は1本: {output:?}");
+        for field in [
+            "runs=2",
+            "longest_run_period=2",
+            "longest_run_chars=128",
+            "runaway_total_chars=256",
+        ] {
+            assert!(has_field(cut[0], field), "{field}: {}", cut[0]);
+        }
+        let seals = report_lines(&output, "封を観測しました");
+        assert_eq!(seals.len(), 1, "清算は1回: {seals:?}");
+        assert!(
+            has_field(seals[0], "usage_prompt_tokens=None"),
+            "打ち切った回は usage が届かない回と同じ: {}",
+            seals[0]
+        );
+    }
+
+    /// **256 に達したのが上流の終わりのチャンク（`finish_reason` 付き）なら、打ち切らない**（上流がもう終えている）。
+    ///
+    /// 打ち切ると、上流の `stop` のチャンクの後に `length` のチャンクがもう1本流れて、`finish_reason` が2回になる。
+    #[test]
+    fn reaching_256_in_the_upstreams_last_chunk_is_not_a_cut() {
+        let mut steps = body_steps(&parts_totalling_255());
+        steps.push(Step::Chunk(Ok(chunk("き", Some(FinishReason::Stop)))));
+        let mut relayed = None;
+        let output = captured_under_default_filter(|| {
+            relayed = Some(run_relay_with(steps, plan(), None, unreachable_redo()));
+        });
+        let relayed = relayed.expect("走ったこと");
+        assert!(
+            downstream(&relayed.events).finished_once_at_the_end(),
+            "{:?}",
+            relayed.events
+        );
+        assert_eq!(last_finish(&relayed.events), json!("stop"));
+        assert!(report_lines(&output, RUNAWAY_CUT_LINE).is_empty());
+    }
+
+    /// **打ち切りの行の「最長の区間」は、同じ長さなら前にあるほう**（A-21b のレビュー）。
+    ///
+    /// 周期 2 の 128 文字（`あい`×64）と周期 3 の 128 文字（`かきく`×42 ＋ `かき`）で合計 256。後ろのほうを出す実装
+    /// （同点で置き換える）は `longest_run_period=3` を出す。
+    #[test]
+    fn the_longest_run_in_the_cut_line_is_the_earlier_one_on_a_tie() {
+        let mut parts = vec![BEFORE_RUNAWAY.to_owned()];
+        parts.extend(std::iter::repeat_n("あい".to_owned(), 64));
+        parts.push("！".to_owned());
+        parts.extend(std::iter::repeat_n("かきく".to_owned(), 42));
+        parts.push("か".to_owned());
+        parts.push("き".to_owned());
+        let runs: Vec<(usize, usize)> = crate::domain::fold_runaway_repetition(&parts.concat())
+            .runs
+            .iter()
+            .map(|run| (run.period, run.length))
+            .collect();
+        assert_eq!(
+            runs,
+            vec![(2, 128), (3, 128)],
+            "前提: 同じ長さで周期の違う2区間"
+        );
+        let mut steps = body_steps(&parts);
+        steps.push(Step::Chunk(Ok(chunk(AFTER_CUT, None))));
+        let mut relayed = None;
+        let output = captured_under_default_filter(|| {
+            relayed = Some(run_relay_with(steps, plan(), None, unreachable_redo()));
+        });
+        let relayed = relayed.expect("走ったこと");
+        assert_eq!(
+            downstream(&relayed.events).content,
+            parts.concat(),
+            "前提: 最後の差分で打ち切った"
+        );
+        let cut = report_lines(&output, RUNAWAY_CUT_LINE);
+        assert_eq!(cut.len(), 1, "{output:?}");
+        for field in [
+            "longest_run_period=2",
+            "longest_run_chars=128",
+            "runaway_total_chars=256",
+        ] {
+            assert!(has_field(cut[0], field), "{field}: {}", cut[0]);
+        }
+    }
+
+    /// **その回で `finish_reason` 付きのチャンクを一度でも流した後は、本文が続いて 256 に達しても打ち切らない**
+    /// （上流がもうその回を終えている / A-21b のレビュー）。
+    ///
+    /// 中身のある `stop` のチャンク（空ではないので保留されない）の後に、上流が本文の差分を送り続ける形。打ち切ると
+    /// `length` の終わりのチャンクがもう1本流れて、下流に `finish_reason` が2回出る。下流の `finish_reason` は最初の
+    /// `stop` の1回だけで、`[DONE]` で終わり、全部が流れて保存される。
+    #[test]
+    fn no_cut_after_the_upstream_has_already_sent_a_finish_reason() {
+        let mut steps = vec![Step::Chunk(Ok(chunk("「はい」", Some(FinishReason::Stop))))];
+        let tail: Vec<String> = std::iter::repeat_n("あい".to_owned(), 130).collect();
+        steps.extend(body_steps(&tail));
+        let mut relayed = None;
+        let output = captured_under_default_filter(|| {
+            relayed = Some(run_relay_with(steps, plan(), None, unreachable_redo()));
+        });
+        let relayed = relayed.expect("走ったこと");
+        let whole = format!("「はい」{}", tail.concat());
+        assert!(
+            folded_total(&whole) >= RUNAWAY_CUT_CHARS,
+            "前提: 256 に達する"
+        );
+        let seen = downstream(&relayed.events);
+        assert_eq!(
+            seen.finishes,
+            vec![0],
+            "finish_reason は最初の1回だけ: {:?}",
+            relayed.events
+        );
+        assert_eq!(seen.dones, vec![seen.len - 1], "{:?}", relayed.events);
+        assert_eq!(seen.content, whole, "全部流れること");
+        assert_eq!(relayed.saved[1].raw_content, whole);
+        assert!(report_lines(&output, RUNAWAY_CUT_LINE).is_empty());
+    }
+
+    /// **どの切れ目で届いても、積み上げた全文に純粋関数を当てた合計が初めて 256 に達したチャンクで打ち切る**（§決定7）。
+    ///
+    /// 期待値（どのチャンクまで流れるか）は、チャンクごとに `fold_runaway_repetition` を全文に当てて決める。
+    #[test]
+    fn the_cut_comes_at_the_chunk_where_the_fold_first_reaches_256_whatever_the_chunking() {
+        let text = format!(
+            "{BEFORE_RUNAWAY}「おかえり」{}{}",
+            "「好き」……\n".repeat(30),
+            "ずっと一緒だよ、".repeat(30)
+        );
+        let chars: Vec<char> = text.chars().collect();
+        for size in [1_usize, 3, 7, 16, 50] {
+            let parts: Vec<String> = chars
+                .chunks(size)
+                .map(|piece| piece.iter().collect())
+                .collect();
+            let mut prefix = String::new();
+            let mut expected = None;
+            for part in &parts {
+                prefix.push_str(part);
+                if folded_total(&prefix) >= RUNAWAY_CUT_CHARS {
+                    expected = Some(prefix.clone());
+                    break;
+                }
+            }
+            let expected = expected.expect("前提: この本文はどこかで 256 に達する");
+            assert!(expected.len() < text.len(), "前提: 末尾より前で達する");
+
+            let mut steps = body_steps(&parts);
+            steps.push(Step::Chunk(Ok(chunk("", Some(FinishReason::Stop)))));
+            let relayed = run_relay_with(steps, plan(), None, unreachable_redo());
+            let seen = downstream(&relayed.events);
+            assert_eq!(seen.content, expected, "切れ目 {size} 文字");
+            assert_eq!(
+                last_finish(&relayed.events),
+                json!("length"),
+                "切れ目 {size} 文字"
+            );
+            assert_eq!(relayed.saved[1].raw_content, expected, "切れ目 {size} 文字");
+        }
+    }
+
+    /// **思考が本文の差分に漏れる上流では、思考の中のループも生のまま数えて打ち切る**（§決定4）。
+    ///
+    /// 打ち切った回の本文は閉じない思考だけなので、剥がすと空になるが、**引き直さない**（中継は閉じない思考を
+    /// 引き直さない / ADR-0059 §決定3）。保存は生の出力のまま。剥がした後の本文で数える実装は、ここで打ち切らない。
+    #[test]
+    fn a_loop_inside_a_leaked_thought_is_counted_raw_and_cut_without_a_retry() {
+        let mut parts = vec!["<think>\n".to_owned()];
+        parts.extend(std::iter::repeat_n("どうしよう、".to_owned(), 60));
+        let mut steps = body_steps(&parts);
+        steps.push(Step::Chunk(Ok(chunk("</think>「ただいま」", None))));
+        steps.push(Step::Chunk(Ok(chunk("", Some(FinishReason::Stop)))));
+        let again = Again::streaming(vec![Ok(second_stream())]);
+        let mut relayed = None;
+        let output = captured_under_default_filter(|| {
+            relayed = Some(run_relay_with(steps, plan(), None, redo_to(&again)));
+        });
+        let relayed = relayed.expect("走ったこと");
+
+        let seen = downstream(&relayed.events);
+        assert!(
+            seen.content.starts_with("<think>\nどうしよう、") && !seen.content.contains("</think>"),
+            "閉じタグの前で打ち切ること: {:?}",
+            seen.content
+        );
+        assert!(
+            seen.content.chars().count() < parts.concat().chars().count(),
+            "前提: 最後まで流していない"
+        );
+        assert_eq!(last_finish(&relayed.events), json!("length"));
+        assert_eq!(again.opens(), 0, "打ち切った回は引き直さないこと");
+        assert_eq!(relayed.saved[1].raw_content, seen.content);
+        assert_eq!(report_lines(&output, RUNAWAY_CUT_LINE).len(), 1);
+    }
+
+    /// 本文の中で閉じた思考に、200 文字の区間（`あい`×100）を入れた空の回の台本（閉じタグは終わりのチャンク）。
+    fn blank_with_a_200_char_loop() -> Vec<Result<ChatChunk, LlmError>> {
+        let mut chunks = vec![Ok(chunk("<think>", None))];
+        chunks.extend(std::iter::repeat_n("あい", 100).map(|part| Ok(chunk(part, None))));
+        chunks.push(Ok(chunk("</think>", Some(FinishReason::Stop))));
+        chunks
+    }
+
+    /// **空の本文の引き直しの2回目・3回目で打ち切るときも、前の回の合計を持ち越さない**（§決定4・§決定7）。
+    ///
+    /// 捨てる回はどれも 200 文字の区間を持つ（打ち切らない長さ）。採る回の区間（`「好き」……` の周期 6）は、
+    /// 自分だけで 256 に達するのは 43 回目（258 文字）。前の回の 200 を持ち越すと、区間が条件を満たした
+    /// 11 回目（66 文字）で打ち切ってしまう。保存は採る回の打ち切るまでの生の出力。
+    #[test]
+    fn a_retried_attempt_counts_its_runaway_afresh() {
+        const UNIT: &str = "「好き」……";
+        for attempts in [2_usize, 3] {
+            let mut last: Vec<Result<ChatChunk, LlmError>> = std::iter::repeat_n(UNIT, 60)
+                .map(|part| Ok(chunk(part, None)))
+                .collect();
+            last.push(Ok(chunk("", Some(FinishReason::Stop))));
+            let mut opens: Vec<Result<Chunks, ()>> = Vec::new();
+            if attempts == 3 {
+                opens.push(Ok(blank_with_a_200_char_loop()));
+            }
+            opens.push(Ok(last));
+            let again = Again::streaming(opens);
+            let first: Vec<Step> = blank_with_a_200_char_loop()
+                .into_iter()
+                .map(Step::Chunk)
+                .collect();
+            let mut relayed = None;
+            let output = captured_under_default_filter(|| {
+                relayed = Some(run_relay_with(first, plan(), None, redo_to(&again)));
+            });
+            let relayed = relayed.expect("走ったこと");
+
+            assert_eq!(again.opens(), attempts - 1, "attempts={attempts}");
+            let kept = UNIT.repeat(43);
+            assert_eq!(folded_total(&kept), 258, "前提: 43 回で 258 文字");
+            assert_eq!(
+                folded_total(&UNIT.repeat(42)),
+                252,
+                "前提: 42 回では届かない"
+            );
+            let blank = format!("<think>{}</think>", "あい".repeat(100));
+            let seen = downstream(&relayed.events);
+            assert_eq!(
+                seen.content,
+                format!("{}{kept}", blank.repeat(attempts - 1)),
+                "attempts={attempts}: 採る回の 43 回目まで流れること"
+            );
+            assert!(seen.finished_once_at_the_end(), "{:?}", relayed.events);
+            assert_eq!(last_finish(&relayed.events), json!("length"));
+            assert_eq!(relayed.saved[1].raw_content, kept, "attempts={attempts}");
+            let cut = report_lines(&output, RUNAWAY_CUT_LINE);
+            assert_eq!(cut.len(), 1, "attempts={attempts}: {output:?}");
+            assert!(has_field(cut[0], "runaway_total_chars=258"), "{}", cut[0]);
+            assert!(
+                has_field(cut[0], &format!("attempt={attempts}")),
+                "打ち切った回が何回目か: {}",
+                cut[0]
+            );
+            let line = line_containing(&output, PARSE_MARKER);
+            assert!(
+                has_field(line, &format!("empty_retries={}", attempts - 1)),
+                "{line:?}"
+            );
+        }
+    }
+
+    /// **`finish_reason` 付きのチャンクを保留した後も、打ち切らない**（保留したものも「受けた」に数える / A-21b のレビュー）。
+    ///
+    /// 空の `stop` のチャンク（保留される）の後に、上流が本文の差分を送り続けて 256 に達する形（モジュールの doc の
+    /// 「保留した後に届くもの」）。打ち切らずに全部流し、上流が尽きたら、保留したチャンクを `stop` のまま流して `[DONE]`
+    /// （ここでは引き直しを開けない相手を使う）。保留した差分は落とさない（`raw_content` / 絶対制約）。
+    #[test]
+    fn no_cut_after_a_finish_chunk_was_held() {
+        let mut steps = vec![Step::Chunk(Ok(chunk("\n", Some(FinishReason::Stop))))];
+        let tail: Vec<String> = std::iter::repeat_n("あい".to_owned(), 130).collect();
+        steps.extend(body_steps(&tail));
+        let mut relayed = None;
+        let output = captured_under_default_filter(|| {
+            relayed = Some(run_relay_with(steps, plan(), None, unreachable_redo()));
+        });
+        let relayed = relayed.expect("走ったこと");
+
+        let expected = format!("{}\n", tail.concat());
+        let seen = downstream(&relayed.events);
+        assert_eq!(seen.content, expected, "{:?}", relayed.events);
+        assert!(seen.finished_once_at_the_end(), "{:?}", relayed.events);
+        assert_eq!(last_finish(&relayed.events), json!("stop"));
+        assert_eq!(relayed.saved[1].raw_content, expected);
+        assert!(report_lines(&output, RUNAWAY_CUT_LINE).is_empty());
     }
 }

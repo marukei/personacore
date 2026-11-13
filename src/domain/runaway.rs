@@ -145,8 +145,48 @@ pub fn fold_runaway_repetition(text: &str) -> FoldedRunaway<'_> {
         .filter(|(_, character)| !is_blank(*character))
         .collect();
 
-    let mut candidates = runaway_candidates(&glyphs);
-    // **長いほう → 周期の短いほう → 前にあるほう**の順に採る。
+    let chosen = choose(runaway_candidates(&glyphs));
+
+    if chosen.is_empty() {
+        return FoldedRunaway {
+            text: Cow::Borrowed(text),
+            runs: Vec::new(),
+        };
+    }
+
+    let mut runs = Vec::with_capacity(chosen.len());
+    let mut folded = String::with_capacity(text.len());
+    let mut cursor = 0_usize;
+    for candidate in &chosen {
+        // 単位1回分の最後の文字（空白を除いた添字）と、区間。
+        let (Some(unit_last), Some(run)) = (
+            glyphs.get(candidate.start + candidate.period - 1),
+            candidate.run(&glyphs),
+        ) else {
+            // 候補は `glyphs` の中からしか作らないので来ない。来たら畳まずに次へ（panic しない）。
+            continue;
+        };
+        let keep_until = glyph_end(*unit_last);
+        folded.push_str(text.get(cursor..keep_until).unwrap_or_default());
+        cursor = run.end;
+        runs.push(run);
+    }
+    folded.push_str(text.get(cursor..).unwrap_or_default());
+
+    FoldedRunaway {
+        text: Cow::Owned(folded),
+        runs,
+    }
+}
+
+/// **候補から区間を採る**（[`fold_runaway_repetition`] と [`RunawayCounter`] が共に通る / ADR-0062 §決定1 とその追記）。
+///
+/// **長いほう → 周期の短いほう → 前にあるほう**の順に採り、既に採った区間と重なる候補は、重ならない残りを
+/// 判定し直してその場で採る（並べ直さない）。返すのは**位置の順**。
+///
+/// 並べ方は候補の間の全順序（同じ周期の候補どうしは始まりが違う）なので、**渡す順に結果がよらない**
+/// —— 数え足す側は候補を届いた順に持つが、純粋関数と同じ区間を採る。
+fn choose(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
     candidates.sort_by(|left, right| {
         right
             .length
@@ -164,43 +204,150 @@ pub fn fold_runaway_repetition(text: &str) -> FoldedRunaway<'_> {
         }
     }
     chosen.sort_by_key(|candidate| candidate.start);
+    chosen
+}
 
-    if chosen.is_empty() {
-        return FoldedRunaway {
-            text: Cow::Borrowed(text),
-            runs: Vec::new(),
-        };
+/// **中継が上流の生成を打ち切る、畳む区間の長さの合計**（空白を除いた文字数 / ADR-0062 §決定4）。
+///
+/// 中継は、上流から受けた**生の**差分を積み上げたものについて [`RunawayCounter`] で区間を数え足し、
+/// 区間の長さの合計がこの値に達したら打ち切る（`server::relay`）。
+///
+/// # 来歴（ADR-0033 / ADR-0062 §決定4・§理由「誤検出の壊れ方」）
+///
+/// **測った対象:** [`RUNAWAY_MIN_COPIES`] の doc と同じ 928 本（第三者の推論サーバの Qwen3.8-Flash-Next の
+/// 日本語の返答。2026-11-13）。**ほかのモデル・ほかの言語は測っていない。**
+///
+/// **畳む基準（[`RUNAWAY_MIN_CHARS`] の 64 文字）の4倍にした理由は、誤って打ち切ったときの壊れ方が重いから**
+/// （利用者に流れている返答が途中で切れる）。測った 928 本のうち 64 文字に届かなかった 887 本の区間は、
+/// 短いループを含めても最大 60 文字、ループでない返答では最大 41 文字（2つの句を交互に言い直した返答）で、
+/// 256 文字はそれぞれの4倍・6倍以上。64 文字以上の 41 本のうち読んだ 12 本はどれもループで、残りの 29 本は
+/// 暴走した会話と腕のもの。
+///
+/// **高い側に外れても今より悪くはならない**（`max_tokens` まで流れる。遅くなるだけ）。低い側に外れたら、
+/// `finish_reason: "length"` と打ち切りの行で必ず分かる（黙っては起きない）。
+///
+/// **つまみにしない**（ADR-0036 §決定3。根拠となる計測がある）。誤って打ち切った回が出たら ADR-0062 の追記で直す。
+pub const RUNAWAY_CUT_CHARS: usize = 256;
+
+/// 周期の数（[`RUNAWAY_MIN_PERIOD`]〜[`RUNAWAY_MAX_PERIOD`]）。
+const PERIODS: usize = RUNAWAY_MAX_PERIOD - RUNAWAY_MIN_PERIOD + 1;
+
+/// **届いた文字ごとに区間を数え足す**（ADR-0062 §決定4 / 作業単位 A-21b）。**I/O を持たない。**
+///
+/// 中継（`server::relay`）が、上流から受けた**生の**差分（漏れた思考を剥がす前）を [`Self::push_str`] で渡す。
+/// 渡したもの全部を連結した文字列に [`fold_runaway_repetition`] を当てたときと**同じ区間**を
+/// [`Self::runs`] が返す（§決定7 の見張り番 `the_counter_matches_the_fold_at_every_chunk_boundary` /
+/// `the_counter_matches_the_fold_on_generated_texts`）。
+///
+/// # 何を数え足し、何を数え直すか
+///
+/// * **数え足す（積み上げた全体を走査し直さない）:** 周期ごとの `t[i] == t[i+p]` の続いた長さ。1文字届くごとに
+///   周期の数（63）だけ比べ、続きが切れた周期は、条件を満たせばその区間を「閉じた候補」に足す。
+///   これは [`fold_runaway_repetition`] の候補集め（`runaway_candidates`）を逐次にしたもので、**別の実装**である。
+/// * **聞かれるたびに採り直す:** 閉じた候補と、まだ伸びている候補（周期ごとに高々1つ）から、純粋関数と同じ
+///   `choose` で区間を採る。採る順（長いほう → …）は、後から伸びた候補が先に採った区間を追い越すと入れ替わり、
+///   残りの採り方も変わるので、逐次に足し引きすると純粋関数とずれうる。候補は条件（長さ ≥ `max(3p, 64)`）を
+///   満たしたものだけで、暴走していない返答ではふつう 0 個、暴走した区間1つにつき周期の倍数の分（周期 2 なら
+///   高々 32 個）なので、採り直しは安い。
+///
+/// # 計算量
+///
+/// 1文字ごとに O(63)。[`Self::runs`] / [`Self::total`] は候補の数を k として O(k log k ＋ k·採った数)。
+/// 覚えるのは空白を除いた文字とその位置（1文字につき `(usize, char)` 1つ）と、閉じた候補。
+#[derive(Debug, Clone)]
+pub struct RunawayCounter {
+    /// 空白を除いた文字と、**渡したもの全部を連結した文字列での**バイト位置。
+    glyphs: Vec<(usize, char)>,
+    /// 渡したもの全部のバイト数（次の差分の先頭のバイト位置）。
+    bytes: usize,
+    /// 周期ごとの、末尾で `t[i] == t[i+p]` が続いている長さ（添字は `p - RUNAWAY_MIN_PERIOD`）。
+    matched: [usize; PERIODS],
+    /// 続きが切れて長さが決まった候補（条件を満たしたものだけ）。
+    closed: Vec<Candidate>,
+}
+
+impl Default for RunawayCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RunawayCounter {
+    /// 何も数えていない状態（合計 0）。
+    pub const fn new() -> Self {
+        Self {
+            glyphs: Vec::new(),
+            bytes: 0,
+            matched: [0; PERIODS],
+            closed: Vec::new(),
+        }
     }
 
-    let mut runs = Vec::with_capacity(chosen.len());
-    let mut folded = String::with_capacity(text.len());
-    let mut cursor = 0_usize;
-    for candidate in &chosen {
-        // 区間の最初の文字・単位1回分の最後の文字・区間の最後の文字（どれも空白を除いた添字）。
-        let (Some(first), Some(unit_last), Some(last)) = (
-            glyphs.get(candidate.start),
-            glyphs.get(candidate.start + candidate.period - 1),
-            glyphs.get(candidate.start + candidate.length - 1),
-        ) else {
-            // 候補は `glyphs` の中からしか作らないので来ない。来たら畳まずに次へ（panic しない）。
-            continue;
-        };
-        let keep_until = glyph_end(*unit_last);
-        let run_end = glyph_end(*last);
-        folded.push_str(text.get(cursor..keep_until).unwrap_or_default());
-        cursor = run_end;
-        runs.push(RunawayRun {
-            start: first.0,
-            end: run_end,
-            period: candidate.period,
-            length: candidate.length,
-        });
+    /// 届いた差分を数え足す。**panic しない。**
+    pub fn push_str(&mut self, delta: &str) {
+        for (at, character) in delta.char_indices() {
+            if is_blank(character) {
+                continue;
+            }
+            let index = self.glyphs.len();
+            for (slot, matched) in self.matched.iter_mut().enumerate() {
+                let period = slot + RUNAWAY_MIN_PERIOD;
+                // 比べる相手は `period` 文字前。まだ無ければ、この周期とそれより長い周期は比べない。
+                let Some(partner) = index
+                    .checked_sub(period)
+                    .and_then(|left| self.glyphs.get(left))
+                else {
+                    break;
+                };
+                if partner.1 == character {
+                    *matched += 1;
+                } else {
+                    // 純粋関数の候補集めと同じ: 比べた組の左の添字は `index - period`、続きはその手前まで。
+                    push_if_runaway(
+                        &mut self.closed,
+                        (index - period).saturating_sub(*matched),
+                        period,
+                        *matched,
+                    );
+                    *matched = 0;
+                }
+            }
+            self.glyphs.push((self.bytes + at, character));
+        }
+        self.bytes += delta.len();
     }
-    folded.push_str(text.get(cursor..).unwrap_or_default());
 
-    FoldedRunaway {
-        text: Cow::Owned(folded),
-        runs,
+    /// 渡したもの全部を連結した文字列に [`fold_runaway_repetition`] を当てたときの区間（**位置の順**。
+    /// 位置は連結した文字列でのバイト位置）。無ければ空。
+    pub fn runs(&self) -> Vec<RunawayRun> {
+        choose(self.candidates())
+            .iter()
+            .filter_map(|candidate| candidate.run(&self.glyphs))
+            .collect()
+    }
+
+    /// 区間の長さの合計（空白を除いた文字数）。**中継はこれを [`RUNAWAY_CUT_CHARS`] と比べる。**
+    pub fn total(&self) -> usize {
+        self.runs().iter().map(|run| run.length).sum()
+    }
+
+    /// 閉じた候補と、まだ伸びている候補（純粋関数の「末尾まで続いた分」と同じ）。
+    fn candidates(&self) -> Vec<Candidate> {
+        let mut candidates = self.closed.clone();
+        for (slot, matched) in self.matched.iter().enumerate() {
+            let period = slot + RUNAWAY_MIN_PERIOD;
+            // 比べた組の数は `n - p`（純粋関数の `compared`）。
+            let Some(compared) = self.glyphs.len().checked_sub(period) else {
+                break;
+            };
+            push_if_runaway(
+                &mut candidates,
+                compared.saturating_sub(*matched),
+                period,
+                *matched,
+            );
+        }
+        candidates
     }
 }
 
@@ -215,6 +362,18 @@ struct Candidate {
 impl Candidate {
     fn end(&self) -> usize {
         self.start + self.length
+    }
+
+    /// `glyphs`（空白を除いた文字とバイト位置）の上の区間。添字が外れていれば `None`（来ない。panic しない）。
+    fn run(&self, glyphs: &[(usize, char)]) -> Option<RunawayRun> {
+        let first = glyphs.get(self.start)?;
+        let last = glyphs.get((self.start + self.length).checked_sub(1)?)?;
+        Some(RunawayRun {
+            start: first.0,
+            end: glyph_end(*last),
+            period: self.period,
+            length: self.length,
+        })
     }
 
     fn overlaps(&self, other: &Self) -> bool {
@@ -662,5 +821,173 @@ mod tests {
             2,
             "前提: 区間が2つ畳まれること: {first:?}"
         );
+    }
+
+    // ---- 中継の数え足し（ADR-0062 §決定4・§決定7 / 作業単位 A-21b） ----
+
+    /// 純粋関数が畳む区間の長さの合計。
+    fn folded_total(text: &str) -> usize {
+        fold_runaway_repetition(text)
+            .runs
+            .iter()
+            .map(|run| run.length)
+            .sum()
+    }
+
+    /// **`chunk_chars` 文字ずつ数え足し、切れ目ごとに、積み上げた全文に純粋関数を当てた結果と突き合わせる。**
+    ///
+    /// 区間（位置・周期・長さ）まで一致を見る —— 合計だけだと、別の区間の組が偶然同じ和になる形を見逃す。
+    fn assert_counter_matches_the_fold(text: &str, chunk_chars: &[usize]) {
+        let chars: Vec<char> = text.chars().collect();
+        let mut counter = RunawayCounter::default();
+        let mut prefix = String::new();
+        let mut at = 0_usize;
+        let mut sizes = chunk_chars.iter().copied().cycle();
+        while at < chars.len() {
+            let size = sizes.next().unwrap_or(1).max(1);
+            let end = at.saturating_add(size).min(chars.len());
+            let delta: String = chars[at..end].iter().collect();
+            at = end;
+            counter.push_str(&delta);
+            prefix.push_str(&delta);
+            let folded = fold_runaway_repetition(&prefix);
+            assert_eq!(
+                counter.runs(),
+                folded.runs,
+                "区間が純粋関数と一致すること（切れ目 {chunk_chars:?}・{} 文字まで）: {prefix:?}",
+                prefix.chars().count()
+            );
+            assert_eq!(
+                counter.total(),
+                folded_total(&prefix),
+                "合計が純粋関数と一致すること（切れ目 {chunk_chars:?}）: {prefix:?}"
+            );
+        }
+    }
+
+    /// 切れ目の並べ方（1文字ずつ・まとめて・不揃い・全部を1回で）。
+    const CHUNKINGS: [&[usize]; 6] = [&[1], &[2], &[3], &[7], &[5, 1, 13, 2], &[usize::MAX]];
+
+    /// **数え足した区間と合計は、積み上げた全文に純粋関数を当てたものと、どの切れ目でも一致する**（§決定7）。
+    ///
+    /// **重なりと残りが出る形を全部入れる**（ADR-0062 §決定1 の追記 / A-21a）: 短い残りを捨てる形・後ろ側の残りを採る形・
+    /// 前側の残りを採る形・隙間なく隣り合う形。採る順（長いほう → 周期の短いほう → 前）は途中の切れ目で入れ替わりうる
+    /// （後から伸びた区間が先に採った区間を追い越す）ので、切れ目ごとに見る。
+    #[test]
+    fn the_counter_matches_the_fold_at_every_chunk_boundary() {
+        const UNIT: &str = "ずっと一緒だよ、";
+        let texts = [
+            // 畳まない（対照）。
+            "「おかえりなさい」 彼女は微笑んだ。".to_owned(),
+            format!("{HEAD}{}あ", "あい".repeat(31)),
+            format!("{HEAD}{}", UNIT_21.repeat(3)),
+            format!("{HEAD}{}", SENTENCE_36.repeat(2)),
+            format!("{HEAD}{}", distinct(65).repeat(3)),
+            // 1つ畳む。
+            format!("{HEAD}{}", "あい".repeat(32)),
+            format!("{HEAD}{}", UNIT_22.repeat(3)),
+            format!("{HEAD}{}", distinct(64).repeat(3)),
+            format!("{HEAD}{}\n{TAIL}", "「好き」……".repeat(20)),
+            format!("{HEAD}\r\n{}{TAIL}", "「好き」 ……\r\n".repeat(20)),
+            format!("{HEAD}{}", "あい".repeat(40)),
+            // 2つ畳む。
+            format!(
+                "{HEAD}{}{TAIL}{}{TAIL}",
+                "あい".repeat(40),
+                UNIT_22.repeat(4)
+            ),
+            // **重なり**（A-21a の4つの形）。
+            format!("{}{}", "あいう".repeat(30), "いう".repeat(31)),
+            format!("{}{}", "あいう".repeat(30), "いう".repeat(40)),
+            format!("{}{}", "いう".repeat(40), "あいう".repeat(30)),
+            format!(
+                "{HEAD}{}っと一緒だよ、{}{TAIL}",
+                UNIT.repeat(9),
+                UNIT.repeat(9)
+            ),
+            // **漏れた思考の中のループ**（数えるのは生の出力 / §決定4）。
+            format!("<think>\n{}", "どうしよう、".repeat(30)),
+        ];
+        for text in &texts {
+            for chunking in CHUNKINGS {
+                assert_counter_matches_the_fold(text, chunking);
+            }
+        }
+    }
+
+    /// 決まった種から作る擬似乱数（線形合同法）。**テストの入力を作るだけ**（暗号用途ではない）。
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let high = usize::try_from(self.0 >> 33).unwrap_or(0);
+            high % bound.max(1)
+        }
+    }
+
+    /// **作った入力でも一致する**（§決定7）。4 文字と空白だけの綴りで単位の繰り返しと雑音を混ぜ、
+    /// 周期の違う区間が偶然の一致で重なる形を多く作る。切れ目も不揃いにする。
+    #[test]
+    fn the_counter_matches_the_fold_on_generated_texts() {
+        const ALPHABET: [char; 6] = ['あ', 'い', 'う', 'え', ' ', '\n'];
+        let mut random = Lcg(0x5EED_A21B);
+        for _ in 0..40 {
+            let mut text = String::new();
+            while text.chars().count() < 360 {
+                let unit: String = (0..=random.below(12))
+                    .map(|_| ALPHABET[random.below(ALPHABET.len())])
+                    .collect();
+                if random.below(3) == 0 {
+                    text.push_str(&unit);
+                } else {
+                    text.push_str(&unit.repeat(1 + random.below(24)));
+                }
+            }
+            let chunking: Vec<usize> = (0..5).map(|_| 1 + random.below(9)).collect();
+            assert_counter_matches_the_fold(&text, &chunking);
+        }
+    }
+
+    /// **打ち切りの値は 256 文字**（ADR-0062 §決定4。来歴は [`RUNAWAY_CUT_CHARS`] の doc）。
+    ///
+    /// 合計は**区間の長さの和**: 128 文字と 127 文字の2つの区間で 255、1 文字足して 128 ＋ 128 で 256。
+    /// **手で数えた**（`あい`×64 ＝ 128、`かき`×63 ＋ `か` ＝ 127。間の `！` はどちらの単位とも続かない）。
+    #[test]
+    fn the_cut_is_256_and_a_total_of_255_falls_short() {
+        assert_eq!(RUNAWAY_CUT_CHARS, 256);
+
+        let short = format!("{HEAD}{}！{}か", "あい".repeat(64), "かき".repeat(63));
+        let mut counter = RunawayCounter::default();
+        counter.push_str(&short);
+        let runs: Vec<(usize, usize)> = counter
+            .runs()
+            .iter()
+            .map(|run| (run.period, run.length))
+            .collect();
+        assert_eq!(runs, vec![(2, 128), (2, 127)]);
+        assert_eq!(counter.total(), 255);
+        assert_eq!(folded_total(&short), 255, "前提: 純粋関数も 255");
+
+        counter.push_str("き");
+        assert_eq!(counter.total(), 256);
+        assert_eq!(folded_total(&format!("{short}き")), 256);
+    }
+
+    /// **空白だけの差分は合計を変えない**（数えるのは空白を除いた文字 / [`is_blank`]）。数え始めは 0。
+    #[test]
+    fn a_fresh_counter_is_zero_and_blanks_do_not_count() {
+        let mut counter = RunawayCounter::default();
+        assert_eq!(counter.total(), 0);
+        assert!(counter.runs().is_empty());
+        counter.push_str(&"あい".repeat(32));
+        assert_eq!(counter.total(), 64);
+        counter.push_str(" \n\u{3000}\r\n");
+        assert_eq!(counter.total(), 64, "空白では伸びない");
+        counter.push_str("あ");
+        assert_eq!(counter.total(), 65, "空白を挟んでも区間は続く");
     }
 }
