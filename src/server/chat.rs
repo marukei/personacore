@@ -82,14 +82,6 @@ const USER_ROLE: &str = "user";
 /// 応答 id の接頭辞（OpenAI 互換クライアントが `chatcmpl-` を期待する）。
 const COMPLETION_ID_PREFIX: &str = "chatcmpl-";
 
-/// DB から読む会話履歴の上限件数。
-///
-/// **ここは「読む上限」であって「載せる上限」ではない。** 実際に何件載るかは
-/// `prompt::budget` が決める（履歴は最初に削られる枠）。多めに読んでおいて
-/// 予算に削らせる形にしてあるので、この値を増やしても
-/// プロンプトが膨らむわけではない（DB の読み取り量だけが増える）。
-const HISTORY_LIMIT: u32 = 50;
-
 /// 本文を読めなかったときにログへ残す入口のラベル（**応答には載らない**）。
 const ENDPOINT: &str = "chat_completions";
 
@@ -315,9 +307,21 @@ pub(super) async fn chat_completions(
         .recall_memories(character.id)
         .await
         .map_err(|err| internal(&err, "記憶を取得できませんでした"))?;
+    // **履歴の窓は、往復の通し番号の区切りから読む**（ADR-0063 / 作業単位 A-17）。
+    //
+    // かつてはここで最新の 50 件（`HISTORY_LIMIT`）を読んでいた。doc は「読む上限であって載せる上限ではない」
+    // と書いていたが、**長い会話では予算より先に件数が効き**、毎ターン最古の1往復が落ちて
+    // 会話キャッシュが全ターン 0 になっていた（ADR-0063 §背景）。いまは「直近 25 往復を含む最も新しい区切り」
+    // から読み（窓は 25〜34 往復）、読む件数の天井は `domain::HISTORY_READ_CAP`。
+    // **今回の発言はまだ書かれていない**（往復は応答の後に `TurnSink::persist` がまとめて書く）ので、
+    // 数える往復の数は「これまでの往復」だけになる。
+    //
+    // **`turns_before` を必ず `PromptInput` へ渡す**（予算で削るときの区切りへの切り上げに要る / §決定3）。
+    // 渡し忘れても `prompt` の単体テストは緑のまま —— 見張り番は `tests/server_chat.rs` の
+    // `the_history_window_trimmed_by_the_budget_stays_on_a_boundary`（§決定4）。
     let history = state
         .store()
-        .recent_messages(session_id, HISTORY_LIMIT)
+        .recent_history(session_id)
         .await
         .map_err(|err| internal(&err, "会話履歴を取得できませんでした"))?;
 
@@ -377,7 +381,8 @@ pub(super) async fn chat_completions(
             attributes: &attributes,
             agreements: &agreements,
             memories: &memories,
-            history: &history,
+            history: &history.messages,
+            history_turns_before: Some(history.turns_before),
             user_message,
         },
     )

@@ -14,7 +14,10 @@ use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
 use super::{Store, StoreError};
-use crate::domain::{CharacterId, Message, MessageId, NewMessage, Role, SessionId};
+use crate::domain::{
+    CharacterId, HISTORY_READ_CAP, Message, MessageId, NewMessage, Role, SessionId,
+    first_turn_to_read,
+};
 
 /// `session` テーブルの1行。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +79,19 @@ pub struct MessagePage {
     ///
     /// 1件多く頼んで決める——総数との差で決めると、読んでいる間に増えた分で狂う。
     pub has_older: bool,
+}
+
+/// 本文のプロンプトに渡す会話履歴の窓（[`Store::recent_history`] / ADR-0063 / 作業単位 A-17）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentHistory {
+    /// **古い順**（`prompt::PromptInput::history` にそのまま渡す並び）。
+    pub messages: Vec<Message>,
+    /// **`messages` の最初の行より前にある、そのセッションの利用者の発言の数**
+    /// （`prompt::PromptInput::history_turns_before` にそのまま渡す）。
+    ///
+    /// 窓が区切りから始まっていれば「読み始めの通し番号 − 1」。読む件数の天井で頭が切れたときも、
+    /// **返した最初の行から数え直す**ので、`messages` との対応は崩れない。
+    pub turns_before: u32,
 }
 
 /// 日時の書式。**`migrations/0001_initial.sql` の DEFAULT と同一にすること。**
@@ -297,6 +313,30 @@ const COUNT_MESSAGES: &str = "SELECT count(*) FROM message WHERE session_id = ?"
 /// 並びの権威は `id`（`SELECT_RECENT_MESSAGES` と同じ理由）。
 const COUNT_USER_MESSAGES_THROUGH: &str =
     "SELECT count(*) FROM message WHERE session_id = ?1 AND role = ?2 AND id <= ?3";
+
+/// **そのセッションの利用者の発言の数**（＝ 往復の数 / ADR-0063 / 作業単位 A-17）。
+///
+/// `?1` = セッション id / `?2` = 利用者の役割の綴り（`role_to_db(Role::User)`）。
+const COUNT_USER_MESSAGES: &str =
+    "SELECT count(*) FROM message WHERE session_id = ?1 AND role = ?2";
+
+/// **読み始めの往復の利用者の発言から最新まで**（ADR-0063 §決定2）。**新しい順に取り出して呼び出し側で反転する。**
+///
+/// `?1` = セッション id / `?2` = 利用者の役割の綴り / `?3` = 読み始めの手前にある利用者の発言の数
+/// （読み始めの通し番号 − 1。副問合せの `OFFSET`）/ `?4` = 読む件数の天井。
+///
+/// 利用者の発言が `?3` 件以下（＝ 読み始めの往復が無い）なら副問合せが NULL になり、1行も返らない。
+/// 並びの権威は `id`（`SELECT_RECENT_MESSAGES` と同じ理由）。
+const SELECT_MESSAGES_FROM_TURN: &str = "SELECT id, role, dialogue, narration, raw_content, created_at \
+     FROM message WHERE session_id = ?1 AND id >= \
+         (SELECT id FROM message WHERE session_id = ?1 AND role = ?2 ORDER BY id LIMIT 1 OFFSET ?3) \
+     ORDER BY id DESC LIMIT ?4";
+
+/// **その行より前にある、利用者の発言の数**（窓の `turns_before` / ADR-0063）。
+///
+/// `?1` = セッション id / `?2` = 利用者の役割の綴り / `?3` = 窓の最初の行の id（**これ未満**）。
+const COUNT_USER_MESSAGES_BEFORE: &str =
+    "SELECT count(*) FROM message WHERE session_id = ?1 AND role = ?2 AND id < ?3";
 
 impl Store {
     /// セッションを作成し、作成した行の id を返す（`aoi@new` の意味論）。
@@ -569,6 +609,9 @@ impl Store {
     ///
     /// プロンプト組立が使う並びなので、返す順序を逆にしないこと。
     /// `limit` が 0 なら空。件数より大きければ全件。
+    ///
+    /// **本文のプロンプトはこれで読まない**（[`Store::recent_history`] —— 区切りから読み、
+    /// 通し番号の手掛かりも返す / ADR-0063）。件数で切ると、長い会話で窓が毎ターン動く。
     pub async fn recent_messages(
         &self,
         session_id: SessionId,
@@ -587,6 +630,65 @@ impl Store {
             messages.push(message_from_row(row, session_id)?);
         }
         Ok(messages)
+    }
+
+    /// **本文のプロンプトに渡す会話履歴の窓**（ADR-0063 §決定1・§決定2 / 作業単位 A-17）。
+    ///
+    /// 1. そのセッションの**利用者の発言を数える**（＝ 往復の数 N。今回の発言はまだ書かれていない ——
+    ///    本文の経路は応答を受け取った後に往復をまとめて書く / `server::turn`）。
+    /// 2. 読み始めの通し番号を決める（`domain::first_turn_to_read`。直近 25 往復を含む最も新しい区切り）。
+    /// 3. **その番号の利用者の発言から最新まで**を、[`HISTORY_READ_CAP`] 件を天井に新しい側から読む。
+    /// 4. 返した最初の行より前の利用者の発言を数え直して `turns_before` にする。
+    ///
+    /// **状態を持たない**（DB の列もメモリ上の状態も足さない / §決定1）。数え直すだけなので、
+    /// exe を再起動しても同じ窓になる。**利用者の発言を消す口ができたら、その後の窓が1回動く**
+    /// （ADR-0063 の「守れないもの」）。
+    ///
+    /// **読むだけ。トランザクションを取らない。** 1〜3 の間に同じセッションへ往復が書き足されても、
+    /// 窓が少し長くなるだけで、`turns_before` は返した行から数えるので行との対応は崩れない
+    /// （id は挿入順に増え、行は消えない）。
+    pub async fn recent_history(&self, session_id: SessionId) -> Result<RecentHistory, StoreError> {
+        let turns: i64 = sqlx::query_scalar(COUNT_USER_MESSAGES)
+            .bind(session_id.get())
+            .bind(role_to_db(Role::User))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(StoreError::Query)?;
+        let turns = u32::try_from(turns).map_err(|_| StoreError::InvalidStoredValue)?;
+        // 読み始めの往復の、利用者の発言の手前にある利用者の発言の数（OFFSET に使う）。
+        let skipped = first_turn_to_read(turns).saturating_sub(1);
+
+        let rows = sqlx::query(SELECT_MESSAGES_FROM_TURN)
+            .bind(session_id.get())
+            .bind(role_to_db(Role::User))
+            .bind(i64::from(skipped))
+            .bind(i64::from(HISTORY_READ_CAP))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(StoreError::Query)?;
+        let mut messages = Vec::with_capacity(rows.len());
+        // SQL は新しい順に取っているので、時系列順に戻す。
+        for row in rows.iter().rev() {
+            messages.push(message_from_row(row, session_id)?);
+        }
+
+        let turns_before = match messages.first() {
+            Some(first) => {
+                let counted: i64 = sqlx::query_scalar(COUNT_USER_MESSAGES_BEFORE)
+                    .bind(session_id.get())
+                    .bind(role_to_db(Role::User))
+                    .bind(first.id.get())
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(StoreError::Query)?;
+                u32::try_from(counted).map_err(|_| StoreError::InvalidStoredValue)?
+            }
+            None => 0,
+        };
+        Ok(RecentHistory {
+            messages,
+            turns_before,
+        })
     }
 
     /// そのキャラクターの会話を**素の `aoi` が続ける順**に `limit` 件まで返す（作業単位 D-12c-1）。

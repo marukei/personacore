@@ -42,7 +42,7 @@ use personacore::llm::{
 };
 use personacore::measured::ModelFace;
 use personacore::prompt::{
-    CountedParts, MESSAGE_OVERHEAD_TOKENS, PromptInput, TokenBudget, build_prompt,
+    CountedParts, MESSAGE_OVERHEAD_TOKENS, PromptInput, TokenBudget, build_prompt, parts_to_count,
 };
 use personacore::server::{
     App, AppConfig, BindAddr, ENV_CONTEXT_TOKENS, ENV_LLM_ENDPOINT, ENV_LLM_IDLE_TIMEOUT,
@@ -84,7 +84,11 @@ const STREAM_PROMPT_TOKENS: u32 = 43;
 /// 偽の上流が返す本文。**両方の経路で同じ本文**にする（2ターン目の履歴を腕の間で揃えるため）。
 const REPLY: &str = "「はい」";
 
-/// 履歴を読む上限（`server::chat` の `HISTORY_LIMIT` より大きい値。台本の履歴はそれより少ない）。
+/// 保存された件数を数えるときに読む上限（[`settled_history`]。台本の履歴はそれより少ない）。
+///
+/// **参照値の計画（[`TestServer::try_byte_plan`]）はこれを使わない** —— 本文処理と同じ
+/// `Store::recent_history` で読む（ADR-0063 / 作業単位 A-17。かつては `server::chat` の
+/// `HISTORY_LIMIT` = 50 件より大きいこの値で読み、台本の履歴がそれより少ないことで一致させていた）。
 const HISTORY_READ: u32 = 1_000;
 
 /// 狭い予算（明示のコンテキスト長）。**バイト数の計画が履歴を削る**大きさ。
@@ -294,6 +298,46 @@ async fn bodies_to(server: &MockServer, wanted: &str) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// **外で組んだ1回目の数えた計画**（[`TestServer::counted_reference`]）。
+struct CountedReference {
+    /// 通し番号を渡した組み上がり（本文処理と同じ）。
+    numbered: Vec<String>,
+    /// その配分が区切りへの切り上げで落とした件数（ADR-0063 §決定3）。
+    snapped_away: usize,
+    /// 通し番号を渡さない組み上がり（`server::chat` が `history_turns_before: None` を渡す変異と同じ）。
+    unnumbered: Vec<String>,
+}
+
+impl CountedReference {
+    /// **この台本では区切りへの切り上げが何もしていない**ことを確かめる（ADR-0063 / 作業単位 A-17）。
+    ///
+    /// 組み直しの見張り番（N1・共有の差し引き・N4）が見ているのは数えた計画の組み直しで、窓ではない。
+    /// 切り上げが効くと1回目の計画が縮んで封が取り分に収まり、組み直しが起きなくなる。だから
+    /// 1. 外で組んだ計画が、サーバが1回目に封をした本文そのものであること（参照が本物の計画であること）、
+    /// 2. その計画の切り上げが 0 件で、通し番号を渡さない組み上がりと同じであること、
+    ///
+    /// を台本の偶然に任せず assert する。
+    fn assert_snapping_is_idle(&self, first_seal: &[String], label: &str) {
+        assert_eq!(
+            first_seal,
+            self.numbered.as_slice(),
+            "前提: 外で組んだ数えた計画が、1回目に封をした本文と同じであること（{label}）"
+        );
+        assert_eq!(
+            self.snapped_away,
+            0,
+            "前提: この台本では ADR-0063 の切り上げが何も落とさないこと（{label}）。\
+             番号なしの組み上がりの履歴は {} 件で、先頭は {:?}",
+            self.unnumbered.len().saturating_sub(2),
+            self.unnumbered.get(1).map(|head| head.get(..4))
+        );
+        assert_eq!(
+            self.numbered, self.unnumbered,
+            "前提: 通し番号を渡さない組み上がりと同じであること（{label}）"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------- サーバ
 
 /// エフェメラルポートで起動した実サーバ。
@@ -489,9 +533,10 @@ impl TestServer {
         context_tokens: u32,
     ) -> Result<personacore::prompt::BuiltPrompt, personacore::prompt::PromptError> {
         let character = self.character().await;
+        // **本文処理と同じ読み方**（窓と通し番号 / ADR-0063）。
         let history = self
             .store
-            .recent_messages(session, HISTORY_READ)
+            .recent_history(session)
             .await
             .expect("履歴を読めること");
         let stats = self
@@ -521,13 +566,81 @@ impl TestServer {
                 attributes: &attributes,
                 agreements: &agreements,
                 memories: &memories,
-                history: &history,
+                history: &history.messages,
+                history_turns_before: Some(history.turns_before),
                 user_message,
             },
             TokenBudget::new(context_tokens, TokenBudget::DEFAULT_RESPONSE_TOKENS)
                 .expect("予算になる値であること"),
             &CountedParts::default(),
         )
+    }
+
+    /// **いまの DB から、1回目の数えた計画を外で組む**（[`Tokenizing`] と同じ数え方 = 部品ごとに [`quarter`]）。
+    ///
+    /// 通し番号を渡した組み上がり（本文処理と同じ）と、渡さない組み上がり（`server::chat` が
+    /// `history_turns_before: None` を渡す変異と同じ）の両方を返す。
+    /// **ターンを送る前に呼ぶこと**（送ると、その往復が履歴に入る）。`context_tokens` は数えた計画の窓
+    /// （本文と裏方が同じ上流なら差し引いた後の値）。
+    async fn counted_reference(
+        &self,
+        session: SessionId,
+        user_message: &str,
+        context_tokens: u32,
+    ) -> CountedReference {
+        let character = self.character().await;
+        let history = self
+            .store
+            .recent_history(session)
+            .await
+            .expect("履歴を読めること");
+        let stats = self
+            .store
+            .stat_allocs(character.id)
+            .await
+            .expect("性格を読めること");
+        let attributes = self
+            .store
+            .character_attributes(character.id)
+            .await
+            .expect("属性を読めること");
+        let agreements = self
+            .store
+            .active_agreements(character.id)
+            .await
+            .expect("取り決めを読めること");
+        let memories = self
+            .store
+            .recall_memories(character.id)
+            .await
+            .expect("記憶を読めること");
+        let input = |turns_before| PromptInput {
+            character: &character,
+            stats: &stats,
+            attributes: &attributes,
+            agreements: &agreements,
+            memories: &memories,
+            history: &history.messages,
+            history_turns_before: turns_before,
+            user_message,
+        };
+        let mut counted = CountedParts::default();
+        for part in parts_to_count(&input(None)) {
+            let tokens = quarter(&part);
+            counted.insert(part, tokens);
+        }
+        let budget = TokenBudget::new(context_tokens, TokenBudget::DEFAULT_RESPONSE_TOKENS)
+            .expect("予算になる値であること");
+        let built = |turns_before| {
+            build_prompt(&input(turns_before), budget, &counted).expect("数えた計画が組めること")
+        };
+        let numbered = built(Some(history.turns_before));
+        let unnumbered = built(None);
+        CountedReference {
+            numbered: contents(&numbered.messages),
+            snapped_away: numbered.plan.history_snapped_away(),
+            unnumbered: contents(&unnumbered.messages),
+        }
     }
 
     async fn character(&self) -> personacore::domain::Character {
@@ -1553,6 +1666,9 @@ async fn a_prompt_is_sent_only_after_the_upstream_counted_it_within_the_allowanc
         let byte_plan = server
             .byte_plan(session, "ただいま", TIGHT_CONTEXT_TOKENS)
             .await;
+        let reference = server
+            .counted_reference(session, "ただいま", TIGHT_CONTEXT_TOKENS)
+            .await;
 
         let mark = log.mark();
         server.ok_turn("ただいま", streaming).await;
@@ -1560,6 +1676,9 @@ async fn a_prompt_is_sent_only_after_the_upstream_counted_it_within_the_allowanc
         let seen = one_copy(&calls);
 
         let seals = seals_in(&seen);
+        if let Some((first_seal, _)) = seals.first() {
+            reference.assert_snapping_is_idle(first_seal, &format!("N1 / streaming={streaming}"));
+        }
         assert_eq!(
             seals.len(),
             2,
@@ -1728,11 +1847,25 @@ async fn a_shared_upstream_leaves_room_for_one_background_request() {
         let byte_plan = server
             .byte_plan(session, "ただいま", SHARED_CONTEXT_TOKENS)
             .await;
+        // 同じ上流の腕の数えた計画の窓は、裏方の1要求分を差し引いた後の値。
+        let reference = server
+            .counted_reference(
+                session,
+                "ただいま",
+                SHARED_CONTEXT_TOKENS - BACKGROUND_REQUEST,
+            )
+            .await;
 
         let mark = log.mark();
         server.ok_turn("ただいま", false).await;
         let line = log.one_seal_line_since(mark);
         let seen = one_copy(&calls);
+        if !separate {
+            // 組み直しを見るのは同じ上流の腕だけ（別の上流の腕は組み直しの回数を見ない）。
+            if let Some((first_seal, _)) = seals_in(&seen).first() {
+                reference.assert_snapping_is_idle(first_seal, arm);
+            }
+        }
         let sends = sends_in(&seen);
         assert_eq!(sends.len(), 1, "{arm}");
         let sent = n1_seal(&sends[0]);
@@ -2111,8 +2244,17 @@ async fn a_usage_above_the_sealed_count_turns_the_face_back_to_bytes() {
             let server =
                 n4_server_with(arm.seal, arm.usage_of, arm.parts_uncountable, &calls).await;
             let session = server.seed_history(arm.history_turns, 400).await;
+            let reference = server
+                .counted_reference(session, "ただいま", TIGHT_CONTEXT_TOKENS)
+                .await;
 
             let first = observe(&log, &server, &calls, "ただいま", streaming).await;
+            if arm.rebuilds > 0 {
+                // 組み直しの腕は、切り上げが1回目の計画を縮めていないことを前提にする。
+                if let Some((first_seal, _)) = seals_in(&first.seen).first() {
+                    reference.assert_snapping_is_idle(first_seal, name);
+                }
+            }
             let (sealed, actual, planned, first_sent) =
                 first_turn_numbers_of(&first, arm.seal, arm.usage_of, arm.plan);
             assert!(

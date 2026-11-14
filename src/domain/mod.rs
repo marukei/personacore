@@ -21,6 +21,7 @@ mod character;
 mod chat;
 mod drift;
 mod drift_ledger;
+mod history_window;
 mod memory;
 mod message;
 mod runaway;
@@ -68,6 +69,10 @@ pub use drift::{
 pub use drift_ledger::{
     DEFAULT_DRIFT_DECAY, DEFAULT_DRIFT_SLOPE, DEFAULT_DRIFT_STEP_COST, DriftAxisLedger,
     DriftLedger, DriftLedgerError, DriftTuning, DriftTuningError, DriftTurnEffect, MAX_DRIFT_SLOPE,
+};
+pub use history_window::{
+    HISTORY_MIN_TURNS, HISTORY_READ_CAP, HISTORY_SNAP_MIN_FITTING_TURNS, HISTORY_TURN_STEP,
+    a_boundary_lies_between, first_turn_to_read,
 };
 pub use memory::{
     CategoryError, ContentError, Memory, MemoryCategory, MemoryColumn, MemoryContent, MemoryEntry,

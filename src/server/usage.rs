@@ -330,6 +330,7 @@ mod tests {
                 agreements: &[],
                 memories: &memories,
                 history: &history,
+                history_turns_before: None,
                 user_message: "こんにちは",
             },
             budget(),
