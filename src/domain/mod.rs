@@ -72,7 +72,7 @@ pub use drift_ledger::{
 };
 pub use history_window::{
     HISTORY_MIN_TURNS, HISTORY_READ_CAP, HISTORY_SNAP_MIN_FITTING_TURNS, HISTORY_TURN_STEP,
-    a_boundary_lies_between, first_turn_to_read,
+    MEMORY_BOUNDARY_PHASE, a_boundary_lies_between, first_turn_to_read, memory_boundary_turn,
 };
 pub use memory::{
     CategoryError, ContentError, Memory, MemoryCategory, MemoryColumn, MemoryContent, MemoryEntry,

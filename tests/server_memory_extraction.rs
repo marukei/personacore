@@ -43,7 +43,7 @@ use personacore::llm::{
 use personacore::server::{
     App, AppConfig, BindAddr, ENV_LLM_ENDPOINT, ENV_MAIN_MODEL, ENV_SUB_MODEL, ServerError,
 };
-use personacore::store::Store;
+use personacore::store::{RecallScope, Store};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -579,7 +579,7 @@ impl TestServer {
     async fn memories(&self) -> Vec<Memory> {
         let character = self.character().await;
         self.store
-            .recall_memories(character.id)
+            .recall_memories(character.id, RecallScope::Everything)
             .await
             .expect("記憶を読めること")
     }
@@ -588,7 +588,7 @@ impl TestServer {
     async fn bystander_memories(&self) -> Vec<Memory> {
         let bystander = self.bystander().await;
         self.store
-            .recall_memories(bystander.id)
+            .recall_memories(bystander.id, RecallScope::Everything)
             .await
             .expect("傍観者の記憶を読めること")
     }
@@ -978,6 +978,97 @@ async fn a_stored_own_memory_stays_out_of_the_persona_prompt_but_reaches_the_ext
             "抽出の依頼の既知の記憶から落ちた: {fact}\n{extraction}"
         );
     }
+
+    server.stop().await;
+}
+
+/// **抽出が書いた記憶は、次の区切りまで本文の依頼に載らないが、次の抽出の依頼には載る**
+/// （ADR-0064 §決定1・§決定3 —— 絞るのは本文の想起だけ）。
+///
+/// 1ターン目の抽出が `USER_FACT` を書く（本番の書き手 `Store::add_memory_in_session`）。
+/// 2ターン目は往復の数 1 で区切りが無く、境の時刻はセッションの作成時刻 —— 抽出の記憶はそれより新しい。
+///
+/// * 本文の依頼に `USER_FACT` が載らない（境の時刻を渡さない変異で赤）。
+/// * 2ターン目の抽出の依頼（既知の記憶）には載る（裏方まで絞る変異で赤）。
+///
+/// **時刻の同着で揺れない形にしてある。** 上流はモックなので、セッションを作ってから抽出の INSERT までに
+/// 待ちが無く、同じミリ秒に入りうる（境は `<=` なので、同着だと記憶が境の内側に入る）。
+/// **記憶の行（本番の書き手が書いたもの）には触らず**、境になるセッションの `created_at` だけを
+/// 過去へ書き換え、記憶が境より新しいことを前提として確かめてから主張する。
+#[tokio::test]
+async fn an_extracted_memory_waits_for_the_boundary_in_the_persona_prompt_but_not_in_the_extraction_request()
+ {
+    const SECOND_MESSAGE: &str = "今日は雨だったね";
+    const SESSION_CREATED_AT: &str = "2000-01-01T00:00:00.000Z";
+
+    let main = MainLlm::new();
+    let sub = SubLlm::replying(&[EXTRACTED, ""]);
+    let server = TestServer::start(Arc::clone(&main), Arc::clone(&sub)).await;
+
+    server.chat(&non_streaming_body(USER_MESSAGE)).await;
+    let memories = server.wait_for_memories(2).await;
+    let extracted = memories
+        .iter()
+        .find(|memory| memory.subject == Subject::User && memory.content.as_str() == USER_FACT)
+        .unwrap_or_else(|| panic!("前提: 1ターン目の抽出が利用者の記憶を書いたこと: {memories:?}"));
+
+    // 境（往復の数 1 ＝ 区切りが無い → セッションの作成時刻）を過去へ動かす（テストだけの細工）。
+    let character = server.character().await;
+    let session = server
+        .store
+        .latest_session(character.id)
+        .await
+        .expect("会話を引けること")
+        .expect("1ターン目の会話があること");
+    let done = sqlx::query("UPDATE session SET created_at = ? WHERE id = ?")
+        .bind(SESSION_CREATED_AT)
+        .bind(session.id.get())
+        .execute(server.store.pool())
+        .await
+        .expect("時刻を書き換えられること");
+    assert_eq!(done.rows_affected(), 1, "1行だけ書き換えること");
+    let boundary = server
+        .store
+        .recall_boundary(session.id)
+        .await
+        .expect("境の時刻を求められること");
+    assert_eq!(
+        boundary.as_stored(),
+        SESSION_CREATED_AT,
+        "前提: 境はセッションの作成時刻"
+    );
+    let extracted_at: String = sqlx::query_scalar("SELECT created_at FROM memory WHERE id = ?")
+        .bind(extracted.id.get())
+        .fetch_one(server.store.pool())
+        .await
+        .expect("記憶の時刻を読めること");
+    assert!(
+        extracted_at.as_str() > boundary.as_stored(),
+        "前提の違反: 抽出の記憶（{extracted_at}）が境（{}）より新しくない",
+        boundary.as_stored()
+    );
+
+    server.chat(&non_streaming_body(SECOND_MESSAGE)).await;
+    let persona = main.last_prompt();
+    assert!(
+        persona.contains(SECOND_MESSAGE),
+        "前提: 2ターン目の本文の依頼を見ていること: {persona}"
+    );
+    assert!(
+        !persona.contains(USER_FACT),
+        "抽出で増えた記憶は、次の区切りまで本文の依頼に載らないこと: {persona}"
+    );
+
+    wait_for_calls(&sub, 2).await;
+    let extraction = sub.last_prompt();
+    assert!(
+        extraction.contains(SECOND_MESSAGE),
+        "前提: 2ターン目の抽出の依頼を見ていること: {extraction}"
+    );
+    assert!(
+        extraction.contains(USER_FACT),
+        "抽出の依頼の既知の記憶には、境より新しい記憶も載ること: {extraction}"
+    );
 
     server.stop().await;
 }

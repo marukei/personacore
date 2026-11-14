@@ -27,7 +27,7 @@ use personacore::domain::{
     MemoryContent, MemoryEntry, MemoryId, NewMemory, Persona, Subject, SupersededMemory,
     UnreadableMemory,
 };
-use personacore::store::{Memory, Store, StoreError};
+use personacore::store::{Memory, RecallScope, Store, StoreError};
 use sqlx::error::ErrorKind;
 use tempfile::TempDir;
 
@@ -141,7 +141,7 @@ async fn add_then_recall_round_trips_every_column() {
         .expect("記憶を追加できること");
 
     let memories = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect("想起が成功すること");
     assert_eq!(memories.len(), 1);
@@ -181,7 +181,7 @@ async fn category_is_optional() {
     assert_eq!(stored, None, "分類なしは NULL で格納されること");
 
     let memories = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect("想起が成功すること");
     assert_eq!(memories.len(), 1);
@@ -213,7 +213,7 @@ async fn subject_is_stored_with_the_spelling_the_schema_expects() {
     assert_eq!(stored, vec!["user".to_owned(), "character".to_owned()]);
 
     let subjects: Vec<Subject> = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect("想起が成功すること")
         .into_iter()
@@ -245,7 +245,7 @@ async fn subject_distinguishes_memories_with_identical_content() {
         .expect("記憶を追加できること");
 
     let pairs: Vec<(Subject, String)> = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect("想起が成功すること")
         .into_iter()
@@ -294,7 +294,7 @@ async fn superseded_memories_are_excluded_but_not_deleted() {
         .expect("superseded_by を設定できること");
 
     let memories = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect("想起が成功すること");
     assert_eq!(
@@ -360,7 +360,7 @@ async fn locked_memories_are_recalled_with_the_flag() {
         .expect("locked を設定できること");
 
     let memories = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect("想起が成功すること");
     assert_eq!(
@@ -397,7 +397,7 @@ async fn memories_are_scoped_to_one_character() {
     assert_eq!(
         contents(
             &store
-                .recall_memories(aoi)
+                .recall_memories(aoi, RecallScope::Everything)
                 .await
                 .expect("想起が成功すること")
         ),
@@ -407,7 +407,7 @@ async fn memories_are_scoped_to_one_character() {
     assert_eq!(
         contents(
             &store
-                .recall_memories(rin)
+                .recall_memories(rin, RecallScope::Everything)
                 .await
                 .expect("想起が成功すること")
         ),
@@ -433,7 +433,7 @@ async fn recall_returns_memories_in_creation_order() {
     }
 
     let memories = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect("想起が成功すること");
     assert_eq!(
@@ -452,7 +452,7 @@ async fn recall_of_a_character_without_memories_is_empty() {
 
     assert!(
         store
-            .recall_memories(aoi)
+            .recall_memories(aoi, RecallScope::Everything)
             .await
             .expect("想起が成功すること")
             .is_empty(),
@@ -460,7 +460,7 @@ async fn recall_of_a_character_without_memories_is_empty() {
     );
     assert!(
         store
-            .recall_memories(unknown)
+            .recall_memories(unknown, RecallScope::Everything)
             .await
             .expect("想起が成功すること")
             .is_empty(),
@@ -497,7 +497,7 @@ async fn unknown_stored_subject_is_reported_as_invalid_stored_value() {
     force_update(&store, "UPDATE memory SET subject = ?", "assistant").await;
 
     let err = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect_err("想定外の subject は握り潰さないこと");
     assert!(
@@ -523,7 +523,7 @@ async fn unknown_stored_locked_is_reported_as_invalid_stored_value() {
     force_update(&store, "UPDATE memory SET locked = ?", "7").await;
 
     let err = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect_err("想定外の locked は握り潰さないこと");
     assert!(
@@ -548,7 +548,7 @@ async fn blank_stored_content_is_reported_as_invalid_stored_value() {
         .expect("直接の INSERT が成功すること");
 
     let err = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect_err("空白のみの本文は握り潰さないこと");
     assert!(
@@ -613,7 +613,7 @@ async fn overlong_stored_content_is_reported_as_invalid_stored_value() {
         .expect("直接の INSERT が成功すること");
 
     let err = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect_err("上限を超えた本文は握り潰さないこと");
     assert!(
@@ -639,7 +639,7 @@ async fn content_at_the_limit_round_trips() {
         .expect("上限ちょうどの本文は追加できること");
 
     let memories = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect("想起が成功すること");
     assert_eq!(contents(&memories), vec![at_limit.as_str()]);
@@ -665,7 +665,7 @@ async fn overlong_stored_category_is_reported_as_invalid_stored_value() {
     .expect("直接の INSERT が成功すること");
 
     let err = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect_err("上限を超えた分類は握り潰さないこと");
     assert!(
@@ -691,7 +691,7 @@ async fn category_at_the_limit_round_trips() {
         .expect("上限ちょうどの分類は追加できること");
 
     let memories = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect("想起が成功すること");
     assert_eq!(
@@ -717,7 +717,7 @@ async fn padded_stored_values_are_normalized_on_read() {
     .expect("直接の INSERT が成功すること");
 
     let memories = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect("想起が成功すること");
     assert_eq!(memories.len(), 1);
@@ -801,7 +801,7 @@ async fn a_correction_hides_the_old_memory_from_recall_without_deleting_it() {
     assert_ne!(new, old, "訂正版は新しい行であること");
 
     let memories = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect("想起が成功すること");
     assert_eq!(
@@ -880,7 +880,7 @@ async fn a_correction_does_not_touch_another_characters_memories() {
     assert_eq!(
         contents(
             &store
-                .recall_memories(rin)
+                .recall_memories(rin, RecallScope::Everything)
                 .await
                 .expect("想起が成功すること")
         ),
@@ -978,7 +978,7 @@ async fn superseding_a_memory_of_another_character_is_rejected() {
     assert_eq!(
         contents(
             &store
-                .recall_memories(rin)
+                .recall_memories(rin, RecallScope::Everything)
                 .await
                 .expect("想起が成功すること")
         ),
@@ -1047,7 +1047,7 @@ async fn an_already_superseded_memory_cannot_be_superseded_again() {
     assert_eq!(
         contents(
             &store
-                .recall_memories(aoi)
+                .recall_memories(aoi, RecallScope::Everything)
                 .await
                 .expect("想起が成功すること")
         ),
@@ -1069,7 +1069,7 @@ async fn a_broken_memory_can_still_be_superseded() {
     let broken = insert_memory_ignoring_checks(&store, aoi, "user", "\u{3000} \t", None, 0).await;
     assert!(
         matches!(
-            store.recall_memories(aoi).await,
+            store.recall_memories(aoi, RecallScope::Everything).await,
             Err(StoreError::InvalidStoredValue)
         ),
         "前提: 壊れた行があると想起は止まること"
@@ -1095,7 +1095,7 @@ async fn a_broken_memory_can_still_be_superseded() {
         .expect("壊れた行も訂正できること");
 
     let memories = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect("訂正すると想起が回復すること");
     assert_eq!(contents(&memories), vec!["猫を「コーヒー」と名付けている"]);
@@ -1191,7 +1191,7 @@ async fn two_corrections_of_the_same_memory_never_race_into_a_locked_database() 
 
         // どちらが勝っても、鎖は線形で有効な記憶は1件。
         let memories = store
-            .recall_memories(aoi)
+            .recall_memories(aoi, RecallScope::Everything)
             .await
             .unwrap_or_else(|err| panic!("どう転んでも想起できること（{round} 周目）: {err:?}"));
         assert_eq!(
@@ -1379,7 +1379,7 @@ async fn the_repair_listing_stays_readable_where_recall_stops() {
     insert_memory_ignoring_checks(&store, aoi, "user", "ロックが壊れた記憶", None, 7).await;
 
     let err = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect_err("想起は壊れた行を黙って読み飛ばさないこと");
     assert!(
@@ -1697,7 +1697,7 @@ async fn memories_created_in_the_same_millisecond_are_ordered_by_id() {
     );
 
     let recalled = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect("想起が成功すること");
     assert_eq!(
@@ -2367,7 +2367,7 @@ async fn the_superseded_listing_shows_what_the_production_writer_left_behind() {
 
     // **想起からは消えている**（この作業単位で想起を1バイトも変えていないこと）。
     let recalled = store
-        .recall_memories(aoi)
+        .recall_memories(aoi, RecallScope::Everything)
         .await
         .expect("想起が成功すること");
     assert_eq!(contents(&recalled), vec!["喫茶店でアルバイトをしている"]);

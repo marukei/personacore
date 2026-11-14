@@ -27,7 +27,8 @@ use std::time::Duration;
 
 use personacore::domain::{
     AttributeKey, AttributeSet, AttributeValue, CharacterAttribute, DisplayName, Handle,
-    MemoryContent, Message, NewMemory, OutputFormat, Persona, Role, StatAlloc, StatAxis, Subject,
+    MemoryContent, MemoryId, Message, NewMemory, OutputFormat, Persona, Role, StatAlloc, StatAxis,
+    Subject,
 };
 use personacore::llm::{
     ChatRequest, ChatRole, ChatStream, Completion, DEFAULT_ENDPOINT, DEFAULT_MAIN_MODEL,
@@ -3548,6 +3549,298 @@ async fn the_history_window_trimmed_by_the_budget_stays_on_a_boundary() {
     // 往復の数は「最新 − 始まり ＋ 1」で、予算に入る 22 を超えず、切り上げた後も 10 以上。
     let counts: Vec<usize> = windows.iter().map(|(_, count)| *count).collect();
     assert_eq!(counts, vec![20, 21, 22, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------- 記憶の区切り（ADR-0064 / A-15b）
+
+/// 利用者についての記憶（分類なし）。
+fn user_memory(content: &str) -> NewMemory {
+    NewMemory {
+        subject: Subject::User,
+        content: MemoryContent::parse(content).expect("正当な本文であること"),
+        category: None,
+    }
+}
+
+/// 本文の要求の先頭の system の本文。
+fn system_of(request: &ChatRequest) -> String {
+    let first = request
+        .messages
+        .first()
+        .expect("本文の要求にメッセージがあること");
+    assert_eq!(first.role, ChatRole::System, "先頭は system であること");
+    first.content.clone()
+}
+
+/// 直に置いた会話の時刻（過去の固定値。本番の DEFAULT と同じ綴り）。
+const SEEDED_AT: &str = "2000-01-01T00:00:01.000Z";
+
+/// 区切りより前の記憶の時刻（[`SEEDED_AT`] より前）。
+const OLD_MEMORY_AT: &str = "2000-01-01T00:00:00.000Z";
+
+/// **直に置いた会話（セッションとそのメッセージ全部）の `created_at` を [`SEEDED_AT`] へ書き換える**
+/// （テストだけの細工）。
+///
+/// `memory.created_at` と比べる境の時刻はミリ秒の綴りなので、置いた往復と後から足す記憶が同じミリ秒に
+/// 入ると、境（`<=`）の内側に入って結果が揺れる。置いた会話を過去へ動かして、後から足す記憶
+/// （いまの時刻）が境より確実に新しくなるようにする。並びの権威は `id` なので、窓は変わらない。
+async fn backdate_seeded_session(server: &TestServer, session: i64) {
+    for statement in [
+        "UPDATE session SET created_at = ? WHERE id = ?",
+        "UPDATE message SET created_at = ? WHERE session_id = ?",
+    ] {
+        sqlx::query(statement)
+            .bind(SEEDED_AT)
+            .bind(session)
+            .execute(server.store.pool())
+            .await
+            .expect("時刻を書き換えられること");
+    }
+}
+
+/// 記憶の `created_at` を直に書き換える（テストだけの細工）。
+async fn backdate_memory(server: &TestServer, memory: MemoryId, stamp: &str) {
+    let done = sqlx::query("UPDATE memory SET created_at = ? WHERE id = ?")
+        .bind(stamp)
+        .bind(memory.get())
+        .execute(server.store.pool())
+        .await
+        .expect("時刻を書き換えられること");
+    assert_eq!(done.rows_affected(), 1, "1行だけ書き換えること");
+}
+
+/// 記憶の `created_at`（格納された綴りのまま）。
+async fn stored_memory_time(server: &TestServer, memory: MemoryId) -> String {
+    sqlx::query_scalar("SELECT created_at FROM memory WHERE id = ?")
+        .bind(memory.get())
+        .fetch_one(server.store.pool())
+        .await
+        .expect("記憶の時刻を読めること")
+}
+
+/// **いまの境の時刻**（本文処理と同じ `Store::recall_boundary`）。
+async fn current_recall_boundary(server: &TestServer, raw_session: i64) -> String {
+    let character = server
+        .store
+        .find_character_by_handle(&name("aoi"))
+        .await
+        .expect("キャラクターを引けること")
+        .expect("キャラクターが存在すること");
+    let session = server
+        .store
+        .find_session(character.id, raw_session)
+        .await
+        .expect("セッションを引けること")
+        .expect("セッションが存在すること");
+    server
+        .store
+        .recall_boundary(session.id)
+        .await
+        .expect("境の時刻を求められること")
+        .as_stored()
+        .to_owned()
+}
+
+/// 番号 `turn` の発言を1ターン送り、**上流へ届いた本文の要求**を返す。
+async fn send_numbered_turn(server: &TestServer, session: i64, turn: u32) -> ChatRequest {
+    let (status, body) = server
+        .chat(&request_of(&format!("aoi@{session}"), &numbered_user(turn)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "ターン {turn}: {body}");
+    let request = server.llm.last_request();
+    assert_eq!(
+        request
+            .messages
+            .last()
+            .map(|message| message.content.as_str()),
+        Some(numbered_user(turn).as_str()),
+        "前提: 最後は今回の発言（ターン {turn}）"
+    );
+    request
+}
+
+/// **区切りの間に増えた記憶は、次の区切りのターンまで本文に載らず、区切りのターンで載る。
+/// 訂正は次のターンで入れ替わる**（ADR-0064 §決定1・§決定2・§決定4 —— 本文の経路を通す見張り番）。
+///
+/// 12 往復を置いたセッションへ、13〜17 の発言を送る。送る時点の往復の数は 12〜16 で、
+/// **区切りは 12〜14 では往復 5、15 と 16 では往復 15**。
+///
+/// * 区切りより前の記憶（`OLD_FACT`）は、セッションより先に足す —— 最初から載る。
+/// * 増えた記憶（`NEW_FACT`）は、往復 12 を置いた後に足す（抽出が書くのと同じく、
+///   往復 5 の最後のメッセージより新しい）—— **ターン 13〜15 では載らず、system はその間1文字も変わらない。
+///   ターン 16（往復の数 15）で載る。**
+/// * ターン 16 の後で `OLD_FACT` を訂正する —— **ターン 17 で入れ替わる**（区切りを待たない）。
+///
+/// 境の時刻を渡さない（全件を読む）変異では、ターン 13 から `NEW_FACT` が載って赤になる。
+/// 訂正の素通しを外す変異では、ターン 17 に訂正版が載らず赤になる。
+///
+/// **時刻の同着で揺れない形にしてある**: 置いた会話と `OLD_FACT` は過去の固定値へ書き換え
+/// （`backdate_seeded_session`）、`NEW_FACT` が境より新しいことを前提として確かめてから主張する。
+#[tokio::test]
+async fn a_memory_added_between_boundaries_reaches_the_persona_prompt_only_at_the_next_boundary() {
+    const OLD_FACT: &str = "利用者は朝に川沿いを散歩する";
+    const NEW_FACT: &str = "利用者は古い港町で育った";
+    const CORRECTED_FACT: &str = "利用者は夕方に公園を散歩する";
+
+    let replies: Vec<String> = (13..=17).map(numbered_reply).collect();
+    let replies: Vec<&str> = replies.iter().map(String::as_str).collect();
+    let server = TestServer::start_with_env(
+        MockLlm::replying_each(&replies),
+        &[(ENV_CONTEXT_TOKENS, "32768")],
+    )
+    .await;
+    server.seed("aoi", "葵").await;
+    let character = server
+        .store
+        .find_character_by_handle(&name("aoi"))
+        .await
+        .expect("キャラクターを引けること")
+        .expect("キャラクターが存在すること");
+
+    let old = server
+        .store
+        .add_memory(character.id, &user_memory(OLD_FACT))
+        .await
+        .expect("記憶を足せること");
+    let session = seed_numbered_session(&server, 12).await;
+    // **時刻の同着で揺れないように**、置いた会話と区切りより前の記憶を過去へ動かす（`backdate_seeded_session`）。
+    backdate_memory(&server, old, OLD_MEMORY_AT).await;
+    backdate_seeded_session(&server, session).await;
+    let new = server
+        .store
+        .add_memory(character.id, &user_memory(NEW_FACT))
+        .await
+        .expect("記憶を足せること");
+    // 前提: 増えた記憶は境より新しく、区切りより前の記憶は境以前（崩れていたら主張の前に止まる）。
+    let boundary = current_recall_boundary(&server, session).await;
+    // 置いた会話は全部同じ SEEDED_AT にしてあるので、ここで分かるのは「境が置いた会話の時刻」まで
+    // （どの往復の終わりを選んだかは tests/store_recall_boundary.rs が時刻を往復ごとに変えて見ている）。
+    assert_eq!(
+        boundary, SEEDED_AT,
+        "前提: 境は置いた会話の時刻（SEEDED_AT）"
+    );
+    let new_at = stored_memory_time(&server, new).await;
+    assert!(
+        new_at.as_str() > boundary.as_str(),
+        "前提の違反: 増えた記憶（{new_at}）が境（{boundary}）より新しくない"
+    );
+    assert!(
+        stored_memory_time(&server, old).await.as_str() <= boundary.as_str(),
+        "前提の違反: 区切りより前の記憶が境以前でない"
+    );
+
+    let mut systems = Vec::new();
+    for turn in 13..=16 {
+        systems.push(system_of(&send_numbered_turn(&server, session, turn).await));
+    }
+    for (offset, system) in systems[..3].iter().enumerate() {
+        let turn = 13 + offset;
+        assert!(
+            system.contains(OLD_FACT),
+            "ターン {turn}: 区切りより前の記憶は載ること:\n{system}"
+        );
+        assert!(
+            !system.contains(NEW_FACT),
+            "ターン {turn}: 区切りの間に増えた記憶は、次の区切りまで載らないこと:\n{system}"
+        );
+    }
+    assert_eq!(systems[0], systems[1], "ターン 13 と 14 の system は同じ");
+    assert_eq!(systems[1], systems[2], "ターン 14 と 15 の system は同じ");
+    assert!(
+        systems[3].contains(NEW_FACT) && systems[3].contains(OLD_FACT),
+        "ターン 16（往復の数 15 ＝ 区切り）で増えた記憶が載ること:\n{}",
+        systems[3]
+    );
+
+    // **訂正はすぐ反映する**（区切りを待たない / §決定2）。
+    server
+        .store
+        .supersede_memory(character.id, old, &user_memory(CORRECTED_FACT))
+        .await
+        .expect("訂正できること");
+    let system = system_of(&send_numbered_turn(&server, session, 17).await);
+    assert!(
+        system.contains(CORRECTED_FACT),
+        "ターン 17: 訂正版が次のターンで載ること:\n{system}"
+    );
+    assert!(
+        !system.contains(OLD_FACT),
+        "ターン 17: 訂正された記憶は外れること:\n{system}"
+    );
+    assert!(
+        system.contains(NEW_FACT),
+        "ターン 17: 区切りで載った記憶は載ったまま:\n{system}"
+    );
+
+    server.stop().await;
+}
+
+/// **件数で決まる窓が動くターンは、記憶が載るターンと重なる**（ADR-0064 §決定1）。
+///
+/// 34 往復を置いたセッションに記憶を足し、35・36 の発言を送る。送る時点の往復の数は 34 と 35。
+/// **ターン 35 は窓が 1 から（34 往復）で記憶は載らず、ターン 36 は窓が 11 から（25 往復）へ動き、
+/// 同じターンで記憶が載る** —— 先頭の system と窓の両方が変わるのは1ターンだけ。
+#[tokio::test]
+async fn the_memory_boundary_coincides_with_the_turn_the_history_window_moves() {
+    const NEW_FACT: &str = "利用者は冬になると毎年スキーに行く";
+
+    let replies: Vec<String> = (35..=36).map(numbered_reply).collect();
+    let replies: Vec<&str> = replies.iter().map(String::as_str).collect();
+    let server = TestServer::start_with_env(
+        MockLlm::replying_each(&replies),
+        &[(ENV_CONTEXT_TOKENS, "32768")],
+    )
+    .await;
+    server.seed("aoi", "葵").await;
+    let character = server
+        .store
+        .find_character_by_handle(&name("aoi"))
+        .await
+        .expect("キャラクターを引けること")
+        .expect("キャラクターが存在すること");
+    let session = seed_numbered_session(&server, 34).await;
+    // **時刻の同着で揺れないように**、置いた会話を過去へ動かす（`backdate_seeded_session`）。
+    backdate_seeded_session(&server, session).await;
+    let new = server
+        .store
+        .add_memory(character.id, &user_memory(NEW_FACT))
+        .await
+        .expect("記憶を足せること");
+    let boundary = current_recall_boundary(&server, session).await;
+    assert_eq!(
+        boundary, SEEDED_AT,
+        "前提: 境は置いた会話の時刻（SEEDED_AT）"
+    );
+    let new_at = stored_memory_time(&server, new).await;
+    assert!(
+        new_at.as_str() > boundary.as_str(),
+        "前提の違反: 足した記憶（{new_at}）が境（{boundary}）より新しくない"
+    );
+
+    let before = send_numbered_turn(&server, session, 35).await;
+    let after = send_numbered_turn(&server, session, 36).await;
+    assert_eq!(
+        history_window_of(&before),
+        Some((1, 34)),
+        "前提: ターン 35 の窓は 1 から 34 往復"
+    );
+    assert_eq!(
+        history_window_of(&after),
+        Some((11, 25)),
+        "前提: ターン 36 で窓が 11 からへ動く"
+    );
+    assert!(
+        !system_of(&before).contains(NEW_FACT),
+        "ターン 35（往復の数 34）では載らないこと:\n{}",
+        system_of(&before)
+    );
+    assert!(
+        system_of(&after).contains(NEW_FACT),
+        "ターン 36（往復の数 35）で、窓が動くのと同じターンに載ること:\n{}",
+        system_of(&after)
+    );
 
     server.stop().await;
 }

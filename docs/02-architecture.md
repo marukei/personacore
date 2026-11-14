@@ -44,7 +44,9 @@
 
 **記憶はベクトル検索していない。** 本文に載るのは、**利用者についての記憶のうち、想起が選んだ分**
 （[ADR-0023](adr/0023-three-layer-recall.md) の3層想起 / [ADR-0050](adr/0050-consolidating-memories-into-experience.md) §決め直し 1）。
-`store`（`Store::recall_memories`）は有効な記憶を**主語を問わず全件**返し、
+`store`（`Store::recall_memories`）は有効な記憶を**主語を問わず**返す。本文の経路では、抽出で増えた記憶を
+10 往復ごとの区切りまで待たせるため、境の時刻以前に作られた記憶（と訂正で入った記憶）に絞って返す
+（`RecallScope::AsOf` / [ADR-0064](adr/0064-extracted-memories-reach-the-prompt-in-steps-of-ten-turns.md)）。裏方の要求には全件を返す。
 **主語で絞るのも、想起で選ぶのも `prompt` の側**（`build_prompt`）。キャラクター自身についての記憶は、
 本文には載らないが、抽出と軸の候補の依頼には載る。
 （かつての全件注入 [ADR-0003](adr/0003-full-memory-injection.md) は ADR-0023 で置換済み。）
@@ -58,7 +60,7 @@ sequenceDiagram
 
     FE->>PC: POST /v1/chat/completions（model でセッションを同定）
     PC->>DB: キャラクター・属性・性格ステータスを読む
-    PC->>DB: 記憶を読む（superseded_by IS NULL の全件。主語を問わない）
+    PC->>DB: 記憶を読む（superseded_by IS NULL のうち、区切りの境の時刻以前のものと訂正で入ったもの。主語を問わない / ADR-0064）
     PC->>DB: 直近の履歴を読む
     PC->>PC: 利用者についての記憶だけを候補に想起 → プロンプト組立 ＋ トークン予算の配分
     PC->>LM: 本文生成（SSE）

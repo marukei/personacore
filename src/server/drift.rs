@@ -2778,7 +2778,12 @@ mod tests {
         });
         assert!(
             runtime
-                .block_on(fixture.store.recall_memories(fixture.character.id))
+                .block_on(
+                    fixture.store.recall_memories(
+                        fixture.character.id,
+                        crate::store::RecallScope::Everything
+                    ),
+                )
                 .is_err(),
             "前提: 記憶が読めない状態であること"
         );

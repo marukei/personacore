@@ -36,7 +36,10 @@ pub use agreement::{AgreementProposalsRecorded, AgreementTransition};
 pub use attribute::AttributeRevision;
 pub use axis_candidate::{AxisCandidate, AxisCandidateTransition};
 pub use drift::{DriftVoteRecord, DriftVoteTally, DriftWrite, StoredDriftCharge, StoredDriftVote};
-pub use session::{AppendedTurn, MessagePage, OpeningText, RecentHistory, Session, SessionSummary};
+pub use memory::RecallScope;
+pub use session::{
+    AppendedTurn, MessagePage, OpeningText, RecallBoundary, RecentHistory, Session, SessionSummary,
+};
 
 // 行の型は `domain` に置いてある（純粋モジュールが sqlx を引き込まないため。
 // 理由は `crate::domain` の doc）。**呼び出し側の名前を変えないよう再公開する。**

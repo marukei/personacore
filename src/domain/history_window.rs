@@ -18,6 +18,10 @@
 //! | 読む窓（`Store::recent_history`） | [`first_turn_to_read`] |
 //! | 予算で削るときの切り上げ（`prompt::budget`） | [`a_boundary_lies_between`] と [`HISTORY_SNAP_MIN_FITTING_TURNS`] |
 //!
+//! **記憶の区切り**（ADR-0064 / 作業単位 A-15b）もここに置く。抽出で増えた記憶を本文に載せるターンを、
+//! 窓が動くターンに揃えるため、位相を窓の規則から導く（[`MEMORY_BOUNDARY_PHASE`]）。
+//! 使うのは本文の想起の境の時刻（`Store::recall_boundary`）で、[`memory_boundary_turn`] を呼ぶ。
+//!
 //! **I/O を持たない純粋関数**（CLAUDE.md 3節）。
 
 /// **区切りの間隔**（往復の数）。利用者が選んだ（候補は 5・10・20 / ADR-0063 §決定1）。
@@ -105,6 +109,35 @@ const fn boundaries_through(turn: u32) -> u32 {
     }
 }
 
+/// **記憶の区切りの位相**（ADR-0064 §決定1 / 作業単位 A-15b）。
+///
+/// 抽出で増えた記憶を本文に載せるのは、往復の数 N が `MEMORY_BOUNDARY_PHASE`
+/// （mod [`HISTORY_TURN_STEP`]）になったターン（5, 15, 25, …）だけ。
+///
+/// **位相は窓の規則から導く。** 件数で決まる窓が動くのは
+/// `first_turn_to_read(N)` が変わるターン ＝ N ≡ [`HISTORY_MIN_TURNS`]（mod 間隔）のターン
+/// （N = 35, 45, …）なので、同じ位相にすると、窓が動くターンと記憶が載るターンが重なる
+/// （どちらも、そのターンに全部を読み直す —— 読み直しの回数が増えない）。
+/// 重なることの見張り番は `every_turn_that_moves_the_history_window_is_a_memory_boundary`。
+pub const MEMORY_BOUNDARY_PHASE: u32 = HISTORY_MIN_TURNS % HISTORY_TURN_STEP;
+
+/// **往復が `turns` 個あるセッションで、記憶の境になる往復の通し番号**（ADR-0064 §決定1）。
+///
+/// `turns` 以下で最大の r（r ≥ 1、r ≡ [`MEMORY_BOUNDARY_PHASE`]（mod [`HISTORY_TURN_STEP`])）。
+/// 無ければ（`turns` < 5）`None` —— そのときの境はセッションの作成時刻（`Store::recall_boundary`）。
+///
+/// `turns` は今回の発言を含めない往復の数（`Store::recent_history` と同じ数え方 / ADR-0063 §決定2）。
+#[must_use]
+pub const fn memory_boundary_turn(turns: u32) -> Option<u32> {
+    // `turns` から r まで戻る数（0〜間隔−1）。位相は間隔より小さいので、引き算は溢れない。
+    let behind =
+        (turns % HISTORY_TURN_STEP + HISTORY_TURN_STEP - MEMORY_BOUNDARY_PHASE) % HISTORY_TURN_STEP;
+    match turns.checked_sub(behind) {
+        Some(0) | None => None,
+        Some(turn) => Some(turn),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +202,77 @@ mod tests {
         }
         // 35, 45, …, 115 で変わる。
         assert_eq!(changes, 9, "120 往復までに変わるのは 9 回");
+    }
+
+    /// **記憶の区切りの往復は、往復の数 N 以下で最大の 5, 15, 25, …**（ADR-0064 §決定1）。
+    ///
+    /// 期待値は関数の外の式で作らず、リテラルの表で持つ。N < 5 は区切りが無い（`None`）。
+    #[test]
+    fn the_memory_boundary_turn_is_the_latest_five_mod_ten_at_or_below_the_turns() {
+        let table: [(u32, Option<u32>); 18] = [
+            (0, None),
+            (1, None),
+            (4, None),
+            (5, Some(5)),
+            (6, Some(5)),
+            (14, Some(5)),
+            (15, Some(15)),
+            (16, Some(15)),
+            (24, Some(15)),
+            (25, Some(25)),
+            (34, Some(25)),
+            (35, Some(35)),
+            (44, Some(35)),
+            (45, Some(45)),
+            (104, Some(95)),
+            (105, Some(105)),
+            // 上端でも溢れない（4294967295 は 5 mod 10）。
+            (u32::MAX - 1, Some(4_294_967_285)),
+            (u32::MAX, Some(u32::MAX)),
+        ];
+        for (turns, expected) in table {
+            assert_eq!(
+                memory_boundary_turn(turns),
+                expected,
+                "往復 {turns} 個のときの記憶の区切り"
+            );
+        }
+    }
+
+    /// **件数で決まる窓が動くターンは、必ず記憶の区切りのターンでもある**（ADR-0064 §決定1）。
+    ///
+    /// 窓が動くターン（`first_turn_to_read` が変わる N = 35, 45, …）で、記憶の区切りが N そのもの
+    /// であること。位相 5 は `HISTORY_MIN_TURNS mod HISTORY_TURN_STEP` から導いている
+    /// （[`MEMORY_BOUNDARY_PHASE`]）。窓の下限か間隔を変えたとき、こちらだけ古い位相のまま
+    /// 残ると、ここが赤になる。
+    #[test]
+    fn every_turn_that_moves_the_history_window_is_a_memory_boundary() {
+        assert_eq!(
+            MEMORY_BOUNDARY_PHASE,
+            HISTORY_MIN_TURNS % HISTORY_TURN_STEP,
+            "位相は窓の下限と間隔から導く"
+        );
+        let mut moves = 0;
+        for turns in 1..=200 {
+            if first_turn_to_read(turns) != first_turn_to_read(turns - 1) {
+                moves += 1;
+                assert_eq!(
+                    memory_boundary_turn(turns),
+                    Some(turns),
+                    "窓が動く往復 {turns} 個のターンは記憶の区切り"
+                );
+            }
+        }
+        // 35, 45, …, 195 の 17 回（窓が1回も動かないと、上の主張は何も見ない）。
+        assert_eq!(moves, 17, "200 往復までに窓が動くのは 17 回");
+        // 区切りは窓が動くターンより多い（5・15・25 は窓が動かない区切り）。
+        let boundaries = (1..=200)
+            .filter(|&turns| memory_boundary_turn(turns) == Some(turns))
+            .count();
+        assert_eq!(
+            boundaries, 20,
+            "200 往復までの記憶の区切りは 5, 15, …, 195 の 20 回"
+        );
     }
 
     /// **区切りをまたぐかどうか**（隣り合う番号・飛んだ番号・またがない飛び・進まない並び）。
