@@ -32,6 +32,16 @@
 //! [`align_to_a_turn`] が採用開始を**偶数へ切り上げる**（＝1件多く、古い側から落とす）。
 //! **切り下げない。** 切り下げると採用が1件増えて取り分を超える。
 //!
+//! # 履歴の始まりは**区切りの往復**へ切り上げる（ADR-0063 §決定3）
+//!
+//! 往復の頭に揃えた後、通し番号があり、予算に入る往復が
+//! [`HISTORY_SNAP_MIN_FITTING_TURNS`](crate::domain::HISTORY_SNAP_MIN_FITTING_TURNS) 以上なら、
+//! [`snap_to_a_boundary`] が始まりを新しい側で最初の区切りの往復（通し番号 1, 11, 21, …）へ
+//! 切り上げる。予算に入る最も古い始まりは履歴が伸びるたびに進むが、載る始まりは区切りをまたぐまで
+//! 動かない（会話キャッシュの接頭辞が保たれる）。予算の揺れで区切りをまたぐと、区切りの間でも動く
+//! （ADR-0063「守れないもの」）。
+//! **これも切り上げなので予算は超えない。**
+//!
 //! # ベクトル検索への移行信号は、ここにはもう無い（15b で撤去）
 //!
 //! ADR-0003 の判断基準は **`memory_tokens` がプロンプト取り分の半分を超えたか**で、
@@ -44,6 +54,8 @@
 //!
 //! この層は**文字列を一切見ない。** コストは `u32` の配列として受け取る。
 //! トークン見積もり（`super::estimate`）を差し替えても、ここのテストは壊れない。
+
+use crate::domain::{HISTORY_SNAP_MIN_FITTING_TURNS, a_boundary_lies_between};
 
 /// コンテキスト全体の割り当て。
 ///
@@ -134,6 +146,8 @@ pub struct BudgetPlan {
     history_count: usize,
     /// 往復の境目へ揃えるために**追加で落とした履歴の件数**（0 か 1）。
     history_aligned_away: usize,
+    /// **区切りの往復へ切り上げるために追加で落とした履歴の件数**（ADR-0063 §決定3。偶数）。
+    history_snapped_away: usize,
     fixed_tokens: u32,
     /// 有効な取り決めの件数（作業単位 A-12a。載せた分と落とした分の和）。
     agreement_count: usize,
@@ -191,6 +205,15 @@ impl BudgetPlan {
     /// ここが 0 のまま終わった掃引は、見張り番として何も見ていない。
     pub const fn history_aligned_away(&self) -> usize {
         self.history_aligned_away
+    }
+
+    /// **区切りの往復へ切り上げるために追加で落とした履歴の件数**（ADR-0063 §決定3）。
+    ///
+    /// 往復の単位で落とすので偶数。[`Self::dropped_history`] はこの分を含む。
+    /// **掃引の見張り番の対照**（[`Self::history_aligned_away`] と同じ立場）—— ここが 0 のまま
+    /// 終わった掃引は、切り上げを一度も見ていない。
+    pub const fn history_snapped_away(&self) -> usize {
+        self.history_snapped_away
     }
 
     /// 削らない枠（システムプロンプト＋今回の発言）の見積もり。
@@ -431,12 +454,24 @@ fn remaining_after_fixed(budget: TokenBudget, fixed_tokens: u32) -> Result<u32, 
 /// プロンプトが予算を超えて上流へ出ることはなく、履歴の取り分も侵されない。
 ///
 /// `agreement_costs` は [`Frames::new`] と同じ形（新しい側から k 件の費用の表）。
+///
+/// # 区切りへの切り上げ（ADR-0063 §決定3 / 作業単位 A-17）
+///
+/// `history_turn_numbers` は**往復ごとの通し番号**（`history_costs` の2件ごとに1つ、古い順）。
+/// 予算に入る最も古い始まりが決まった後で、それを**新しい側で最初の区切りの往復**へ切り上げる
+/// （[`snap_to_a_boundary`]。丸めない条件もそちら）。**切り上げなので予算は超えない。**
+/// `None`（通し番号を持たない履歴 / §決定4）なら丸めない。
+///
+/// **丸めはここで1回だけ掛ける**（数えた計画・組み直し・バイト数の計画は、どれもここを通る）。
+/// [`Frames::new`] の先取りには掛けない —— 先取りが決めるのは記憶の枠で、切り上げは
+/// 履歴を減らす向きにしか動かないので、記憶の枠が足りなくなることはない。
 pub fn plan(
     budget: TokenBudget,
     fixed_tokens: u32,
     agreement_costs: &[u32],
     memory_costs: &[u32],
     history_costs: &[u32],
+    history_turn_numbers: Option<&[u32]>,
 ) -> Result<BudgetPlan, PromptError> {
     // **余白はここで引かれ、以降どの分岐でも戻ってこない。**
     let allowance = budget.prompt_allowance();
@@ -447,9 +482,16 @@ pub fn plan(
 
     // 履歴は「残り − 記憶が使った分」まで伸びる（記憶が使わなかった分を受け取る）。
     // **履歴を削る単位は往復**（ADR-0025 §2）。件数で削ると役割の並びが崩れる。
-    let (history_start, history_tokens, history_aligned_away) = take_newest_turns(
+    let (earliest_start, earliest_tokens, history_aligned_away) = take_newest_turns(
         history_costs,
         frames.remaining.saturating_sub(memory_tokens),
+    );
+    // **区切りの往復へ切り上げる**（ADR-0063 §決定3）。往復の頭に揃えた後に掛ける。
+    let (history_start, history_tokens, history_snapped_away) = snap_to_a_boundary(
+        history_costs,
+        earliest_start,
+        earliest_tokens,
+        history_turn_numbers,
     );
 
     Ok(BudgetPlan {
@@ -458,6 +500,7 @@ pub fn plan(
         history_start,
         history_count: history_costs.len(),
         history_aligned_away,
+        history_snapped_away,
         fixed_tokens,
         agreement_count: agreement_costs.len().saturating_sub(1),
         agreements_kept: frames.agreements_kept,
@@ -527,6 +570,72 @@ fn align_to_a_turn(costs: &[u32], start: usize, tokens: u32) -> (usize, u32, usi
     }
 }
 
+/// 履歴の採用開始を、**新しい側で最初の区切りの往復へ切り上げる**（ADR-0063 §決定3）。
+///
+/// 戻り値は `(採用開始添字, 採用分の合計, 切り上げで追加で落とした件数)`。
+/// `start` は [`take_newest_turns`] が決めた**予算に入る最も古い始まり**（往復の頭）。
+///
+/// # 区切りの往復
+///
+/// 往復の添字 `i > 0` で、`turn_numbers[i - 1] < a ≤ turn_numbers[i]` となる区切り `a` があるもの
+/// （[`a_boundary_lies_between`]）。区切りの往復が空白で落ちていても、その後ろで最初に残った往復が
+/// 区切りの往復になる。
+///
+/// # 丸めない（`start` のまま返す）とき
+///
+/// | 形 | なぜ |
+/// |---|---|
+/// | 通し番号が無い（`None`） | 通し番号を持たない履歴（§決定4） |
+/// | 番号の数が往復の数と合わない | 往復と番号の対応が分からない（本番では出ない。黙って丸めない側に倒す） |
+/// | `start` が 0 | 全部入っている。読んだ先頭は区切りに揃っている（`Store::recent_history`） |
+/// | `start` が往復の頭でない | 揃える相手がいない形（[`align_to_a_turn`] の `None` 枝）。採用は 0 件 |
+/// | 入る往復が [`HISTORY_SNAP_MIN_FITTING_TURNS`]（19）未満 | 切り上げは最大 9 往復を落とすので、19 以上入るときだけ丸めれば必ず 10 往復以上残る（下限が 10 だと最新の1往復まで落ちる回が出る） |
+/// | 最新の往復の始まりまでに区切りが無い | 切り上げる先が無い |
+///
+/// **最新の往復より先へは進めない**ので、最新の1往復を残す規則（[`Frames::new`]）は崩れない。
+/// **落とした分の費用は引く**（[`align_to_a_turn`] と同じ理由）。
+fn snap_to_a_boundary(
+    costs: &[u32],
+    start: usize,
+    tokens: u32,
+    turn_numbers: Option<&[u32]>,
+) -> (usize, u32, usize) {
+    let unchanged = (start, tokens, 0);
+    let Some(numbers) = turn_numbers else {
+        return unchanged;
+    };
+    if start == 0 || !start.is_multiple_of(2) || numbers.len().checked_mul(2) != Some(costs.len()) {
+        return unchanged;
+    }
+    let earliest = start / 2;
+    let fitting = numbers.len().saturating_sub(earliest);
+    if u32::try_from(fitting).is_ok_and(|fitting| fitting < HISTORY_SNAP_MIN_FITTING_TURNS) {
+        return unchanged;
+    }
+
+    // `earliest` 以上で最初の区切りの往復（添字 0 の往復は直前が無いので区切りの往復にならない）。
+    let snapped = (earliest..numbers.len()).find(|turn| {
+        matches!(
+            (
+                turn.checked_sub(1).and_then(|previous| numbers.get(previous)),
+                numbers.get(*turn),
+            ),
+            (Some(previous), Some(current)) if a_boundary_lies_between(*previous, *current)
+        )
+    });
+    let Some(turn) = snapped else {
+        return unchanged;
+    };
+
+    let new_start = turn * 2;
+    let dropped = costs.get(start..new_start).map_or(0, |dropped| {
+        dropped
+            .iter()
+            .fold(0_u32, |sum, cost| sum.saturating_add(*cost))
+    });
+    (new_start, tokens.saturating_sub(dropped), new_start - start)
+}
+
 /// 末尾（新しい側）から、予算に収まる分だけ**連続して**採る。
 ///
 /// 戻り値は `(採用開始添字, 採用分の合計)`。
@@ -562,7 +671,7 @@ mod tests {
     }
 
     fn planned(fixed: u32, memories: &[u32], history: &[u32]) -> BudgetPlan {
-        plan(budget(), fixed, &[], memories, history).expect("収まること")
+        plan(budget(), fixed, &[], memories, history, None).expect("収まること")
     }
 
     /// **取り決めが先に取り、その残りだけを記憶と履歴が分ける**（作業単位 A-12a）。
@@ -578,6 +687,7 @@ mod tests {
             &[0, 120, 240, 360],
             &[50, 50, 50, 50],
             &[30, 30, 30, 30, 30, 30],
+            None,
         )
         .expect("収まること");
         assert_eq!(plan.included_agreements(), 3);
@@ -603,7 +713,7 @@ mod tests {
     #[test]
     fn agreements_that_do_not_fit_are_dropped_and_counted() {
         // 残り 500 に対し、2件で 400・3件で 600。**2件まで**載り、1件落ちる。
-        let plan = plan(budget(), 100, &[0, 200, 400, 600], &[], &[]).expect("収まること");
+        let plan = plan(budget(), 100, &[0, 200, 400, 600], &[], &[], None).expect("収まること");
         assert_eq!(plan.included_agreements(), 2);
         assert_eq!(plan.dropped_agreements(), 1);
         assert_eq!(plan.agreement_tokens(), 400);
@@ -629,7 +739,7 @@ mod tests {
     /// 取り決めは 440 の中から1件だけになり、履歴は1往復（2件）載る。
     #[test]
     fn the_newest_exchange_is_reserved_before_the_agreements() {
-        let plan = plan(budget(), 100, &[0, 230, 460], &[], &[30, 30]).expect("収まること");
+        let plan = plan(budget(), 100, &[0, 230, 460], &[], &[30, 30], None).expect("収まること");
         assert_eq!(
             plan.included_history(),
             2,
@@ -647,11 +757,11 @@ mod tests {
     }
 
     fn plan_with_history(agreement_costs: &[u32], history: &[u32]) -> BudgetPlan {
-        plan(budget(), 100, agreement_costs, &[], history).expect("収まること")
+        plan(budget(), 100, agreement_costs, &[], history, None).expect("収まること")
     }
 
     fn plan_of(agreement_costs: &[u32]) -> BudgetPlan {
-        plan(budget(), 100, agreement_costs, &[], &[]).expect("収まること")
+        plan(budget(), 100, agreement_costs, &[], &[], None).expect("収まること")
     }
 
     /// 既定値は `new` の検証を通る（`Default` が抜け穴にならない）。
@@ -845,16 +955,16 @@ mod tests {
     #[test]
     fn fixed_part_over_the_allowance_fails() {
         assert_eq!(
-            plan(budget(), 601, &[], &[], &[]),
+            plan(budget(), 601, &[], &[], &[], None),
             Err(PromptError::BudgetExhausted)
         );
         assert_eq!(
-            plan(budget(), 1_000, &[], &[10], &[10]),
+            plan(budget(), 1_000, &[], &[10], &[10], None),
             Err(PromptError::BudgetExhausted),
             "余白を食って押し込まないこと"
         );
         // 境界: ちょうど取り分と同じなら通る。
-        assert!(plan(budget(), 600, &[], &[10], &[10]).is_ok());
+        assert!(plan(budget(), 600, &[], &[10], &[10], None).is_ok());
     }
 
     /// 配分結果は**プロンプトの取り分を自分で持ち回る**。
@@ -1109,5 +1219,253 @@ mod tests {
         assert_eq!(plan.history_tokens(), 48, "記憶の余りが履歴へ回っていない");
         assert!(plan.history_tokens() > 61 / 2, "履歴が半分の内側に留まった");
         assert_eq!(plan.history_start(), 12);
+    }
+
+    // ------------------------------------------------------------------
+    // 区切りへの切り上げ（ADR-0063 §決定3・§決定4 / 作業単位 A-17）
+    //
+    // 記憶は置かないので、履歴は「残り（600 − 削れない枠）」まで伸びる。
+    // 履歴の費用は 1 件 10（1往復 20）なので、入る往復の数は「残り / 20」。
+    // ------------------------------------------------------------------
+
+    /// 通し番号 `numbers`（往復ごと）の履歴を、1件 10 の費用で配分する。
+    fn numbered(fixed: u32, numbers: &[u32]) -> BudgetPlan {
+        let costs = vec![10_u32; numbers.len() * 2];
+        plan(budget(), fixed, &[], &[], &costs, Some(numbers)).expect("収まること")
+    }
+
+    /// 同じ形の履歴を、通し番号なしで配分する（対照）。
+    fn unnumbered(fixed: u32, turns: usize) -> BudgetPlan {
+        let costs = vec![10_u32; turns * 2];
+        plan(budget(), fixed, &[], &[], &costs, None).expect("収まること")
+    }
+
+    /// 通し番号の並び（両端を含む）。
+    fn serials(from: u32, through: u32) -> Vec<u32> {
+        (from..=through).collect()
+    }
+
+    /// **予算に入る最も古い始まりを、新しい側で最初の区切りの往復へ切り上げる。**
+    ///
+    /// 通し番号 11〜45 の 35 往復。残り 420 に 21 往復入り、最も古い始まりは通し番号 25（添字 28）。
+    /// 区切りは 21・31・41（**選ばれる 31 は端ではない**）。切り上げなので 31（添字 40）—— 21 へ切り下げると
+    /// 予算を超え、41 まで飛ぶと最初の区切りを飛ばしたことになる。
+    #[test]
+    fn the_earliest_start_is_snapped_up_to_the_next_boundary_turn() {
+        let plan = numbered(180, &serials(11, 45));
+
+        assert_eq!(plan.history_start(), 40, "通し番号 31 の往復から始まること");
+        assert_eq!(plan.included_history(), 30);
+        assert_eq!(
+            plan.dropped_history(),
+            40,
+            "切り上げで落とした分も数えること"
+        );
+        assert_eq!(plan.history_tokens(), 300, "落とした分の費用を引くこと");
+        assert_eq!(plan.history_snapped_away(), 12);
+        assert_eq!(plan.history_aligned_away(), 0);
+        assert!(plan.prompt_tokens() <= plan.prompt_allowance(), "{plan:?}");
+
+        // 対照: 同じ費用で通し番号が無ければ、最も古い始まり（添字 28）のまま。
+        let plain = unnumbered(180, 35);
+        assert_eq!(plain.history_start(), 28, "前提: 最も古い始まりは添字 28");
+        assert_eq!(plain.history_tokens(), 420);
+        assert_eq!(plain.history_snapped_away(), 0);
+    }
+
+    /// **予算に入る往復が 19 未満なら丸めない**（ADR-0063 §決定3 / 利用者の決定）。19 ちょうどなら丸める。
+    ///
+    /// 通し番号 1〜35 の 35 往復。残り 380（19 往復）の最も古い始まりは 17、残り 360（18 往復）は 18。
+    /// どちらも区切り 21 が後ろにある —— 丸めれば 21 になる形で、18 往復の側だけ丸めないことを見る。
+    /// 19 往復の側は、切り上げても 15 往復残る（10 往復以上）。
+    #[test]
+    fn fewer_than_nineteen_fitting_turns_are_not_snapped() {
+        let nineteen = numbered(220, &serials(1, 35));
+        assert_eq!(
+            nineteen.history_start(),
+            40,
+            "19 往復入るなら 21 へ切り上げる"
+        );
+        assert_eq!(nineteen.history_tokens(), 300);
+        assert_eq!(nineteen.history_snapped_away(), 8);
+
+        let eighteen = numbered(240, &serials(1, 35));
+        assert_eq!(
+            eighteen.history_start(),
+            34,
+            "18 往復なら丸めない（通し番号 18 から）"
+        );
+        assert_eq!(eighteen.history_tokens(), 360);
+        assert_eq!(eighteen.history_snapped_away(), 0);
+    }
+
+    /// **10 往復しか入らない配分は丸めない**（レビューの例。下限が 10 だと最新の1往復まで落ちていた）。
+    ///
+    /// 通し番号 12〜41 の 30 往復。残り 200 に 10 往復（32〜41）入る。区切り 41 は最新の往復で、
+    /// 下限 10 のときは添字 58 まで切り上げて `included_history() == 2` になっていた。
+    #[test]
+    fn ten_fitting_turns_are_not_snapped_down_to_the_newest_turn() {
+        let plan = numbered(400, &serials(12, 41));
+        assert_eq!(plan.history_start(), 40, "通し番号 32 から（丸めない）");
+        assert_eq!(plan.included_history(), 20);
+        assert_eq!(plan.history_snapped_away(), 0);
+    }
+
+    /// **全部入るなら丸めない**（最も古い始まりが 0。読んだ先頭は区切りに揃っている）。
+    ///
+    /// 通し番号 1〜30 の 30 往復が残り 600 にちょうど入る。後ろに区切り 11・21 があるが、動かさない。
+    /// 先頭が区切りでない（読む件数の天井で切れた）並びでも同じ。
+    #[test]
+    fn a_history_that_fits_from_its_first_turn_is_not_snapped() {
+        let plan = numbered(0, &serials(1, 30));
+        assert_eq!(plan.history_start(), 0);
+        assert_eq!(plan.included_history(), 60);
+        assert_eq!(plan.history_snapped_away(), 0);
+
+        let cut = numbered(0, &serials(5, 34));
+        assert_eq!(cut.history_start(), 0, "先頭が区切りでなくても動かさない");
+        assert_eq!(cut.history_snapped_away(), 0);
+    }
+
+    /// **区切りの往復が空白で落ちていたら、その後ろで最初に残った往復を区切りとして扱う。**
+    ///
+    /// 通し番号 31 の往復が無い（30 の次が 32）。35 往復のうち 21 往復入り、最も古い始まりは 25。
+    /// 切り上げ先は 32（添字 40）。「番号が区切り（`% 10 == 1`）の往復」を探す形だと、41（添字 58）まで飛ぶ。
+    #[test]
+    fn a_boundary_turn_dropped_as_blank_passes_the_boundary_to_the_next_kept_turn() {
+        let mut numbers = serials(11, 30);
+        numbers.extend(serials(32, 46));
+        assert_eq!(numbers.len(), 35, "前提: 35 往復");
+
+        let plan = numbered(180, &numbers);
+        assert_eq!(plan.history_start(), 40, "通し番号 32 の往復から始まること");
+        assert_eq!(plan.history_tokens(), 300);
+        assert_eq!(plan.history_snapped_away(), 12);
+    }
+
+    /// **最も古い始まりがすでに区切りの往復なら動かさない**（「以上で最初」の等号の側）。
+    ///
+    /// 通し番号 1〜40。残り 400（20 往復）の最も古い始まりは 21（添字 40）。
+    #[test]
+    fn an_earliest_start_on_a_boundary_turn_stays_put() {
+        let plan = numbered(200, &serials(1, 40));
+        assert_eq!(plan.history_start(), 40);
+        assert_eq!(plan.history_snapped_away(), 0);
+    }
+
+    /// **最も古い始まりから最新の往復までに区切りが無ければ、最も古い始まりのまま。**
+    ///
+    /// 番号が進む並びでは、19 往復以上入れば区切りは必ずあるので、**本番では出ない形**
+    /// （番号の進まない並びで作る）。番号の数が往復の数と合わない並びも丸めない。
+    #[test]
+    fn without_a_boundary_before_the_newest_turn_the_earliest_start_is_kept() {
+        let flat = numbered(180, &[7; 35]);
+        assert_eq!(flat.history_start(), 28);
+        assert_eq!(flat.history_snapped_away(), 0);
+
+        // 番号が1つ足りない（34 個）。丸めれば添字 40 になる並び。
+        let costs = vec![10_u32; 70];
+        let numbers = serials(11, 44);
+        let mismatched = plan(budget(), 180, &[], &[], &costs, Some(&numbers)).expect("収まること");
+        assert_eq!(
+            mismatched.history_start(),
+            28,
+            "数が合わない番号では丸めない"
+        );
+        assert_eq!(mismatched.history_snapped_away(), 0);
+    }
+
+    /// **通し番号を持たない履歴は丸めない**（ADR-0063 §決定4）。
+    #[test]
+    fn a_history_without_turn_numbers_is_not_snapped() {
+        let costs = vec![10_u32; 70];
+        let plain = plan(budget(), 180, &[], &[], &costs, None).expect("収まること");
+        let numbered = numbered(180, &serials(11, 45));
+        assert_eq!(plain.history_start(), 28);
+        assert_ne!(
+            plain.history_start(),
+            numbered.history_start(),
+            "対照: 同じ費用で番号があれば丸める"
+        );
+    }
+
+    /// **予算を掃引しても、切り上げた配分は予算を超えず、始まりは往復の頭で、区切りの往復に乗る。**
+    ///
+    /// 費用は全部違う値（落とした分を引いたかが見える）。通し番号は 11〜30・32〜45（31 が空白で落ちた形）。
+    /// 比べる相手は**同じ費用の、通し番号なしの配分**（最も古い始まり）。
+    ///
+    /// # 対照
+    ///
+    /// 切り上げが実際に働いた回数（`snapped`）と、**19 往復未満なので丸めなかった回数**（`short`）が
+    /// どちらも 0 でないこと。片方でも 0 なら、この掃引はその枝を見ていない。
+    ///
+    /// **丸めた回は、残りが 10 往復以上**（下限を 19 にした理由 / 利用者の決定）。
+    #[test]
+    fn snapping_never_exceeds_the_budget_across_a_sweep() {
+        let mut numbers = serials(11, 30);
+        numbers.extend(serials(32, 45));
+        let costs: Vec<u32> = (0..numbers.len() * 2)
+            .map(|index| u32::try_from(index * 7 % 13 + 3).expect("小さい値"))
+            .collect();
+        let mut snapped = 0;
+        let mut short = 0;
+
+        for fixed in 0..=budget().prompt_allowance() {
+            let plan = plan(budget(), fixed, &[], &[], &costs, Some(&numbers)).expect("収まること");
+            let plain = super::plan(budget(), fixed, &[], &[], &costs, None).expect("収まること");
+            let start = plan.history_start();
+            let earliest = plain.history_start();
+
+            assert!(
+                start.is_multiple_of(2),
+                "往復の頭（fixed = {fixed}）: {start}"
+            );
+            assert!(start >= earliest, "切り下げた（fixed = {fixed}）");
+            let included: u32 = costs[start..].iter().sum();
+            assert_eq!(plan.history_tokens(), included, "費用（fixed = {fixed}）");
+            assert_eq!(plan.dropped_history(), start);
+            assert_eq!(plan.history_snapped_away(), start - earliest);
+            assert!(
+                plan.prompt_tokens() <= plan.prompt_allowance(),
+                "予算を超えた（fixed = {fixed}）: {plan:?}"
+            );
+
+            let fitting = (costs.len() - earliest) / 2;
+            if start != earliest {
+                snapped += 1;
+                assert!(
+                    earliest > 0 && fitting >= 19,
+                    "丸めない条件（fixed = {fixed}）"
+                );
+                assert!(
+                    (costs.len() - start) / 2 >= 10,
+                    "切り上げた後も 10 往復以上残る（fixed = {fixed}）: 始まり {start}"
+                );
+                let turn = start / 2;
+                assert!(
+                    a_boundary_lies_between(numbers[turn - 1], numbers[turn]),
+                    "区切りの往復へ（fixed = {fixed}）"
+                );
+                for skipped in earliest / 2..turn {
+                    assert!(
+                        skipped == 0
+                            || !a_boundary_lies_between(numbers[skipped - 1], numbers[skipped]),
+                        "最初の区切りを飛ばした（fixed = {fixed}）: 往復 {skipped}"
+                    );
+                }
+            } else if earliest > 0 && fitting >= 19 {
+                // 丸める条件なのに動かなかったのは、最も古い始まりがすでに区切りの往復だったときだけ。
+                let turn = earliest / 2;
+                assert!(
+                    a_boundary_lies_between(numbers[turn - 1], numbers[turn]),
+                    "丸めるはずの配分が動かなかった（fixed = {fixed}）"
+                );
+            } else if earliest > 0 && fitting > 0 {
+                short += 1;
+            }
+        }
+
+        assert!(snapped > 0, "対照: 切り上げが一度も働いていない");
+        assert!(short > 0, "対照: 19 往復未満の枝を一度も通っていない");
     }
 }

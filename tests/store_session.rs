@@ -1231,6 +1231,226 @@ async fn recent_messages_returns_the_last_n_in_chronological_order() {
     );
 }
 
+// ---------------------------------------------------------------------- 履歴の窓（ADR-0063 / A-17）
+
+/// 通し番号 `turn` の往復（本文に番号を書く。利用者と応答で別の綴り）。
+async fn append_numbered_turn(store: &Store, session: SessionId, turn: u32) {
+    store
+        .append_turn(
+            session,
+            &raw_only(Role::User, &format!("依頼{turn}")),
+            &raw_only(Role::Assistant, &format!("返事{turn}")),
+        )
+        .await
+        .expect("往復を書けること");
+}
+
+/// 窓の最初の行（利用者の発言）の通し番号。
+fn first_turn_of(history: &personacore::store::RecentHistory) -> u32 {
+    let first = &history
+        .messages
+        .first()
+        .expect("窓が空でないこと")
+        .raw_content;
+    first
+        .strip_prefix("依頼")
+        .and_then(|number| number.parse().ok())
+        .unwrap_or_else(|| panic!("窓の最初の行が利用者の発言ではない: {first}"))
+}
+
+/// **往復を 1〜60 と伸ばしながら読むと、読み始めは 10 往復に1回だけ変わり、N ≥ 25 では 25〜34 往復が返る**
+/// （ADR-0063 §決定2）。
+///
+/// **同じキャラクターの別のセッションにも毎回1往復書く**（数える範囲がセッションに閉じていなければ、
+/// 番号がずれる）。変わり目の前後はリテラルで固定する。
+#[tokio::test]
+async fn the_recent_history_starts_on_a_boundary_that_moves_once_every_ten_turns() {
+    let (_dir, store) = setup().await;
+    let aoi = character(&store, "aoi").await;
+    let other = store.create_session(aoi).await.expect("作成できること");
+    let session = store.create_session(aoi).await.expect("作成できること");
+
+    let mut firsts = Vec::new();
+    for turn in 1..=60_u32 {
+        append_numbered_turn(&store, other, 1_000 + turn).await;
+        append_numbered_turn(&store, session, turn).await;
+
+        let history = store
+            .recent_history(session)
+            .await
+            .expect("履歴を読めること");
+        let first = first_turn_of(&history);
+        assert_eq!(history.turns_before, first - 1, "往復 {turn}: 前の発言の数");
+        let expected: Vec<String> = (first..=turn)
+            .flat_map(|number| [format!("依頼{number}"), format!("返事{number}")])
+            .collect();
+        let raw: Vec<String> = history
+            .messages
+            .iter()
+            .map(|message| message.raw_content.clone())
+            .collect();
+        assert_eq!(raw, expected, "往復 {turn}: 読み始めから最新まで、欠けずに");
+        let window = turn - first + 1;
+        if turn >= 25 {
+            assert!(
+                (25..=34).contains(&window),
+                "往復 {turn}: 窓は 25〜34 往復（いま {window}）"
+            );
+        } else {
+            assert_eq!(first, 1, "往復 {turn}: 25 未満は全部読む");
+        }
+        firsts.push(first);
+    }
+
+    // 変わり目の前後（添字は往復の数 − 1）。
+    assert_eq!(firsts[33], 1, "34 往復までは 1 から");
+    assert_eq!(firsts[34], 11, "35 往復で 11 へ");
+    assert_eq!(firsts[44], 21, "45 往復で 21 へ");
+    assert_eq!(firsts[54], 31, "55 往復で 31 へ");
+    assert_eq!(firsts[59], 31, "60 往復はまだ 31 から");
+    let changes = firsts.windows(2).filter(|pair| pair[0] != pair[1]).count();
+    assert_eq!(
+        changes, 3,
+        "60 往復までに読み始めが変わるのは 3 回: {firsts:?}"
+    );
+}
+
+/// **返事の無い利用者の発言も1つの番号を持つ**（DB の利用者の発言を数える / `Store::turn_number` と同じ）。
+///
+/// 1〜29 の往復の後に返事の無い依頼（30）、続けて 31〜35 の往復。往復の数は 35 なので、読み始めは 11。
+/// 返事の無い依頼を数えない形だと往復の数が 34 になり、読み始めは 1 のまま。
+#[tokio::test]
+async fn a_user_message_without_a_reply_still_takes_a_turn_number() {
+    let (_dir, store) = setup().await;
+    let aoi = character(&store, "aoi").await;
+    let session = store.create_session(aoi).await.expect("作成できること");
+    for turn in 1..=29 {
+        append_numbered_turn(&store, session, turn).await;
+    }
+    store
+        .append_message(session, &raw_only(Role::User, "依頼30"))
+        .await
+        .expect("発言を書けること");
+    for turn in 31..=35 {
+        append_numbered_turn(&store, session, turn).await;
+    }
+
+    let history = store
+        .recent_history(session)
+        .await
+        .expect("履歴を読めること");
+    assert_eq!(first_turn_of(&history), 11);
+    assert_eq!(history.turns_before, 10);
+    assert_eq!(
+        history.messages.len(),
+        2 * 25 - 1,
+        "11〜35 の往復と、返事の無い依頼1件"
+    );
+}
+
+/// **読む件数には天井がある**（[`personacore::domain::HISTORY_READ_CAP`]）。天井で頭が切れても、
+/// `turns_before` は**返した最初の行から数え直す**ので、行との対応は崩れない。
+///
+/// 30 往復（読み始めは 1）の後に、往復の形でない応答だけの行を 80 件。読み始めからは 140 件あるが、
+/// 返るのは新しい側の 100 件で、最初の行は通し番号 21 の依頼（前に 20 件）。
+#[tokio::test]
+async fn the_recent_history_is_capped_and_still_counts_from_its_first_row() {
+    let (_dir, store) = setup().await;
+    let aoi = character(&store, "aoi").await;
+    let session = store.create_session(aoi).await.expect("作成できること");
+    for turn in 1..=30 {
+        append_numbered_turn(&store, session, turn).await;
+    }
+    for index in 0..80 {
+        store
+            .append_message(
+                session,
+                &raw_only(Role::Assistant, &format!("応答だけ{index}")),
+            )
+            .await
+            .expect("発言を書けること");
+    }
+
+    let history = store
+        .recent_history(session)
+        .await
+        .expect("履歴を読めること");
+    assert_eq!(
+        personacore::domain::HISTORY_READ_CAP,
+        100,
+        "前提: 天井は 100 件"
+    );
+    assert_eq!(history.messages.len(), 100);
+    assert_eq!(first_turn_of(&history), 21);
+    assert_eq!(history.turns_before, 20);
+    assert_eq!(
+        history
+            .messages
+            .last()
+            .map(|message| message.raw_content.as_str()),
+        Some("応答だけ79"),
+        "新しい側を返す"
+    );
+}
+
+/// **天井で頭が応答の行に当たっても、`turns_before` はその応答の依頼まで数える**（レビューの提案 B）。
+///
+/// 30 往復の後に応答だけの行を 81 件。読み始め（通し番号 1）からは 141 件で、返るのは新しい側の 100 件。
+/// 最初の行は通し番号 21 の応答（`返事21`）で、その手前の利用者の発言は 1〜21 の 21 件。
+/// 窓の中の最初の依頼は `依頼22`（通し番号 22 = 21 + 1）。
+#[tokio::test]
+async fn a_cap_that_cuts_at_a_reply_still_counts_its_request() {
+    let (_dir, store) = setup().await;
+    let aoi = character(&store, "aoi").await;
+    let session = store.create_session(aoi).await.expect("作成できること");
+    for turn in 1..=30 {
+        append_numbered_turn(&store, session, turn).await;
+    }
+    for index in 0..81 {
+        store
+            .append_message(
+                session,
+                &raw_only(Role::Assistant, &format!("応答だけ{index}")),
+            )
+            .await
+            .expect("発言を書けること");
+    }
+
+    let history = store
+        .recent_history(session)
+        .await
+        .expect("履歴を読めること");
+    assert_eq!(history.messages.len(), 100);
+    let first = history.messages.first().expect("窓が空でないこと");
+    assert_eq!(first.role, Role::Assistant, "先頭は応答の行");
+    assert_eq!(first.raw_content, "返事21");
+    assert_eq!(history.turns_before, 21, "依頼21 まで数える");
+    assert_eq!(
+        history
+            .messages
+            .iter()
+            .find(|message| message.role == Role::User)
+            .map(|message| message.raw_content.as_str()),
+        Some("依頼22"),
+        "窓の中の最初の依頼"
+    );
+}
+
+/// **空のセッションは空の窓**（前の発言は 0）。
+#[tokio::test]
+async fn an_empty_session_has_an_empty_recent_history() {
+    let (_dir, store) = setup().await;
+    let aoi = character(&store, "aoi").await;
+    let session = store.create_session(aoi).await.expect("作成できること");
+
+    let history = store
+        .recent_history(session)
+        .await
+        .expect("履歴を読めること");
+    assert!(history.messages.is_empty());
+    assert_eq!(history.turns_before, 0);
+}
+
 /// メッセージはセッションごとに独立している。
 #[tokio::test]
 async fn messages_are_scoped_to_one_session() {

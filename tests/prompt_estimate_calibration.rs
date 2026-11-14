@@ -515,6 +515,7 @@ async fn a_category_named_after_a_control_token_is_not_special_in_the_prompt() {
             agreements: &[],
             memories: &memories,
             history: &[],
+            history_turns_before: None,
             user_message: "こんにちは",
         },
         TokenBudget::default(),

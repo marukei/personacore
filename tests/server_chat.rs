@@ -3343,3 +3343,211 @@ async fn a_superseded_memory_is_never_recalled_even_when_the_user_repeats_it() {
 
     server.stop().await;
 }
+
+// ---------------------------------------------------------------------- 履歴の窓（ADR-0063 / A-17）
+
+/// 通し番号 `turn` の利用者の発言（**番号ごとに別の綴り。長さは番号によらず一定**）。
+fn numbered_user(turn: u32) -> String {
+    format!("依頼{turn:03}：今日あった出来事を順番に話している。")
+}
+
+/// 通し番号 `turn` の応答（[`numbered_user`] と同じ長さ・別の綴り）。
+fn numbered_reply(turn: u32) -> String {
+    format!("返事{turn:03}：そのときの気持ちを静かに聞いている。")
+}
+
+/// 上流へ届いた本文の要求の、**履歴の最初のメッセージ**（利用者の発言）の通し番号と、履歴の往復の数。
+///
+/// 要求は `[システム, 履歴…, 今回の発言]`。履歴が無ければ `None`。
+fn history_window_of(request: &ChatRequest) -> Option<(u32, usize)> {
+    let history = request.messages.get(1..request.messages.len() - 1)?;
+    let first = history.first()?;
+    assert_eq!(
+        first.role,
+        ChatRole::User,
+        "履歴は利用者の発言から始まること"
+    );
+    let turn = first
+        .content
+        .strip_prefix("依頼")
+        .and_then(|rest| rest.split('：').next())
+        .and_then(|number| number.parse().ok())
+        .unwrap_or_else(|| panic!("履歴の最初が番号付きの依頼ではない: {}", first.content));
+    Some((turn, history.len() / 2))
+}
+
+/// **`turns` 往復の会話を直に置いたセッション**を作り、生の id を返す（本文処理が書くのと同じ `append_turn`）。
+async fn seed_numbered_session(server: &TestServer, turns: u32) -> i64 {
+    let character = server
+        .store
+        .find_character_by_handle(&name("aoi"))
+        .await
+        .expect("キャラクターを引けること")
+        .expect("キャラクターが存在すること");
+    let session = server
+        .store
+        .create_session(character.id)
+        .await
+        .expect("セッションを作れること");
+    let raw = |role, text: String| personacore::domain::NewMessage {
+        role,
+        dialogue: None,
+        narration: None,
+        raw_content: text,
+    };
+    for turn in 1..=turns {
+        server
+            .store
+            .append_turn(
+                session,
+                &raw(Role::User, numbered_user(turn)),
+                &raw(Role::Assistant, numbered_reply(turn)),
+            )
+            .await
+            .expect("往復を書けること");
+    }
+    session.get()
+}
+
+/// `next..` の番号で `count` ターン送り、**上流へ届いた本文の要求の履歴の窓**を1ターンずつ返す。
+async fn send_numbered_turns(
+    server: &TestServer,
+    session: i64,
+    next: u32,
+    count: u32,
+) -> Vec<(u32, usize)> {
+    let mut windows = Vec::new();
+    for turn in next..next + count {
+        let (status, body) = server
+            .chat(&request_of(&format!("aoi@{session}"), &numbered_user(turn)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "ターン {turn}: {body}");
+        let request = server.llm.last_request();
+        assert_eq!(
+            request
+                .messages
+                .last()
+                .map(|message| message.content.as_str()),
+            Some(numbered_user(turn).as_str()),
+            "前提: 最後は今回の発言"
+        );
+        let window = history_window_of(&request)
+            .unwrap_or_else(|| panic!("ターン {turn}: 履歴が載っていない"));
+        // 履歴の最後は直前の往復（最新の1往復は必ず残る）。
+        assert_eq!(
+            request.messages[request.messages.len() - 2].content,
+            numbered_reply(turn - 1),
+            "ターン {turn}: 履歴の最後は直前の応答"
+        );
+        windows.push(window);
+    }
+    windows
+}
+
+/// **件数で決まる窓は、区切りをまたぐまで同じ往復から始まり、またいだターンで変わる**
+/// （ADR-0063 §決定2 / 本文の経路 `server::chat` を通す見張り番）。
+///
+/// 41 往復を置いたセッションへ、42〜46 の発言を送る。送る時点の往復の数は 41〜45 で、
+/// **読み始めは 41〜44 では 11、45 で 21**（区切りの 11・21 はどちらも会話の途中にある）。
+/// 窓の往復の数は 31〜34、そして 25。予算は広くとり、**件数だけで決まる**形にする。
+///
+/// 変更前（最新の 50 件）なら、読み始めは毎ターン 17, 18, 19, 20, 21 と動く。
+#[tokio::test]
+async fn the_history_window_stays_put_until_it_crosses_a_boundary() {
+    let replies: Vec<String> = (42..=46).map(numbered_reply).collect();
+    let replies: Vec<&str> = replies.iter().map(String::as_str).collect();
+    let server = TestServer::start_with_env(
+        MockLlm::replying_each(&replies),
+        &[(ENV_CONTEXT_TOKENS, "32768")],
+    )
+    .await;
+    server.seed("aoi", "葵").await;
+    let session = seed_numbered_session(&server, 41).await;
+
+    let windows = send_numbered_turns(&server, session, 42, 5).await;
+    assert_eq!(
+        windows,
+        vec![(11, 31), (11, 32), (11, 33), (11, 34), (21, 25)],
+        "（読み始め, 往復の数）の並び"
+    );
+
+    server.stop().await;
+}
+
+/// **予算で削られる窓も、区切りの往復から始まり、区切りをまたぐまで動かない**
+/// （ADR-0063 §決定3・§決定4 —— 本番が通し番号を `prompt` へ渡し忘れたときに赤くなる見張り番）。
+///
+/// 40 往復を置いたセッション（読み始めは 11、45 往復目から 21）へ、41〜52 の発言を送る。予算は
+/// **履歴にちょうど 22.5 往復分**が残る大きさにし（削れない枠は関数の外で組んで測る）、22 往復が入る
+/// （丸める下限の 19 以上で、読む窓の 25 往復より少ない —— 12 ターンの間ずっと予算で削られ、ずっと丸める）。
+/// 予算に入る最も古い往復は 19, 20, …, 30 と毎ターン進むが、**載るのは 21 から（3 ターン）、
+/// 次に 31 から（9 ターン）**。通し番号を渡し忘れると、19 から毎ターン動き、往復の数は毎ターン 22。
+#[tokio::test]
+async fn the_history_window_trimmed_by_the_budget_stays_on_a_boundary() {
+    use personacore::prompt::{CountedParts, MESSAGE_OVERHEAD_TOKENS, PromptInput, build_prompt};
+
+    // 削れない枠を外で測る（今回の発言は番号によらず同じ長さ）。
+    let probe = TestServer::with_reply("「はい」").await;
+    probe.seed("aoi", "葵").await;
+    let character = probe
+        .store
+        .find_character_by_handle(&name("aoi"))
+        .await
+        .expect("キャラクターを引けること")
+        .expect("キャラクターが存在すること");
+    let user_message = numbered_user(41);
+    let fixed = build_prompt(
+        &PromptInput {
+            character: &character,
+            stats: &[],
+            attributes: &[],
+            agreements: &[],
+            memories: &[],
+            history: &[],
+            history_turns_before: None,
+            user_message: &user_message,
+        },
+        TokenBudget::new(32_768, TokenBudget::DEFAULT_RESPONSE_TOKENS)
+            .expect("予算になる値であること"),
+        &CountedParts::default(),
+    )
+    .expect("削れない枠が収まること")
+    .plan
+    .fixed_tokens();
+    probe.stop().await;
+
+    // 1往復の費用（バイト数 ＋ 1件ごとの上乗せ）。利用者と応答は同じ長さ。
+    assert_eq!(
+        numbered_user(41).len(),
+        numbered_reply(41).len(),
+        "前提: 利用者と応答は同じ長さ"
+    );
+    let message_cost =
+        u32::try_from(numbered_user(41).len()).expect("小さい値") + MESSAGE_OVERHEAD_TOKENS;
+    let turn_cost = message_cost * 2;
+    let context = TokenBudget::DEFAULT_RESPONSE_TOKENS + fixed + turn_cost * 22 + turn_cost / 2;
+
+    let replies: Vec<String> = (41..=52).map(numbered_reply).collect();
+    let replies: Vec<&str> = replies.iter().map(String::as_str).collect();
+    let context = context.to_string();
+    let server = TestServer::start_with_env(
+        MockLlm::replying_each(&replies),
+        &[(ENV_CONTEXT_TOKENS, context.as_str())],
+    )
+    .await;
+    server.seed("aoi", "葵").await;
+    let session = seed_numbered_session(&server, 40).await;
+
+    let windows = send_numbered_turns(&server, session, 41, 12).await;
+    let firsts: Vec<u32> = windows.iter().map(|(first, _)| *first).collect();
+    assert_eq!(
+        firsts,
+        vec![21, 21, 21, 31, 31, 31, 31, 31, 31, 31, 31, 31],
+        "履歴の最初の往復の並び（窓: {windows:?}）"
+    );
+    // 往復の数は「最新 − 始まり ＋ 1」で、予算に入る 22 を超えず、切り上げた後も 10 以上。
+    let counts: Vec<usize> = windows.iter().map(|(_, count)| *count).collect();
+    assert_eq!(counts, vec![20, 21, 22, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
+
+    server.stop().await;
+}

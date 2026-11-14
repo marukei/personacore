@@ -519,6 +519,26 @@ pub struct PromptInput<'a> {
     /// 自前DBを正とする（docs/02-architecture.md「履歴の二重管理」）ため、
     /// ここには `store` から読んだ確定済みのメッセージだけを渡す。
     pub history: &'a [Message],
+    /// **`history` の最初のメッセージより前にある、そのセッションの利用者の発言の数**
+    /// （ADR-0063 / 作業単位 A-17。`Store::recent_history` の `turns_before`）。
+    ///
+    /// 往復の通し番号（利用者の発言を古い順に数えた番号）は、これに `history` の中の
+    /// 利用者の発言を数え足して決まる（[`history_turns`]）。**`history` の利用者の発言は
+    /// 1件も読み飛ばさずに数える**（返事の無い依頼・形の崩れた往復・空白の往復も、DB では1つの番号を持つ）。
+    ///
+    /// **`None` なら通し番号を持たない履歴**で、予算で削るときに区切りへ丸めない（§決定4）。
+    /// **本番の本文の経路（`server::chat`）は必ず `Some` を渡す** —— 渡し忘れても単体のテストは
+    /// 緑のまま。**渡し忘れを捕まえる見張り番は、予算で削られる側の結合テストだけ**
+    /// （`tests/server_chat.rs` の `the_history_window_trimmed_by_the_budget_stays_on_a_boundary`）。
+    /// 件数で決まる側（`the_history_window_stays_put_until_it_crosses_a_boundary`）は、DB の読みが
+    /// 区切りから始まるので、渡し忘れても緑のまま。
+    ///
+    /// **値そのものの正しさは、ここでは丸めの位置にほとんど効かない。** 窓は区切りから読むので
+    /// `turns_before` は 10 の倍数になり、`Some(0)` を渡しても、天井で頭が切れない限り区切りの位置は変わらない
+    /// （レビューの提案 A / 受容）。値は `tests/store_session.rs` の天井のテスト
+    /// （`the_recent_history_is_capped_and_still_counts_from_its_first_row` /
+    /// `a_cap_that_cuts_at_a_reply_still_counts_its_request`）が見ている。
+    pub history_turns_before: Option<u32>,
     /// 今回のユーザー発言（クライアントが送ってきた最新メッセージ）。
     ///
     /// **履歴とは別枠にしてある。** これが無いとモデルは応答できないので、
@@ -646,6 +666,12 @@ struct AgreementLine {
 struct HistoryTurn {
     role: ChatRole,
     text: SafeText,
+    /// **この往復の通し番号**（ADR-0063。利用者の発言と応答の両方に同じ番号）。
+    /// 通し番号を持たない履歴（[`PromptInput::history_turns_before`] が `None`）なら `None`。
+    ///
+    /// **読まれるのは依頼の側だけ**（`build_prompt_priced` は往復の頭 = 偶数の添字の番号を集める）。
+    /// 応答の側にも同じ値を持たせているのは、往復の両方が同じ形であるためだけで、使われていない。
+    turn: Option<u32>,
 }
 
 /// 無害化済みのキャラクター定義。
@@ -836,12 +862,16 @@ fn build_prompt_priced(
         .collect();
 
     // 4. 予算を配分する（削る順序は `budget::plan` に明示してある）。
+    //    **往復ごとの通し番号を渡す**（ADR-0063 §決定3。往復の頭は偶数の添字 / `history_turns`）。
+    //    1つでも番号を持たない往復があれば `None`（丸めない）。
+    let turn_numbers: Option<Vec<u32>> = history.iter().step_by(2).map(|turn| turn.turn).collect();
     let plan = budget::plan(
         budget,
         fixed_tokens,
         &agreement_costs,
         &memory_costs,
         &history_costs,
+        turn_numbers.as_deref(),
     )?;
     if report == Report::Now {
         report_trimming(&plan);
@@ -930,7 +960,7 @@ fn prepare(input: &PromptInput<'_>) -> Prepared {
     // **履歴は往復の列に畳んでから使う**（ADR-0025 §1）。
     // 平坦な列のまま使うと、空白1件で穴が開いたり、削り位置が奇数になったりして
     // 上流が拒否する並びになる。
-    let history = history_turns(input.history);
+    let history = history_turns(input.history, input.history_turns_before);
     let user_message = SafeText::sanitize(input.user_message);
     // **有効な取り決めだけ**（ADR-0051 §決定4）。終わったもの（果たした・破った・取り消した）を
     // 載せると、モデルは終わった約束を守り続ける。**述語は `AgreementState::is_active` に一本化。**
@@ -1325,7 +1355,14 @@ fn memory_line(memory: &Memory) -> MemoryLine {
 ///
 /// 「並びを保つために空の `content` を送る」案は採らない。
 /// 空の本文が別のテンプレートを壊す形は実測で別に出ている（ADR-0025 の却下欄）。
-fn history_turns(messages: &[Message]) -> Vec<HistoryTurn> {
+///
+/// # 往復の通し番号（ADR-0063 / 作業単位 A-17）
+///
+/// `turns_before` が `Some` なら、残した往復の両方に**その往復の通し番号**を持たせる
+/// （[`PromptInput::history_turns_before`]）。落とした往復の番号は欠番になり、
+/// `budget::plan` は欠番の後ろで最初に残った往復を区切りとして扱う。
+/// 番号が `u32` に収まらない往復は番号を持たない（その配分は丸めない）。
+fn history_turns(messages: &[Message], turns_before: Option<u32>) -> Vec<HistoryTurn> {
     let mut index = messages.len();
 
     // 末尾が利用者の発言なら、返事の無い片割れ。**今回の発言の直前には置けない。**
@@ -1336,6 +1373,15 @@ fn history_turns(messages: &[Message]) -> Vec<HistoryTurn> {
         index -= 1;
     }
 
+    // **往復の通し番号**（ADR-0063）。`messages[..index]` の利用者の発言の数を、新しい側から
+    // 1つずつ減らしながら使う —— 往復の依頼はその時点の接頭辞の最後の利用者の発言なので、
+    // 依頼の通し番号は「前の発言の数 ＋ 接頭辞の利用者の発言の数」。**落とす往復も数えから外さない**
+    // （DB では1つの番号を持つ。末尾の返事待ちは接頭辞の外なので、より古い往復の番号に影響しない）。
+    let mut users_through = messages[..index]
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .count();
+
     // 新しい側から往復単位で見て、形が崩れたところで打ち切る。
     let mut newest_first: Vec<HistoryTurn> = Vec::with_capacity(index);
     while let [older @ .., request, reply] = &messages[..index] {
@@ -1343,9 +1389,17 @@ fn history_turns(messages: &[Message]) -> Vec<HistoryTurn> {
             break;
         }
         index = older.len();
+        let turn = turns_before.and_then(|before| {
+            u32::try_from(users_through)
+                .ok()
+                .and_then(|users| before.checked_add(users))
+        });
+        users_through = users_through.saturating_sub(1);
 
         // **空白は往復ごと落とす。** 片方だけ落とすと交互の並びが崩れる。
-        if let (Some(request), Some(reply)) = (history_turn(request), history_turn(reply)) {
+        if let (Some(mut request), Some(mut reply)) = (history_turn(request), history_turn(reply)) {
+            request.turn = turn;
+            reply.turn = turn;
             newest_first.push(reply);
             newest_first.push(request);
         }
@@ -1399,6 +1453,7 @@ fn history_turn(message: &Message) -> Option<HistoryTurn> {
         // 変換の守り手が `prompt` のテストだけになる。
         role: ChatRole::from(message.role),
         text,
+        turn: None,
     })
 }
 
@@ -1738,6 +1793,8 @@ mod tests {
         agreements: Vec<Agreement>,
         memories: Vec<Memory>,
         history: Vec<Message>,
+        /// **既定は `None`（通し番号を持たない履歴）**。既存の見張り番は丸めの無い配分を見続ける。
+        history_turns_before: Option<u32>,
         user_message: String,
     }
 
@@ -1750,6 +1807,7 @@ mod tests {
                 agreements: Vec::new(),
                 memories: Vec::new(),
                 history: Vec::new(),
+                history_turns_before: None,
                 user_message: "こんにちは".to_owned(),
             }
         }
@@ -1762,6 +1820,7 @@ mod tests {
                 agreements: &self.agreements,
                 memories: &self.memories,
                 history: &self.history,
+                history_turns_before: self.history_turns_before,
                 user_message: &self.user_message,
             }
         }
@@ -3132,7 +3191,7 @@ mod tests {
             .find(|memory| memory.subject == Subject::User)
             .map(|memory| estimate_tokens(memory_line(memory).line.as_str()) + 1)
             .expect("利用者の記憶があること");
-        let history_costs: Vec<u32> = history_turns(&fixture.history)
+        let history_costs: Vec<u32> = history_turns(&fixture.history, None)
             .iter()
             .map(|turn| estimate_tokens(turn.text.as_str()) + MESSAGE_OVERHEAD_TOKENS)
             .collect();
@@ -4685,6 +4744,124 @@ mod tests {
                 .all(|message| !message.content.contains("孤児の返事")),
             "{:?}",
             roles(&built.messages)
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 往復の通し番号（ADR-0063 / 作業単位 A-17）
+    // ------------------------------------------------------------------
+
+    /// **通し番号は `history` の利用者の発言を1件も読み飛ばさずに数える**（DB の数え方と同じ）。
+    ///
+    /// 前に 8 件。返事の無い依頼（10）・空白の往復（12）・末尾の返事待ち（14）も番号を持つので、
+    /// 残る往復の番号は 11 と 13。**残った往復だけを数える形**だと 9, 10 になり、
+    /// 返事の無い依頼を数えない形だと 10, 12 になる。
+    #[test]
+    fn history_turns_carry_numbers_counted_from_every_user_message() {
+        let history = vec![
+            message(Role::User, "依頼9"),
+            message(Role::Assistant, "返事9"),
+            message(Role::User, "返事の無い依頼10"),
+            message(Role::User, "依頼11"),
+            message(Role::Assistant, "返事11"),
+            message(Role::User, "  \t "),
+            message(Role::Assistant, "空白の相方12"),
+            message(Role::User, "依頼13"),
+            message(Role::Assistant, "返事13"),
+            message(Role::User, "返事待ち14"),
+        ];
+
+        let turns = history_turns(&history, Some(8));
+        let seen: Vec<(&str, Option<u32>)> = turns
+            .iter()
+            .map(|turn| (turn.text.as_str(), turn.turn))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("依頼11", Some(11)),
+                ("返事11", Some(11)),
+                ("依頼13", Some(13)),
+                ("返事13", Some(13)),
+            ]
+        );
+
+        // 通し番号を持たない履歴は、どの往復も番号を持たない。
+        assert!(
+            history_turns(&history, None)
+                .iter()
+                .all(|turn| turn.turn.is_none())
+        );
+
+        // 溢れる番号は持たない（panic しない）。前に `u32::MAX - 4` 件なら、
+        // 3件目の依頼（依頼11）は `u32::MAX - 1`、5件目（依頼13）は溢れる。
+        let overflowing = history_turns(&history, Some(u32::MAX - 4));
+        assert_eq!(overflowing[0].turn, Some(u32::MAX - 1), "3件目の依頼");
+        assert_eq!(overflowing[2].turn, None, "5件目の依頼は溢れる");
+    }
+
+    /// **番号を持つ履歴は、組み上がりでも区切りの往復から始まる**（`build_prompt` → `budget::plan` の配線）。
+    ///
+    /// 通し番号 11〜40 の 30 往復。予算を細かく動かして、**番号なしなら区切りでない往復から始まる**
+    /// 予算を探し（前提）、同じ予算で番号ありなら次の区切りの往復から始まることを見る。
+    /// 番号を `plan` へ渡し忘れると、両方が同じ往復から始まって赤になる。
+    #[test]
+    fn a_numbered_history_starts_the_built_prompt_on_a_boundary_turn() {
+        let mut fixture = Fixture::new();
+        for turn in 11..=40_u32 {
+            fixture
+                .history
+                .push(message(Role::User, &format!("依頼{turn}：今日の話の続き")));
+            fixture.history.push(message(
+                Role::Assistant,
+                &format!("返事{turn}：そうだったね"),
+            ));
+        }
+        let first_user_turn = |built: &BuiltPrompt| -> u32 {
+            let first = &built.messages[1].content;
+            first
+                .strip_prefix("依頼")
+                .and_then(|rest| rest.split('：').next())
+                .and_then(|number| number.parse().ok())
+                .unwrap_or_else(|| panic!("履歴の先頭が依頼ではない: {first}"))
+        };
+
+        let mut checked = 0;
+        for context in (200..=4_000_u32).step_by(7) {
+            let budget = TokenBudget::new(context, 100).expect("正当な予算であること");
+            fixture.history_turns_before = None;
+            let Ok(plain) = build_prompt(&fixture.input(), budget) else {
+                continue;
+            };
+            let included_turns = plain.plan.included_history() / 2;
+            // 丸めるのは 19 往復以上入るときだけ（`domain::HISTORY_SNAP_MIN_FITTING_TURNS`）。
+            if plain.plan.dropped_history() == 0 || included_turns < 19 {
+                continue;
+            }
+            let earliest = first_user_turn(&plain);
+            if earliest % 10 == 1 {
+                continue;
+            }
+            // 前提が揃った予算: 番号なしは区切りでない往復（earliest）から始まる。
+            let boundary = (earliest - 1) / 10 * 10 + 11;
+            fixture.history_turns_before = Some(10);
+            let numbered = build_prompt(&fixture.input(), budget).expect("同じ予算に収まること");
+            assert_eq!(
+                first_user_turn(&numbered),
+                boundary,
+                "番号ありは次の区切りの往復から（context = {context}, 番号なしは {earliest}）"
+            );
+            assert_eq!(
+                numbered.plan.history_snapped_away(),
+                usize::try_from((boundary - earliest) * 2).expect("小さい値"),
+                "context = {context}"
+            );
+            assert!(numbered.plan.prompt_tokens() <= numbered.plan.prompt_allowance());
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "前提: 番号なしが区切りでない往復から始まる予算が1つも無かった"
         );
     }
 
@@ -6496,7 +6673,7 @@ mod tests {
 
         // **外で計算した取り分**: 履歴を新しい往復から、残りの半分（切り捨て）に入るだけ。
         // 1往復も入らなければ、残りに入る最新の1往復（`budget::Frames::new` の doc）。
-        let history_costs: Vec<u32> = history_turns(&fixture.history)
+        let history_costs: Vec<u32> = history_turns(&fixture.history, None)
             .iter()
             .map(|turn| estimate_tokens(turn.text.as_str()) + MESSAGE_OVERHEAD_TOKENS)
             .collect();

@@ -998,6 +998,7 @@ mod tests {
                 agreements: &[],
                 memories: &[],
                 history: &[],
+                history_turns_before: None,
                 user_message: "こんにちは",
             },
             budget(),
