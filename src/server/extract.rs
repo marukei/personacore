@@ -69,7 +69,7 @@ use crate::prompt::extraction::{
     ExampleStyle, ExtractionInput, ExtractionPrompt, build_extraction_prompt, example_echoes,
     example_format_echoes, request_tokens,
 };
-use crate::store::{Store, StoreError};
+use crate::store::{RecallScope, Store, StoreError};
 
 /// **サブモデルの実コンテキスト長を、まだ一度も引けていないときの落とし所**
 /// （`loaded_context_length` / トークン / 作業単位 B-7）。
@@ -1169,7 +1169,13 @@ async fn extract(store: &Store, llm: &dyn LlmClient, job: &TurnJob) {
     let sub_context = job.sub_context;
     // **すでに知っていること**（§13）。**上流を呼ぶ前**に、トランザクションを跨がずに読む。
     // 想起の入口は `Store::recall_memories` ひとつ（ADR-0003）。
-    let known_memories = match store.recall_memories(job.character_id).await {
+    // **全件を読む**（ADR-0064 §決定3 —— 本文の想起の境で絞らない）。絞ると、区切りを待っている
+    // 記憶が既知の記憶から消え、同じ事実を言い直した記憶が増える。見張り番は `tests/server_memory_extraction.rs` の
+    // `an_extracted_memory_waits_for_the_boundary_in_the_persona_prompt_but_not_in_the_extraction_request`。
+    let known_memories = match store
+        .recall_memories(job.character_id, RecallScope::Everything)
+        .await
+    {
         Ok(memories) => memories,
         Err(err) => {
             // **知らないまま走らせない**（この関数の doc）。
@@ -2125,7 +2131,7 @@ mod tests {
     /// 2件目を足すまで **1029/1029 緑**で通り抜けた。
     ///
     /// 取り違えると、実機では **`aoi` との会話から抽出した記憶が別キャラの行として入る。**
-    /// 想起の入口は `Store::recall_memories(character_id)` だけなので、
+    /// 想起の入口は `Store::recall_memories(character_id, scope)` だけなので、
     /// もう一方が他人の事実を自分のこととして語り始める。
     ///
     /// > **これは修復の導線でも直しきれない**（20b でレビューと judgment をやり直した）。
@@ -2851,13 +2857,21 @@ mod tests {
         });
 
         let memories = runtime
-            .block_on(fixture.store.recall_memories(fixture.character.id))
+            .block_on(
+                fixture
+                    .store
+                    .recall_memories(fixture.character.id, RecallScope::Everything),
+            )
             .expect("記憶を読めること");
 
         // **会話しなかった方は1件も増えていないこと**（持ち主の決め打ちを捕まえる）。
         // ここに置くのは、この入口を通るすべての回で見るため。
         let bystander = runtime
-            .block_on(fixture.store.recall_memories(fixture.bystander.id))
+            .block_on(
+                fixture
+                    .store
+                    .recall_memories(fixture.bystander.id, RecallScope::Everything),
+            )
             .expect("傍観者の記憶を読めること");
         assert_eq!(
             as_pairs(&bystander),
@@ -3029,7 +3043,11 @@ mod tests {
             "前提: id が使い回されていること（されなければ、このテストは何も見ていない）"
         );
         let memories = runtime
-            .block_on(fixture.store.recall_memories(reborn.id))
+            .block_on(
+                fixture
+                    .store
+                    .recall_memories(reborn.id, RecallScope::Everything),
+            )
             .expect("記憶を読めること");
         assert!(
             memories.is_empty(),
@@ -3703,7 +3721,7 @@ mod tests {
     /// **記憶はその会話のキャラクターにだけ入る**（持ち主を決め打ちにしない）。
     ///
     /// キャラクターが2体以上いる実機で取り違えると、**`aoi` との会話から抽出した記憶が
-    /// 別キャラの `memory` 行として入る。** 想起の入口は `recall_memories(character_id)`
+    /// 別キャラの `memory` 行として入る。** 想起の入口は `recall_memories(character_id, scope)`
     /// だけなので、もう一方が他人の事実を自分のこととして語り始める。
     /// **修復の導線でも持ち主は移せない**（[`Fixture`] の doc）。
     ///
@@ -3733,10 +3751,18 @@ mod tests {
         });
 
         let mine = runtime
-            .block_on(fixture.store.recall_memories(fixture.character.id))
+            .block_on(
+                fixture
+                    .store
+                    .recall_memories(fixture.character.id, RecallScope::Everything),
+            )
             .expect("記憶を読めること");
         let theirs = runtime
-            .block_on(fixture.store.recall_memories(fixture.bystander.id))
+            .block_on(
+                fixture
+                    .store
+                    .recall_memories(fixture.bystander.id, RecallScope::Everything),
+            )
             .expect("傍観者の記憶を読めること");
         runtime.block_on(fixture.store.close());
 
@@ -4900,7 +4926,11 @@ mod tests {
 
         // 記憶は**本番と同じ入口**から読む（ADR-0003 / 想起の入口はこれひとつ）。
         let known = runtime
-            .block_on(fixture.store.recall_memories(fixture.character.id))
+            .block_on(
+                fixture
+                    .store
+                    .recall_memories(fixture.character.id, RecallScope::Everything),
+            )
             .expect("記憶を読めること");
         runtime.block_on(fixture.store.close());
         assert_eq!(
@@ -5079,7 +5109,11 @@ mod tests {
             });
         });
         let memories = runtime
-            .block_on(fixture.store.recall_memories(fixture.character.id))
+            .block_on(
+                fixture
+                    .store
+                    .recall_memories(fixture.character.id, RecallScope::Everything),
+            )
             .expect("記憶を読めること");
         runtime.block_on(fixture.store.close());
 

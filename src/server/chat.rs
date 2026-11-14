@@ -66,7 +66,7 @@ use super::{AppState, counted_plan, openapi, seal, usage};
 use crate::domain::{Character, Handle, ModelSelector, SessionId, SessionRef};
 use crate::llm::{FinishReason, LlmError};
 use crate::prompt::{PromptError, PromptInput};
-use crate::store::StoreError;
+use crate::store::{RecallScope, StoreError};
 
 /// `object` フィールドの定数（OpenAI 互換）。
 ///
@@ -302,9 +302,23 @@ pub(super) async fn chat_completions(
         .active_agreements(character.id)
         .await
         .map_err(|err| internal(&err, "取り決めを取得できませんでした"))?;
+    // **本文の想起は、最後の区切りのターンより前に作られた記憶に絞る**（ADR-0064 / 作業単位 A-15b）。
+    //
+    // 抽出で増えた記憶をすぐ載せると、そのターンだけ先頭の system が変わり、会話キャッシュが 0 になる。
+    // 境の時刻（往復の数 N 以下で最大の 5, 15, 25, … 番目の往復の最後のメッセージ。区切りが無ければ
+    // セッションの作成時刻）より後の記憶は、次の区切りのターンまで待たせる。訂正で入った記憶は素通り。
+    // **境を渡すのはこの経路だけ**（裏方は `RecallScope::Everything` で全件を読む / §決定3）。
+    //
+    // 渡し忘れても `prompt` の単体テストは緑のまま —— 見張り番は `tests/server_chat.rs` の
+    // `a_memory_added_between_boundaries_reaches_the_persona_prompt_only_at_the_next_boundary`。
+    let recall_boundary = state
+        .store()
+        .recall_boundary(session_id)
+        .await
+        .map_err(|err| internal(&err, "記憶の境を求められませんでした"))?;
     let memories = state
         .store()
-        .recall_memories(character.id)
+        .recall_memories(character.id, RecallScope::AsOf(&recall_boundary))
         .await
         .map_err(|err| internal(&err, "記憶を取得できませんでした"))?;
     // **履歴の窓は、往復の通し番号の区切りから読む**（ADR-0063 / 作業単位 A-17）。

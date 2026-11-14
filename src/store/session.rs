@@ -16,7 +16,7 @@ use sqlx::sqlite::SqliteRow;
 use super::{Store, StoreError};
 use crate::domain::{
     CharacterId, HISTORY_READ_CAP, Message, MessageId, NewMessage, Role, SessionId,
-    first_turn_to_read,
+    first_turn_to_read, memory_boundary_turn,
 };
 
 /// `session` テーブルの1行。
@@ -92,6 +92,29 @@ pub struct RecentHistory {
     /// 窓が区切りから始まっていれば「読み始めの通し番号 − 1」。読む件数の天井で頭が切れたときも、
     /// **返した最初の行から数え直す**ので、`messages` との対応は崩れない。
     pub turns_before: u32,
+}
+
+/// **本文の想起の境の時刻**（[`Store::recall_boundary`] / ADR-0064 §決定1 / 作業単位 A-15b）。
+///
+/// 本文の想起の候補は、`created_at` がこの時刻以前の記憶に絞る（`RecallScope::AsOf`）。
+///
+/// **格納されている綴りのまま持つ**（`memory.created_at` / `message.created_at` / `session.created_at` は
+/// 同じ `strftime('%Y-%m-%dT%H:%M:%fZ','now')` の綴りで、文字列のまま比べると時刻順になる）。
+/// `DateTime` へ戻してから束ねると、sqlx の書式（`+00:00` 等）で書き直されて辞書順が崩れる。
+///
+/// **作る口は `Store::recall_boundary` だけ**（フィールドは非公開）。本文の経路以外の呼び手が
+/// 境を手で作って絞ることはできない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecallBoundary {
+    stored: String,
+}
+
+impl RecallBoundary {
+    /// 格納されている綴り（`2026-11-14T01:02:03.456Z` の形）。
+    #[must_use]
+    pub fn as_stored(&self) -> &str {
+        &self.stored
+    }
 }
 
 /// 日時の書式。**`migrations/0001_initial.sql` の DEFAULT と同一にすること。**
@@ -337,6 +360,22 @@ const SELECT_MESSAGES_FROM_TURN: &str = "SELECT id, role, dialogue, narration, r
 /// `?1` = セッション id / `?2` = 利用者の役割の綴り / `?3` = 窓の最初の行の id（**これ未満**）。
 const COUNT_USER_MESSAGES_BEFORE: &str =
     "SELECT count(*) FROM message WHERE session_id = ?1 AND role = ?2 AND id < ?3";
+
+/// **r 番目の往復の最後のメッセージの時刻**（本文の想起の境 / ADR-0064 §決定1）。
+///
+/// `?1` = セッション id / `?2` = 利用者の役割の綴り / `?3` = r（＝ r + 1 番目の利用者の発言の `OFFSET`）/
+/// `?4` = 次の依頼が無いときの上端（`i64::MAX`）。
+///
+/// 「r 番目の依頼の次の依頼より前で、最も新しいメッセージ」。次の依頼が無い（r が最新の往復）なら
+/// セッションの最後のメッセージ。返事の無い依頼なら、その依頼そのもの。
+/// 並びの権威は `id`（`SELECT_RECENT_MESSAGES` と同じ理由）。**選ぶ行も数える行も、このセッションのものだけ。**
+const SELECT_TURN_END_TIME: &str = "SELECT created_at FROM message WHERE session_id = ?1 AND id < \
+         coalesce((SELECT id FROM message WHERE session_id = ?1 AND role = ?2 \
+                   ORDER BY id LIMIT 1 OFFSET ?3), ?4) \
+     ORDER BY id DESC LIMIT 1";
+
+/// **セッションの作成時刻**（区切りがまだ無いときの境 / ADR-0064 §決定1）。
+const SELECT_SESSION_CREATED_AT: &str = "SELECT created_at FROM session WHERE id = ?";
 
 impl Store {
     /// セッションを作成し、作成した行の id を返す（`aoi@new` の意味論）。
@@ -689,6 +728,55 @@ impl Store {
             messages,
             turns_before,
         })
+    }
+
+    /// **本文の想起の境の時刻**（ADR-0064 §決定1 / 作業単位 A-15b）。
+    ///
+    /// 1. そのセッションの**利用者の発言を数える**（＝ 往復の数 N。[`Store::recent_history`] と同じ数え方 ——
+    ///    今回の発言はまだ書かれていない。返事の無い依頼も1往復）。
+    /// 2. N 以下で最大の区切り r を決める（`domain::memory_boundary_turn`。5, 15, 25, …）。
+    /// 3. r があれば、**r 番目の往復の最後のメッセージ**の `created_at`。無ければ（N < 5）
+    ///    **セッションの `created_at`**。
+    ///
+    /// **状態を持たない**（DB から毎回求める）。exe を再起動しても同じ境になる。
+    ///
+    /// **読むだけ。トランザクションを取らない。** 1〜3 の間に同じセッションへ往復が書き足されても、
+    /// 選ぶのは r 番目の往復の行なので、境は動かない（r が古いままになるだけ）。
+    ///
+    /// セッションが存在しなければ `StoreError::UnknownSession`。**区切りの往復の行が見つからないときも
+    /// `UnknownSession`**（数えてから読むまでにセッションが消えたときだけ起きる。セッションの作成時刻へは落とさない）。
+    pub async fn recall_boundary(
+        &self,
+        session_id: SessionId,
+    ) -> Result<RecallBoundary, StoreError> {
+        let turns: i64 = sqlx::query_scalar(COUNT_USER_MESSAGES)
+            .bind(session_id.get())
+            .bind(role_to_db(Role::User))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(StoreError::Query)?;
+        let turns = u32::try_from(turns).map_err(|_| StoreError::InvalidStoredValue)?;
+
+        // **どちらの読みも、行が無ければ `UnknownSession`。** r ≤ N なので r 番目の依頼は在るはずで、
+        // 見つからないのは数えてから読むまでにセッションが消えた（連鎖でメッセージも消えた）ときだけ。
+        // そのときは別の時刻へ落とさず、セッションが無いことをそのまま返す（ADR-0064 §決定1）。
+        let stored: Option<String> = match memory_boundary_turn(turns) {
+            Some(turn) => sqlx::query_scalar(SELECT_TURN_END_TIME)
+                .bind(session_id.get())
+                .bind(role_to_db(Role::User))
+                .bind(i64::from(turn))
+                .bind(i64::MAX)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(StoreError::Query)?,
+            None => sqlx::query_scalar(SELECT_SESSION_CREATED_AT)
+                .bind(session_id.get())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(StoreError::Query)?,
+        };
+        let stored = stored.ok_or(StoreError::UnknownSession)?;
+        Ok(RecallBoundary { stored })
     }
 
     /// そのキャラクターの会話を**素の `aoi` が続ける順**に `limit` 件まで返す（作業単位 D-12c-1）。

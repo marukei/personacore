@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use chrono::{DateTime, Utc};
 use personacore::domain::{CharacterId, Handle, MemoryCategory, MemoryContent, NewMemory, Subject};
 use personacore::server::{App, AppConfig, BindAddr, ServerError};
-use personacore::store::Store;
+use personacore::store::{RecallScope, Store};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -241,7 +241,7 @@ impl TestServer {
     /// 「一覧の絞り込みだけが変わって想起は変わっていない」形を見逃す。
     async fn recalled_contents(&self, character_id: CharacterId) -> Vec<String> {
         self.store
-            .recall_memories(character_id)
+            .recall_memories(character_id, RecallScope::Everything)
             .await
             .expect("想起できること")
             .into_iter()

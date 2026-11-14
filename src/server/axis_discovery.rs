@@ -57,7 +57,7 @@ use crate::parse::axis_candidate::{AxisCandidateReading, parse_axis_candidate};
 use crate::prompt::axis_discovery::{
     AxisDiscoveryInput, build_axis_discovery_prompt, request_tokens,
 };
-use crate::store::{AxisCandidate, Store, StoreError};
+use crate::store::{AxisCandidate, RecallScope, Store, StoreError};
 
 use super::extract::{
     SubContext, TurnJob, character_vanished, record_vanished, response_completeness,
@@ -194,7 +194,11 @@ pub(in crate::server) async fn run_axis_discovery(
         }
     };
     // **想起の入口はひとつ**（ADR-0003）。読み出しは1クエリで、上流を呼ぶ前。
-    let memories = match store.recall_memories(job.character_id).await {
+    // **全件を読む**（ADR-0064 §決定3 —— 本文の想起の境で絞るのは本文の経路だけ）。
+    let memories = match store
+        .recall_memories(job.character_id, RecallScope::Everything)
+        .await
+    {
         Ok(memories) => memories,
         Err(err) => {
             record_skip(SkipReason::MemoriesUnreadable, job, Some(&err));

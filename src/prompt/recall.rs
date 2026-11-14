@@ -16,7 +16,8 @@
 //!
 //! ```text
 //! 1. 有効な記憶を全件そろえ、利用者についての記憶だけを候補にする
-//!    （`store` は今までどおり両方の主語を全件返す。絞るのは `super::build_prompt` / A-11a）
+//!    （`store` は両方の主語を返す。主語で絞るのは `super::build_prompt` / A-11a。
+//!     本文の経路では、`store` が返すのは**境の時刻で絞った後の全件** —— ADR-0064 / `RecallScope::AsOf`）
 //! 2. その全件を候補集合として、1回だけ採点する      ← ADR-0023 の決定
 //! 3. 層2（直近＝新しい順）と層3（関連＝スコア順）に分ける
 //! 4. 同じ記憶が両方に該当したら1回だけ数える
@@ -185,7 +186,8 @@ pub(super) fn recall(query: &str, candidates: &[Candidate<'_>], frame: u32) -> R
     let mut selection = Selection::new(candidates);
 
     // **1回だけ採点する。** 候補集合は「そのキャラクターの有効な記憶」の全件で固定
-    // （ADR-0023）。ここを層ごとに測り直すと `df` が揺れてスコアが比較不能になる。
+    // （ADR-0023。本文の経路では、境の時刻で絞った後の全件 / ADR-0064）。
+    // ここを層ごとに測り直すと `df` が揺れてスコアが比較不能になる。
     let scores = score_relevance(query, candidates.iter().map(|candidate| candidate.content));
 
     // 層2（直近）。**先取り分まで。** ここで枠を全部使わせないことが FIFO への逆戻りを防ぐ。

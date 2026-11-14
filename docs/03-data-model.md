@@ -926,7 +926,9 @@ ComfyUI が出力する PNG にはワークフロー全体がメタデータと�
   キャラクター自身についての記憶は、本文に載せると自分の台詞の言い直しが定型として戻る輪になる（ADR-0050 の測定）。
   **行は消さずに残り、抽出の依頼（既知の記憶）と軸の候補の依頼には今までどおり載る。**
   会話をまたいで覚えていてほしい約束・決まりは、属性（層1）に人が書く（ADR-0050 §決め直し 5）。
-- `store` の想起の入口（`Store::recall_memories`）は**主語を問わず有効な記憶を全件**返し、
+- `store` の想起の入口（`Store::recall_memories`）は**主語を問わず有効な記憶を**返す。呼び手は範囲を必ず名指しする:
+  裏方の要求は全件（`RecallScope::Everything`）、本文の経路は区切りの境の時刻以前に作られた記憶と訂正で入った記憶だけ
+  （`RecallScope::AsOf` / [ADR-0064](adr/0064-extracted-memories-reach-the-prompt-in-steps-of-ten-turns.md)）。
   主語で絞るのも層に分けて選ぶのも `prompt`（`build_prompt` / `src/prompt/recall.rs`）。
 - **引かなかった件数は数えて `info` に出す**（ADR-0023 §3 / `report_recall`。主語で外した件数は `excluded_own` として別の欄）。
 

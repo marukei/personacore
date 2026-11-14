@@ -48,7 +48,7 @@ use personacore::server::{
     App, AppConfig, BindAddr, ENV_CONTEXT_TOKENS, ENV_LLM_ENDPOINT, ENV_LLM_IDLE_TIMEOUT,
     ENV_MAIN_MODEL, ENV_SUB_LLM_ENDPOINT, ENV_SUB_MODEL, ServerError,
 };
-use personacore::store::Store;
+use personacore::store::{RecallScope, Store};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -554,9 +554,15 @@ impl TestServer {
             .active_agreements(character.id)
             .await
             .expect("取り決めを読めること");
+        // **本文処理と同じ絞り方**（境の時刻 / ADR-0064）。
+        let boundary = self
+            .store
+            .recall_boundary(session)
+            .await
+            .expect("記憶の境を求められること");
         let memories = self
             .store
-            .recall_memories(character.id)
+            .recall_memories(character.id, RecallScope::AsOf(&boundary))
             .await
             .expect("記憶を読めること");
         build_prompt(
@@ -609,9 +615,15 @@ impl TestServer {
             .active_agreements(character.id)
             .await
             .expect("取り決めを読めること");
+        // **本文処理と同じ絞り方**（境の時刻 / ADR-0064）。
+        let boundary = self
+            .store
+            .recall_boundary(session)
+            .await
+            .expect("記憶の境を求められること");
         let memories = self
             .store
-            .recall_memories(character.id)
+            .recall_memories(character.id, RecallScope::AsOf(&boundary))
             .await
             .expect("記憶を読めること");
         let input = |turns_before| PromptInput {

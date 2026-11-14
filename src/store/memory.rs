@@ -41,6 +41,7 @@
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
+use super::session::RecallBoundary;
 use super::{Store, StoreError};
 use crate::domain::{
     CharacterId, Memory, MemoryCategory, MemoryContent, MemoryId, NewMemory, SessionId, Subject,
@@ -67,7 +68,8 @@ const INSERT_MEMORY_IN_SESSION: &str = "INSERT INTO memory (character_id, subjec
      SELECT ?1, ?2, ?3, ?4 \
      WHERE EXISTS (SELECT 1 FROM session WHERE session.id = ?5 AND session.character_id = ?1)";
 
-/// 有効な記憶の全件取得（ADR-0003: 全件注入）。
+/// 有効な記憶の取得（ADR-0003: 全件注入）。**`?2` が NULL なら全件、境の時刻があれば本文の想起の候補**
+/// （下の「本文の想起の境」/ ADR-0064）。
 ///
 /// **`superseded_by IS NULL` を外さないこと。** 外すと「以前はコーヒーが好きだった」が
 /// 現在の事実としてプロンプトに載り、キャラクターが矛盾したことを言い出す。
@@ -82,8 +84,36 @@ const INSERT_MEMORY_IN_SESSION: &str = "INSERT INTO memory (character_id, subjec
 /// `tests/store_memory.rs::memories_created_in_the_same_millisecond_are_ordered_by_id`。**
 /// 同着の組を作らないテストしか無かった間は、`, id DESC` にしても緑だった
 /// （14a のレビューで実測。**これは 14a が作った穴ではなく、以前からあった穴**）。
-const SELECT_ACTIVE_MEMORIES: &str = "SELECT id, subject, content, category, created_at, locked FROM memory \
-     WHERE character_id = ? AND superseded_by IS NULL ORDER BY created_at, id";
+///
+/// # 本文の想起の境（ADR-0064 / 作業単位 A-15b）
+///
+/// `?1` = キャラクターの id / `?2` = 境の時刻（[`RecallScope::AsOf`]。**全件なら NULL**）。
+///
+/// 境があるときは、`created_at` が境の時刻**以前**（`<=`。ミリ秒の同着を含める）の行に絞る。
+/// ただし**訂正で入った行**（ほかの行の後継として指されている行 / ADR-0022）は、境より新しくても素通りする
+/// （ADR-0064 §決定2 —— 訂正は利用者の操作なので、すぐ反映する）。訂正を重ねても、
+/// 最新の行は1つ前の行から指される。**列は足していない**（マイグレーションなし）。
+///
+/// 外側の表に別名 `m` を付けているのは、副問合せの側で同じ表を `earlier` として読むため。
+const SELECT_ACTIVE_MEMORIES: &str = "SELECT id, subject, content, category, created_at, locked FROM memory AS m \
+     WHERE character_id = ?1 AND superseded_by IS NULL \
+       AND (?2 IS NULL OR created_at <= ?2 \
+            OR EXISTS (SELECT 1 FROM memory AS earlier WHERE earlier.superseded_by = m.id)) \
+     ORDER BY created_at, id";
+
+/// **想起の範囲**（[`Store::recall_memories`] / ADR-0064 §決定1・§決定3 / 作業単位 A-15b）。
+///
+/// 想起の入口は1つのまま（ADR-0003）で、**呼び手がどちらかを必ず名指しする**（既定値を持たない）。
+/// 黙って全件になる・黙って絞られる、のどちらも起きない形にしてある。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallScope<'a> {
+    /// **有効な記憶の全件**。記憶を読む裏方の要求（抽出の既知の記憶と軸の候補）はこれを読む
+    /// （ADR-0064 §決定3 —— 絞るのは本文の想起だけ）。
+    Everything,
+    /// **本文の想起の候補**: 有効な記憶のうち、`created_at` が境の時刻以前のもの
+    /// （と、訂正で入ったもの）。境は `Store::recall_boundary` からしか作れない。
+    AsOf(&'a RecallBoundary),
+}
 
 impl Store {
     /// 記憶を追加し、追加した行の id を返す。
@@ -162,7 +192,9 @@ impl Store {
         Ok(MemoryId::from_row(id))
     }
 
-    /// そのキャラクターの**有効な記憶を全件**、作成順（古い順）で返す。
+    /// そのキャラクターの**有効な記憶**を、作成順（古い順）で返す。
+    /// [`RecallScope::Everything`] なら全件、[`RecallScope::AsOf`] なら本文の想起の候補
+    /// （境の時刻以前の記憶と、訂正で入った記憶 / 下の「範囲」）。
     ///
     /// **想起の入口はこの関数だけ**（ADR-0003）。件数が増えてベクトル検索へ移るときは、
     /// **この関数のシグネチャは必ず変わる**（現在のクエリ文なり埋め込みなりを引数で
@@ -185,12 +217,27 @@ impl Store {
     /// 現時点の実害は無いが、抽出の書き込み経路が入った時点で
     /// `Store::list_characters` の doc に書いた話がそのまま当てはまる
     /// （こちらは**そのキャラクターの想起が丸ごと止まる**）。
+    ///
+    /// # 範囲（ADR-0064 / 作業単位 A-15b）
+    ///
+    /// `scope` が [`RecallScope::AsOf`] なら、**本文の想起の候補**に絞る（境の時刻以前に作られた記憶と、
+    /// 訂正で入った記憶）。抽出で増えた記憶が本文に載るのを 10 往復ごとの区切りのターンにまとめ、
+    /// 先頭の system が毎ターン変わらないようにするため。**絞りは採点（`df`）の前**
+    /// （`prompt` へ渡る前の、この読み出しで掛ける）。
+    /// 裏方の要求は [`RecallScope::Everything`] で全件を読む（§決定3）。**本文の経路（`server::chat`）だけが
+    /// 境を渡す。**
     pub async fn recall_memories(
         &self,
         character_id: CharacterId,
+        scope: RecallScope<'_>,
     ) -> Result<Vec<Memory>, StoreError> {
+        let as_of = match scope {
+            RecallScope::Everything => None,
+            RecallScope::AsOf(boundary) => Some(boundary.as_stored()),
+        };
         let rows = sqlx::query(SELECT_ACTIVE_MEMORIES)
             .bind(character_id.get())
+            .bind(as_of)
             .fetch_all(&self.pool)
             .await
             .map_err(StoreError::Query)?;
@@ -202,7 +249,8 @@ impl Store {
         tracing::debug!(
             character_id = character_id.get(),
             memories = memories.len(),
-            "有効な記憶を全件読み出しました"
+            as_of = as_of.unwrap_or("全件"),
+            "有効な記憶を読み出しました"
         );
         Ok(memories)
     }
