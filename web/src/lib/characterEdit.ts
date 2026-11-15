@@ -75,6 +75,15 @@ export interface CharacterDraft {
    * **編集で元の値と同じなら送らない**（他の欄と同じ差分の約束）。
    */
   stat_drift_mode: string;
+  /**
+   * **返答の長さの目安の下限と上限**（作業単位 A-22a / ADR-0065 §決定1）。**2つで1組。**
+   *
+   * **両方空は「未設定」**（作成ではキーごと省く / 編集では元が設定済みなら `null` を送る）。
+   * **片方だけは送らない**（`readResponseLength` の `half`）。範囲（1〜9999・下限 ≤ 上限）は見ない ——
+   * サーバが理由つきで返す（尺度と同じ立場。上下限を写さない）。
+   */
+  response_length_min: string;
+  response_length_max: string;
 }
 
 /**
@@ -119,6 +128,8 @@ export function emptyDraft(): CharacterDraft {
     output_format_instruction: "",
     stat_scale: "",
     stat_drift_mode: FOLLOW_DEFAULT,
+    response_length_min: "",
+    response_length_max: "",
   };
 }
 
@@ -132,6 +143,11 @@ export function draftOf(character: CharacterView): CharacterDraft {
     output_format_instruction: character.output_format_instruction ?? "",
     stat_scale: String(character.stat_scale),
     stat_drift_mode: driftModeDraftOf(character.stat_drift_mode),
+    // **未設定は両方空。** `null` を画面へ出さない。
+    response_length_min:
+      character.response_length === null ? "" : String(character.response_length.min),
+    response_length_max:
+      character.response_length === null ? "" : String(character.response_length.max),
   };
 }
 
@@ -272,6 +288,61 @@ export const SCALE_MESSAGE =
   "尺度は整数で入力してください（使える範囲はサーバが判定します）。";
 
 /**
+ * 返答の長さの目安の読み取り結果（作業単位 A-22a）。
+ *
+ * | `kind` | 下書き |
+ * |---|---|
+ * | `unset` | 両方空（未設定） |
+ * | `value` | 両方が整数 |
+ * | `half` | 片方だけ空 —— **送らない**（サーバは片方だけの本文を 400 `invalid_body` にする） |
+ * | `invalid` | 整数でないものがある —— **送らない** |
+ */
+export type ResponseLengthDraft =
+  | { kind: "unset" }
+  | { kind: "value"; min: number; max: number }
+  | { kind: "half" }
+  | { kind: "invalid" };
+
+/**
+ * 下限と上限を読む。**範囲は見ない**（`ResponseLength::LOWEST` / `HIGHEST` を写さない）。
+ * 範囲外・下限 > 上限はサーバが理由つきで返す（`response_length_too_small` / `_too_large` / `_inverted`）。
+ */
+export function readResponseLength(min: string, max: string): ResponseLengthDraft {
+  const low = readScale(min);
+  const high = readScale(max);
+  if (low.kind === "omitted" && high.kind === "omitted") {
+    return { kind: "unset" };
+  }
+  if (low.kind === "invalid" || high.kind === "invalid") {
+    return { kind: "invalid" };
+  }
+  if (low.kind === "omitted" || high.kind === "omitted") {
+    return { kind: "half" };
+  }
+  return { kind: "value", min: low.value, max: high.value };
+}
+
+/** 目安の片方だけが入っているときの文言。**両方入れるか、両方空にするか**を言う。 */
+export const RESPONSE_LENGTH_HALF_MESSAGE =
+  "返答の長さの目安は、下限と上限の両方を入れてください（両方空にすると未設定になります）。";
+
+/** 目安が整数として読めないときの文言。**範囲を書かない**（尺度と同じ。範囲はサーバが判定する）。 */
+export const RESPONSE_LENGTH_MESSAGE =
+  "返答の長さの目安は整数で入力してください（使える範囲はサーバが判定します）。";
+
+/** 読み取りの失敗を文言にする（送れるなら `null`）。 */
+function responseLengthFailure(read: ResponseLengthDraft): string | null {
+  switch (read.kind) {
+    case "half":
+      return RESPONSE_LENGTH_HALF_MESSAGE;
+    case "invalid":
+      return RESPONSE_LENGTH_MESSAGE;
+    default:
+      return null;
+  }
+}
+
+/**
  * `POST /admin/characters` の本文を組み立てる。
  *
  * **空の欄はキーごと落とす。** 空文字を送るとサーバは「空です」で 400 にする
@@ -287,6 +358,11 @@ export function buildCreate(draft: CharacterDraft): BuiltRequest {
   const scale = readScale(draft.stat_scale);
   if (scale.kind === "invalid") {
     return { ok: false, message: SCALE_MESSAGE };
+  }
+  const length = readResponseLength(draft.response_length_min, draft.response_length_max);
+  const lengthFailure = responseLengthFailure(length);
+  if (lengthFailure !== null) {
+    return { ok: false, message: lengthFailure };
   }
 
   // **`handle` と `base_persona` は落とさない**（省略できない）。
@@ -313,6 +389,10 @@ export function buildCreate(draft: CharacterDraft): BuiltRequest {
   const driftMode = driftModeWireOf(draft.stat_drift_mode);
   if (driftMode !== null) {
     body.stat_drift_mode = driftMode;
+  }
+  // **未設定はキーごと省く**（サーバは省略を未設定と読む / 作業単位 A-22a）。
+  if (length.kind === "value") {
+    body.response_length = { min: length.min, max: length.max };
   }
   return { ok: true, kind: "create", body };
 }
@@ -345,6 +425,11 @@ export function buildUpdate(
   if (scale.kind === "invalid") {
     return { ok: false, message: SCALE_MESSAGE };
   }
+  const length = readResponseLength(draft.response_length_min, draft.response_length_max);
+  const lengthFailure = responseLengthFailure(length);
+  if (lengthFailure !== null) {
+    return { ok: false, message: lengthFailure };
+  }
 
   const body: UpdateCharacterRequest = {};
   if (draft.display_name !== original.display_name) {
@@ -376,6 +461,20 @@ export function buildUpdate(
   const driftMode = driftModeWireOf(draft.stat_drift_mode);
   if (driftMode !== original.stat_drift_mode) {
     body.stat_drift_mode = driftMode;
+  }
+
+  // **返答の長さの目安も3値**（作業単位 A-22a）。両方空にしたら「未設定に戻す」（`null`）、
+  // 元から未設定で空のままなら「変えない」（キーごと落とす）。値は元と違うときだけ載せる。
+  const stored = original.response_length;
+  if (length.kind === "unset") {
+    if (stored !== null) {
+      body.response_length = null;
+    }
+  } else if (
+    length.kind === "value" &&
+    (stored === null || stored.min !== length.min || stored.max !== length.max)
+  ) {
+    body.response_length = { min: length.min, max: length.max };
   }
 
   return { ok: true, kind: "update", body };

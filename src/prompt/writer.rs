@@ -10,7 +10,13 @@
 //! この2つ以外に本文へ届く経路が無いので、「無害化を通っていない文字列がプロンプトに
 //! 混ざる」ことが**書けなくなる**（ADR-0006 の `ValidTag` と同じ発想）。
 //!
-//! 結果として、**引用接頭辞で始まらない行は必ず開発者が書いた定数**という不変条件が立つ。
+//! > **3つ目の口 `directive`（作業単位 A-22a / ADR-0065）は、数だけを差し込める指示行。**
+//! > 断片は `DirectiveSeg` の2種 —— 定数（`&'static str`）と `KanjiNumeral`（数を漢数字にしたもの。
+//! > コンストラクタは `super::response_length::kanji_numeral` だけ）。**任意の文字列を指示行に書く口ではない**
+//! > （`literal` が `&'static str` しか取らないのは、運用者の文を指示行に混ぜないための関所）。
+//!
+//! 結果として、**引用接頭辞で始まらない行は必ず開発者が書いた定数**（と、定数に漢数字を挟んだ行）という
+//! 不変条件が立つ。
 //! 記憶やペルソナに `システム:` や `# 記憶` を仕込まれても、それは引用行の中にしか現れない。
 //!
 //! # 主張しているのは行構造だけ
@@ -29,6 +35,7 @@
 //! **`Seg` の境界で綴りが再生する**からで、これは値の側の無害化では原理的に塞げない。
 //! `Seg` を足したときも自動的に閉じるよう、判定は**組み上げの最後**に置く。
 
+use super::response_length::KanjiNumeral;
 use super::safe::{SafeText, neutralize_control_tokens};
 
 /// 信頼できない文字列の行に付ける接頭辞。
@@ -91,6 +98,17 @@ pub(super) fn quote_line(segments: &[Seg<'_>]) -> QuotedLine {
     QuotedLine(neutralize_control_tokens(&line))
 }
 
+/// **指示行**（引用しない行）を構成する断片。**定数と漢数字だけ**（作業単位 A-22a / ADR-0065）。
+///
+/// `Seg`（引用行の断片）と違って `SafeText` を持てない —— 指示行に運用者の文が混ざると、
+/// 「引用接頭辞で始まらない行は開発者が書いたもの」という不変条件が崩れる。
+pub(super) enum DirectiveSeg<'a> {
+    /// 開発者が書いた定数。
+    Lit(&'static str),
+    /// 漢数字にした数（`super::response_length::kanji_numeral` だけが作れる）。
+    Numeral(&'a KanjiNumeral),
+}
+
 /// 行を積み上げてプロンプト本文を作る。
 pub(super) struct PromptWriter {
     buf: String,
@@ -105,6 +123,25 @@ impl PromptWriter {
     /// 定数行をそのまま書く。**実行時の文字列は渡せない**（`&'static str`）。
     pub(super) fn literal(&mut self, line: &'static str) {
         self.push_line(line);
+    }
+
+    /// **数を差し込んだ指示行**を1行書く（作業単位 A-22a / ADR-0065）。引用接頭辞は付けない。
+    ///
+    /// 断片は定数と漢数字だけ（`DirectiveSeg`）。**制御トークンの無害化は掛けない** —— 掛ける相手
+    /// （`SafeText`）を持てず、漢数字は ASCII の形（`[`…`]` / `<`…`>` の中身）を作れないため。
+    /// 定数に改行が混じっても1行に潰す（`quote_line` と同じく、定数側の事故を型の外で吸収する）。
+    pub(super) fn directive(&mut self, segments: &[DirectiveSeg<'_>]) {
+        let mut line = String::new();
+        for segment in segments {
+            match segment {
+                DirectiveSeg::Lit(text) => line.push_str(text),
+                DirectiveSeg::Numeral(numeral) => line.push_str(numeral.as_str()),
+            }
+        }
+        if line.contains('\n') {
+            line = line.replace('\n', " ");
+        }
+        self.push_line(&line);
     }
 
     /// 空行を1つ入れる（節の区切り）。
@@ -153,6 +190,7 @@ impl PromptWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt::response_length::kanji_numeral;
     use crate::prompt::safe::{
         contains_control_token_shape, non_alphanumeric_shape_body_characters,
     };
@@ -229,6 +267,32 @@ mod tests {
         let mut writer = PromptWriter::new();
         writer.quoted_block(&safe("   "));
         assert_eq!(writer.finish(), "");
+    }
+
+    /// **指示行は接頭辞を付けずに、定数と漢数字をつないだ1行になる**（作業単位 A-22a）。
+    #[test]
+    fn a_directive_joins_constants_and_numerals_without_a_prefix() {
+        let low = kanji_numeral(200);
+        let high = kanji_numeral(1200);
+        let mut writer = PromptWriter::new();
+        writer.literal("前の行");
+        writer.directive(&[
+            DirectiveSeg::Lit("目安は"),
+            DirectiveSeg::Numeral(&low),
+            DirectiveSeg::Lit("〜"),
+            DirectiveSeg::Numeral(&high),
+            DirectiveSeg::Lit("字。"),
+        ]);
+
+        assert_eq!(writer.finish(), "前の行\n目安は二百〜千二百字。");
+    }
+
+    /// 定数側に改行が混じっても指示行は1行に潰れる。
+    #[test]
+    fn a_directive_flattens_newlines_from_literals() {
+        let mut writer = PromptWriter::new();
+        writer.directive(&[DirectiveSeg::Lit("a\nb")]);
+        assert_eq!(writer.finish(), "a b");
     }
 
     /// 定数行・空行・引用行が順に並ぶ。末尾の改行は落ちる。

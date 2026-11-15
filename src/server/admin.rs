@@ -125,12 +125,12 @@ use crate::domain::{
     AxisTrialFailure, Character, CharacterAttribute, CharacterColumn, CharacterEntry,
     CharacterUpdate, DisplayName, DriftDelta, DriftModeSource, FieldUpdate, Handle, Memory,
     MemoryCategory, MemoryColumn, MemoryContent, MemoryEntry, MemoryId, Message, MessageId,
-    NewMemory, OutputFormat, Persona, ResolvedDriftMode, Role, StatAlloc, StatAxis, StatDriftMode,
-    StatScale, Subject, SupersededMemory, UnreadableCharacter, UnreadableMemory,
+    NewMemory, OutputFormat, Persona, ResolvedDriftMode, ResponseLength, Role, StatAlloc, StatAxis,
+    StatDriftMode, StatScale, Subject, SupersededMemory, UnreadableCharacter, UnreadableMemory,
 };
 use crate::store::{
-    AttributeRevision, AxisCandidate, DriftVoteRecord, DriftVoteTally, MessagePage, SessionSummary,
-    StoreError, StoredDriftCharge,
+    AttributeRevision, AxisCandidate, CharacterSettings, DriftVoteRecord, DriftVoteTally,
+    MessagePage, SessionSummary, StoreError, StoredDriftCharge,
 };
 
 /// 本文を読めなかったときにログへ残す入口のラベル（**応答には載らない**）。
@@ -184,6 +184,32 @@ pub(super) struct CreateCharacterRequest {
     #[serde(default)]
     #[schema(schema_with = nullable_drift_mode_schema)]
     stat_drift_mode: Option<String>,
+    /// **返答の長さの目安**（[ADR-0065](../../docs/adr/0065-the-response-length-target-is-a-character-field.md) §決定1）。
+    ///
+    /// **省略・`null` は未設定**（プロンプトは1バイトも変わらない）。値は下限と上限の1組で、
+    /// `ResponseLength::parse` を通す（範囲外・逆転は 400。片方だけは本文として読めず `invalid_body`）。
+    #[serde(default)]
+    response_length: Option<ResponseLengthRequest>,
+}
+
+/// **返答の長さの目安の要求の形**（下限と上限の字数 / ADR-0065 §決定1）。作成と更新で共有する。
+///
+/// **2つとも必須**（片方だけの本文は `invalid_body`）。負の数・整数でない値も `u32` に読めず `invalid_body`。
+/// 範囲（1 ≤ 下限 ≤ 上限 ≤ 9999）は `ResponseLength::parse` が見る（400 の理由つき）。
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ResponseLengthRequest {
+    /// 下限の字数。
+    min: u32,
+    /// 上限の字数。
+    max: u32,
+}
+
+impl ResponseLengthRequest {
+    /// 検証済みの型にする（範囲外・逆転は `ResponseLengthError` → 400）。
+    fn parse(&self) -> Result<ResponseLength, ApiError> {
+        Ok(ResponseLength::parse(self.min, self.max)?)
+    }
 }
 
 /// キャラクター更新の要求（**部分更新** / ADR-0016）。
@@ -279,20 +305,34 @@ pub(super) struct UpdateCharacterRequest {
     /// `DELETE` で完全に消せる（会話があっても）。**作成（`POST`）では受けない**（作るときは常にしまっていない）。
     #[serde(default)]
     archived: Option<bool>,
+    /// **返答の長さの目安**（ADR-0065 §決定1 / 作業単位 A-22a）。**形式指示と同じ3値。**
+    ///
+    /// | JSON | 意味 |
+    /// |---|---|
+    /// | キーごと省略 | 変えない |
+    /// | `{"min": …, "max": …}` | その1組に置き換える（**次のターンから効く**） |
+    /// | `null` | **未設定に戻す**（プロンプトから行が消える） |
+    ///
+    /// 範囲外・逆転は 400（`ResponseLength::parse`）、片方だけは `invalid_body`。
+    #[serde(default, deserialize_with = "nullable_field_update")]
+    #[schema(value_type = Option<ResponseLengthRequest>)]
+    response_length: FieldUpdate<ResponseLengthRequest>,
 }
 
-/// NULL になりうる列の3値を読む（`null` = 消す / 文字列 = 設定する）。
+/// NULL になりうる列の3値を読む（`null` = 消す / 値 = 設定する）。
 ///
-/// **形式指示と変容の走らせ方の2列が使う**（どちらも同じ約束 / 作業単位 A-8 で共有した）。
+/// **形式指示・変容の走らせ方・返答の長さの目安の3つが使う**（どれも同じ約束 / 作業単位 A-8 で共有し、
+/// A-22a で値の型を総称にした）。
 ///
 /// **キーが無い場合はこの関数が呼ばれず、`#[serde(default)]` の `Keep` になる。**
 /// そこが「変えない」と「消す」を分ける仕掛けそのもの
 /// （`Option<String>` を直に受けると `null` と欠落が同じ `None` に潰れる）。
-fn nullable_field_update<'de, D>(deserializer: D) -> Result<FieldUpdate<String>, D::Error>
+fn nullable_field_update<'de, D, T>(deserializer: D) -> Result<FieldUpdate<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
 {
-    Ok(match Option::<String>::deserialize(deserializer)? {
+    Ok(match Option::<T>::deserialize(deserializer)? {
         Some(value) => FieldUpdate::Set(value),
         None => FieldUpdate::Clear,
     })
@@ -1020,6 +1060,9 @@ pub(super) struct CharacterView {
     stat_drift_mode: Option<&'static str>,
     /// **見いだす枠の数**（ADR-0046 §決定1）。**既定の 0 でも省かない**（`stat_scale` と同じ理由）。
     axis_discovery_slots: u32,
+    /// **返答の長さの目安**（ADR-0065 §決定1 / 作業単位 A-22a）。**未設定は `null`**（キーごと落とさない）。
+    #[schema(required = true)]
+    response_length: Option<ResponseLengthView>,
     created_at: DateTime<Utc>,
     /// **しまった時刻**（ADR-0049 §決定1 / 作業単位 A-10）。**しまっていなければ `null`**（キーごと落とさない）。
     ///
@@ -1042,8 +1085,27 @@ impl From<Character> for CharacterView {
             stat_scale: character.stat_scale.get(),
             stat_drift_mode: character.stat_drift_mode.map(StatDriftMode::label),
             axis_discovery_slots: character.axis_discovery_slots.get(),
+            response_length: character.response_length.map(ResponseLengthView::from),
             created_at: character.created_at,
             archived_at: character.archived_at,
+        }
+    }
+}
+
+/// **返答の長さの目安の応答の形**（下限と上限の字数 / ADR-0065 §決定1）。
+#[derive(Debug, Serialize, ToSchema)]
+pub(super) struct ResponseLengthView {
+    /// 下限の字数。
+    min: u32,
+    /// 上限の字数。
+    max: u32,
+}
+
+impl From<ResponseLength> for ResponseLengthView {
+    fn from(length: ResponseLength) -> Self {
+        Self {
+            min: u32::from(length.min()),
+            max: u32::from(length.max()),
         }
     }
 }
@@ -1648,16 +1710,25 @@ pub(super) async fn create_character(
         .as_deref()
         .map(StatDriftMode::parse)
         .transpose()?;
+    // 返答の長さの目安（ADR-0065 §決定1）。**省略・`null` は未設定のまま**。範囲外・逆転はここで 400。
+    let response_length = request
+        .response_length
+        .as_ref()
+        .map(ResponseLengthRequest::parse)
+        .transpose()?;
 
     state
         .store()
-        .create_character_with_drift_mode(
+        .create_character_with_settings(
             &handle,
             &display_name,
             &base_persona,
             output_format.as_ref(),
             stat_scale,
-            stat_drift_mode,
+            CharacterSettings {
+                stat_drift_mode,
+                response_length,
+            },
         )
         .await
         .map_err(|err| classify_create(&err))?;
@@ -3368,6 +3439,12 @@ fn character_update(request: UpdateCharacterRequest) -> Result<CharacterUpdate, 
         // **`None` を `false` に潰さない**（`None` は「変えない」。潰すと、表示名だけを変える
         // 更新のたびに、しまったキャラクターが黙って一覧へ戻ってくる）。
         archived: request.archived,
+        // **`Keep` を `Clear` に潰さない**（形式指示と同じ / ADR-0065 §決定1）。
+        response_length: match &request.response_length {
+            FieldUpdate::Keep => FieldUpdate::Keep,
+            FieldUpdate::Set(raw) => FieldUpdate::Set(raw.parse()?),
+            FieldUpdate::Clear => FieldUpdate::Clear,
+        },
     })
 }
 
@@ -3823,7 +3900,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::domain::CharacterId;
+    use crate::domain::{CharacterId, ResponseLengthError};
 
     fn axis(raw: &str) -> StatAxis {
         StatAxis::parse(raw).expect("テストで使う軸名は正当であること")
@@ -3864,6 +3941,8 @@ mod tests {
             stat_drift_mode: None,
             // **既定（0）と違う値**（ADR-0046）。既定にすると、捨てて既定を書く実装と区別が付かない。
             axis_discovery_slots: 3,
+            // **未設定も `null` でキーごと残す**（ADR-0065 / 作業単位 A-22a）。
+            response_length: None,
             created_at: created,
             // **しまっていなくても `null` でキーごと残す**（ADR-0049 / 作業単位 A-10）。
             archived_at: None,
@@ -3880,10 +3959,99 @@ mod tests {
                 "stat_scale": 7,
                 "stat_drift_mode": null,
                 "axis_discovery_slots": 3,
+                "response_length": null,
                 "created_at": "2026-08-14T01:02:03Z",
                 "archived_at": null,
             })
         );
+    }
+
+    /// **設定した目安は `{"min", "max"}` で出る**（下限と上限を取り違えない / ADR-0065）。
+    #[test]
+    fn a_character_view_names_the_response_length_it_was_written_with() {
+        let length = ResponseLength::parse(200, 400).expect("正当な目安であること");
+        assert_eq!(
+            serde_json::to_value(ResponseLengthView::from(length)).expect("JSON にできること"),
+            json!({"min": 200, "max": 400})
+        );
+    }
+
+    /// **返答の長さの目安の更新は3値**（省く＝変えない / `null`＝未設定に戻す / 値＝置き換える）。
+    ///
+    /// **`null` を「変えない」に潰す実装**（`Option` を直に受ける形）はここで赤になる。
+    #[test]
+    fn the_response_length_update_has_three_states() {
+        let keep = update_from(json!({"display_name": "葵"}));
+        assert_eq!(keep.response_length, FieldUpdate::Keep, "省けば変えない");
+
+        let set = update_from(json!({"response_length": {"min": 200, "max": 400}}));
+        assert_eq!(
+            set.response_length,
+            FieldUpdate::Set(ResponseLength::parse(200, 400).expect("正当な目安であること"))
+        );
+
+        let clear = update_from(json!({"response_length": null}));
+        assert_eq!(
+            clear.response_length,
+            FieldUpdate::Clear,
+            "null は未設定に戻す"
+        );
+    }
+
+    /// **範囲外・逆転は理由つきの 400、片方だけ・負の数・知らない鍵は本文の拒否**（作成と更新の両方）。
+    #[test]
+    fn a_response_length_out_of_range_is_refused_with_its_own_reason() {
+        for (raw, expected) in [
+            (
+                json!({"min": 0, "max": 400}),
+                ApiError::invalid_response_length(ResponseLengthError::TooSmall),
+            ),
+            (
+                json!({"min": 200, "max": 10_000}),
+                ApiError::invalid_response_length(ResponseLengthError::TooLarge),
+            ),
+            (
+                json!({"min": 401, "max": 400}),
+                ApiError::invalid_response_length(ResponseLengthError::Inverted),
+            ),
+        ] {
+            let update = serde_json::from_value::<UpdateCharacterRequest>(
+                json!({"response_length": raw.clone()}),
+            )
+            .expect("要求としては読めること");
+            assert_eq!(character_update(update).err(), Some(expected), "{raw}");
+
+            let create = serde_json::from_value::<CreateCharacterRequest>(json!({
+                "handle": "aoi",
+                "base_persona": "ペルソナ本文",
+                "response_length": raw.clone(),
+            }))
+            .expect("要求としては読めること");
+            assert_eq!(
+                create
+                    .response_length
+                    .as_ref()
+                    .map(ResponseLengthRequest::parse),
+                Some(Err(expected)),
+                "{raw}"
+            );
+            assert_eq!(expected.status(), StatusCode::BAD_REQUEST);
+        }
+
+        for raw in [
+            json!({"min": 200}),
+            json!({"max": 400}),
+            json!({"min": -1, "max": 400}),
+            json!({"min": 200, "max": 400, "unit": "字"}),
+            json!({"min": 2.5, "max": 400}),
+            json!(400),
+        ] {
+            assert!(
+                serde_json::from_value::<UpdateCharacterRequest>(json!({"response_length": raw}))
+                    .is_err(),
+                "本文として読めないこと: {raw}"
+            );
+        }
     }
 
     /// **表示名は省略できる。省略時は識別子の値で埋まる**（ADR-0011 / 0004a）。
@@ -4177,6 +4345,7 @@ mod tests {
                 stat_scale: StatScale::parse(7).expect("正当な尺度であること"),
                 stat_drift_mode: mode,
                 axis_discovery_slots: AxisDiscoverySlots::NONE,
+                response_length: None,
                 created_at: created,
                 archived_at: None,
             });

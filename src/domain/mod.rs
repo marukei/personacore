@@ -24,6 +24,7 @@ mod drift_ledger;
 mod history_window;
 mod memory;
 mod message;
+mod response_length;
 mod runaway;
 mod selector;
 mod session;
@@ -79,6 +80,7 @@ pub use memory::{
     MemoryId, NewMemory, Subject, SupersededMemory, UnreadableMemory,
 };
 pub use message::{Message, MessageId, NewMessage, Role};
+pub use response_length::{ResponseLength, ResponseLengthError};
 pub use runaway::{
     FoldedRunaway, RUNAWAY_CUT_CHARS, RUNAWAY_MAX_PERIOD, RUNAWAY_MIN_CHARS, RUNAWAY_MIN_COPIES,
     RunawayCounter, RunawayRun, fold_runaway_repetition,

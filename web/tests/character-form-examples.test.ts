@@ -47,6 +47,7 @@ const MIO: CharacterView = {
   stat_scale: 5,
   stat_drift_mode: null,
   axis_discovery_slots: 0,
+  response_length: null,
   archived_at: null,
   created_at: "2026-08-27T00:00:00Z",
 };

@@ -71,6 +71,13 @@ export interface CharacterView {
    * `CharacterView` を丸ごと突き合わせるので、欄だけを写してある。
    */
   axis_discovery_slots: number;
+  /**
+   * **返答の長さの目安**（下限と上限の字数 / ADR-0065 §決定1 / 作業単位 A-22a）。**未設定は `null`**
+   * （キーごと落とさない、という Rust 側の約束）。
+   *
+   * **読み手は編集の画面**（`characterEdit.ts` の `draftOf` が下書きの初期値にする）。
+   */
+  response_length: ResponseLengthView | null;
   /** RFC 3339。 */
   created_at: string;
   /**
@@ -80,6 +87,21 @@ export interface CharacterView {
    * **読み手は `characterArchive.ts`**（上の一覧としまった一覧の出し分け・会話の相手の選択肢）。
    */
   archived_at: string | null;
+}
+
+/** 返答の長さの目安（`admin.rs` の `ResponseLengthView`）。**両方そろって返る**（片方だけは無い）。 */
+export interface ResponseLengthView {
+  min: number;
+  max: number;
+}
+
+/**
+ * 返答の長さの目安の要求（`admin.rs` の `ResponseLengthRequest`）。**両方とも必須**
+ * （片方だけはサーバが本文として読まず 400 `invalid_body`。画面は片方だけなら送らない / `characterEdit.ts`）。
+ */
+export interface ResponseLengthRequest {
+  min: number;
+  max: number;
 }
 
 /**
@@ -312,6 +334,11 @@ export interface CreateCharacterRequest {
    * **送り手は `CharacterForm.svelte` の新規作成**（「既定に従う」なら省く / 作業単位 D-15）。
    */
   stat_drift_mode?: string;
+  /**
+   * 返答の長さの目安（ADR-0065 / 作業単位 A-22a）。**省けば未設定**。
+   * **送り手は `CharacterForm.svelte` の新規作成**（下限・上限の両方を入れたときだけ載せる）。
+   */
+  response_length?: ResponseLengthRequest;
 }
 
 /**
@@ -359,6 +386,12 @@ export interface UpdateCharacterRequest {
    * **送り手は `CharacterList.svelte`** の「しまう」と、しまった一覧の「戻す」。
    */
   archived?: boolean;
+  /**
+   * 返答の長さの目安（ADR-0065 / 作業単位 A-22a）。**形式指示と同じ3値** ——
+   * 省けば変えない、`null` で未設定へ戻す、`{ min, max }` で置き換える。
+   * **送り手は `CharacterForm.svelte` の編集**（触ったときだけ）。
+   */
+  response_length?: ResponseLengthRequest | null;
 }
 
 /**

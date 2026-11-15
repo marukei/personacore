@@ -201,7 +201,7 @@ itself. It is served with `--no-ui` too, because it is part of the API, not of t
 carries the API version:
 
 ```
-x-personacore-api-version: 1.10
+x-personacore-api-version: 1.11
 ```
 
 That includes errors, 404 and 405 responses, the event stream and `/openapi.json`.
@@ -373,7 +373,7 @@ documentation for where each feature is switched off.
 |---|---|
 | `GET /admin/characters` | List characters, archived ones included (rows that cannot be read are listed separately under `unreadable`) |
 | `POST /admin/characters` | Create a character (201) |
-| `PATCH /admin/characters/{handle}` | Change some fields, or archive or restore the character (`archived`). Fields you omit are unchanged; `null` clears `output_format_instruction` and `stat_drift_mode` and leaves the other fields unchanged |
+| `PATCH /admin/characters/{handle}` | Change some fields, or archive or restore the character (`archived`). Fields you omit are unchanged; `null` clears `output_format_instruction`, `stat_drift_mode` and `response_length` and leaves the other fields unchanged |
 | `DELETE /admin/characters/{handle}` | Delete a character for good (204). Allowed when it has no conversation or when it is archived; otherwise refused with 409 |
 
 The **handle** (`handle`) is the identifier used in URLs and in `model`. It is fixed at
@@ -387,6 +387,22 @@ There is no `PUT` on a character (405): replacing a character wholesale is not o
 All `/admin` request bodies reject unknown fields with 400, so a misspelled field name
 is reported instead of silently ignored. (`/v1/chat/completions` is the opposite: it
 accepts unknown fields, as OpenAI clients expect.)
+
+### Response length target
+
+`response_length` gives a character a target length for its replies, as a lower and an
+upper number of characters: `{"min": 200, "max": 400}`. Both numbers are required
+and must be whole numbers; a missing number, a negative or fractional one, or an unknown key
+is refused with 400 `invalid_body`. Within that, 1 ≤ `min` ≤ `max` ≤ 9999; otherwise the
+request is refused with 400 (`response_length_too_small`, `response_length_too_large` or
+`response_length_inverted`).
+`null` (the default) means no target. When a target is set, one line asking for replies of
+about that length is added at the end of the chat prompt; with no target the prompt is
+unchanged. A change takes effect from the next turn.
+
+It is a target, not a limit: replies often run past the upper number, and nothing is cut.
+It also does not bring back replies that have already become short in an ongoing
+conversation; start a new conversation for that. The line is written in Japanese.
 
 ### Archiving and deleting characters
 
@@ -896,7 +912,7 @@ header.
 
 ## Versioning and compatibility
 
-The current API version is `1.10`.
+The current API version is `1.11`.
 
 The API version is kept separately from the application version and is stated in the
 OpenAPI document (`info.version`) and in the `X-Personacore-Api-Version` header. The
@@ -932,6 +948,15 @@ segment (such as `v1`) into the paths under `/admin`.
   working; requests that reached personacore some other way (for example through another
   host name) may start to be refused within `1.x`. The `Host` / `Origin` checks were added
   this way.
+
+Changes in `1.11` (from `1.10`): a character has a new field, `response_length` (an object
+`{"min": …, "max": …}` or `null`), in responses, and `POST /admin/characters` and
+`PATCH /admin/characters/{handle}` accept it as an optional field (see
+[Response length target](#response-length-target)). Leaving it out of a `PATCH` keeps the
+current value, and leaving it out of a `POST` creates the character with no target. `invalid_columns` of an unreadable character can name the new values
+`response_length_min` and `response_length_max`, and a value out of range is refused with
+400 and the new `error.code` values `response_length_too_small`, `response_length_too_large`
+and `response_length_inverted`.
 
 Changes in `1.10` (from `1.9`): no route, field or `enum` value was added or removed.
 A streamed reply that runs away is now cut by personacore: the stream ends with

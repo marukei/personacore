@@ -42,6 +42,7 @@ const AOI: CharacterView = {
   stat_scale: 5,
   stat_drift_mode: null,
   axis_discovery_slots: 0,
+  response_length: null,
   archived_at: null,
   created_at: "2026-08-27T00:00:00Z",
 };
@@ -56,6 +57,7 @@ const MIO: CharacterView = {
   stat_scale: 7,
   stat_drift_mode: null,
   axis_discovery_slots: 0,
+  response_length: null,
   archived_at: null,
   created_at: "2026-08-27T00:10:00Z",
 };
@@ -70,6 +72,7 @@ const NAR: CharacterView = {
   stat_scale: 3,
   stat_drift_mode: null,
   axis_discovery_slots: 0,
+  response_length: null,
   archived_at: null,
   created_at: "2026-08-27T00:20:00Z",
 };

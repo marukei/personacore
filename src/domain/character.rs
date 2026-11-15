@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 
 use super::axis_candidate::AxisDiscoverySlots;
 use super::drift::StatDriftMode;
+use super::response_length::ResponseLength;
 use super::stat::StatScale;
 use super::text::{contains_control_or_line_break, is_effectively_blank, trim_blank};
 
@@ -48,6 +49,12 @@ pub struct Character {
     /// **既定 0（見いださない）。** 0 のキャラクターには軸の候補が1件も作れない。
     /// **プロンプトには載らない**（候補を出すかどうかを決めるだけ）。
     pub axis_discovery_slots: AxisDiscoverySlots,
+    /// **返答の長さの目安**（下限と上限の字数 /
+    /// [ADR-0065](../../docs/adr/0065-the-response-length-target-is-a-character-field.md) §決定1）。
+    ///
+    /// **`None` は「未設定」。** 未設定のキャラクターのプロンプトは1バイトも変わらない。
+    /// 設定されていれば、`prompt` が本文の system の最後に指示行を1行載せる（裏方の依頼には載せない）。
+    pub response_length: Option<ResponseLength>,
     /// 作成日時（UTC）。
     pub created_at: DateTime<Utc>,
     /// **しまった時刻**（[ADR-0049](../../docs/adr/0049-deleting-characters-and-conversations.md) §決定1）。
@@ -185,6 +192,15 @@ pub enum CharacterColumn {
     /// **読めない値を「しまっていない」に落とさない** —— 落とすと、しまったはずのキャラクターが
     /// 黙って `GET /v1/models` に戻ってくる。読めない行として指し示す（直し方は `PATCH` で戻す）。
     ArchivedAt,
+    /// **返答の長さの目安の下限**（ADR-0065 §決定1）。**NULL は「未設定」であって不正ではない。**
+    ///
+    /// **下限と上限は1組で読む**（`ResponseLength::parse`）。片方だけ・範囲の外・下限 > 上限のどれでも、
+    /// **1組が読めない＝2列とも指し示す**（[`Self::ResponseLengthMax`] と必ず一緒に並ぶ）。
+    /// 直すときは `PATCH` の `response_length` が2列を同時に書く（`null` で未設定に戻すか、1組を入れ直す）。
+    /// スキーマに CHECK があるので普通は壊れないが、`StatScale` と同じ理由（CHECK は外せる）で指し示せるようにしてある。
+    ResponseLengthMin,
+    /// **返答の長さの目安の上限**（ADR-0065 §決定1）。扱いは [`Self::ResponseLengthMin`] と同じ（1組で指し示す）。
+    ResponseLengthMax,
 }
 
 impl CharacterColumn {
@@ -192,7 +208,7 @@ impl CharacterColumn {
     ///
     /// 数え漏らしは `every_variant_is_listed_in_all` が止める
     /// （variant を足すとあのテストの `match` がコンパイルできなくなる）。
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::Handle,
         Self::DisplayName,
         Self::BasePersona,
@@ -201,6 +217,8 @@ impl CharacterColumn {
         Self::StatDriftMode,
         Self::AxisDiscoverySlots,
         Self::ArchivedAt,
+        Self::ResponseLengthMin,
+        Self::ResponseLengthMax,
     ];
 
     /// DB の列名。ログと API 応答に出す。
@@ -218,6 +236,8 @@ impl CharacterColumn {
             Self::StatDriftMode => "stat_drift_mode",
             Self::AxisDiscoverySlots => "axis_discovery_slots",
             Self::ArchivedAt => "archived_at",
+            Self::ResponseLengthMin => "response_length_min",
+            Self::ResponseLengthMax => "response_length_max",
         }
     }
 }
@@ -282,6 +302,9 @@ pub struct CharacterUpdate {
     /// **時刻そのものは渡さない。** 書くのは `store` の SQL（`strftime`）で、
     /// 呼び出し側が任意の時刻を書ける口は作らない。
     pub archived: Option<bool>,
+    /// **返答の長さの目安**（ADR-0065 §決定1）。**NULL になりうる列なので3値**
+    /// （`Clear` は「未設定」へ戻す。`Set` は下限と上限の2列を同時に書く —— 片方だけを書く口は無い）。
+    pub response_length: FieldUpdate<ResponseLength>,
 }
 
 /// **NULL になりうる列の部分更新**を表す3値。
@@ -2450,7 +2473,9 @@ mod tests {
             | CharacterColumn::StatScale
             | CharacterColumn::StatDriftMode
             | CharacterColumn::AxisDiscoverySlots
-            | CharacterColumn::ArchivedAt => CharacterColumn::ALL.contains(&column),
+            | CharacterColumn::ArchivedAt
+            | CharacterColumn::ResponseLengthMin
+            | CharacterColumn::ResponseLengthMax => CharacterColumn::ALL.contains(&column),
         };
 
         for column in CharacterColumn::ALL {
@@ -2458,7 +2483,7 @@ mod tests {
         }
         assert_eq!(
             CharacterColumn::ALL.len(),
-            8,
+            10,
             "列を足したなら ALL の要素数も増えていること"
         );
     }

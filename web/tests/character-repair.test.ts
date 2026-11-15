@@ -211,6 +211,7 @@ describe("全部の欄を送る（差分ではない）", () => {
       stat_scale: 7,
       stat_drift_mode: null,
       axis_discovery_slots: 0,
+      response_length: null,
       archived_at: null,
       created_at: "2026-08-27T00:00:00Z",
     };
@@ -225,6 +226,9 @@ describe("全部の欄を送る（差分ではない）", () => {
     const editDraft: CharacterDraft = {
       handle: original.handle,
       ...repairDraft,
+      // **元は未設定**（`null`）＝両方空。差分モードでは変えていない扱い（作業単位 A-22a）。
+      response_length_min: "",
+      response_length_max: "",
     };
 
     const diff = buildUpdate(original, editDraft);

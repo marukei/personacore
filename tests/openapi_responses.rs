@@ -464,6 +464,8 @@ async fn the_character_endpoints_answer_as_documented() {
             "base_persona": "ペルソナ本文",
             "output_format_instruction": "「」で台詞を書く",
             "stat_drift_mode": "shadow",
+            // **値のある形を一度通す**（作業単位 A-22a）。下の `PATCH` が `null` の形を通す。
+            "response_length": {"min": 200, "max": 400},
         })),
         StatusCode::CREATED,
     )
@@ -479,6 +481,7 @@ async fn the_character_endpoints_answer_as_documented() {
             "output_format_instruction": null,
             "stat_drift_mode": null,
             "axis_discovery_slots": 2,
+            "response_length": null,
         })),
         StatusCode::OK,
     )
@@ -1340,6 +1343,7 @@ async fn the_checker_refuses_planted_responses() {
         "stat_scale": 5,
         "stat_drift_mode": "shadow",
         "axis_discovery_slots": 0,
+        "response_length": null,
         "created_at": "2026-09-30T00:00:00Z",
         "archived_at": null,
     });

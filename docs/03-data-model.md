@@ -21,6 +21,7 @@ SQLite 単一ファイル。将来 `sqlite-vec` でベクトル検索を同一DB
 | `axis_discovery_slots` | **見いだす枠の数 `m`**（0〜4・**既定 0 ＝見いださない**。[ADR-0046](adr/0046-drift-proposes-new-axes.md) §決定1）。0 のキャラクターには軸の候補が1件も作れない。**プロンプトには載らない**。書くのは `PATCH` だけ（範囲外は 400） |
 | `created_at` | |
 | `archived_at` | **しまった時刻。NULL はしまっていない**（[ADR-0049](adr/0049-deleting-characters-and-conversations.md) §決定1）。しまったキャラクターは `GET /v1/models` と画面の一覧に出ず、chat は 409。**中身は変えない**ので戻せる。**しまってあれば `DELETE` で会話ごと消える**（カスケード）。書くのは `PATCH` の `archived` だけ。**プロンプトには載らない** |
+| `response_length_min` / `response_length_max` | **返答の長さの目安**（下限と上限の字数。[ADR-0065](adr/0065-the-response-length-target-is-a-character-field.md) §決定1）。**2列で1組**: 両方 NULL（未設定）か、両方が整数で 1 ≤ 下限 ≤ 上限 ≤ 9999（CHECK）。未設定ならプロンプトは1バイトも変わらない。設定されていれば本文の system の最後に指示行を1行載せる（`ja` の束の文に漢数字を差し込む / `src/prompt/response_length.rs`）。**削れない枠に載る**ので上限を持つ（最悪ケースの見張り番は `every_field_at_its_limit_still_fits_the_default_budget`）。1組が読めなければ一覧は2列とも指し示す |
 
 > **`stat_scale` はまだ `stat_alloc.value` を縛っていない**（作業単位 0011a-1 の時点）。
 > 列は往復するが、**尺度を超える値をいまも保存できる。**
@@ -378,6 +379,8 @@ SQL 走査テストの許可リストも緩めることになる。
   （直近のターンの `included` / `dropped`。**DB には持たない** —— 起動し直すと `null`）。画面はそれを読んで「載っていない取り決めがある」と言う。
 * 見張り番は `prompt` の `agreements_at_their_limit_never_exhaust_the_default_budget_and_the_drop_is_reported`（既定の予算）と
   `agreements_at_their_limit_all_fit_a_sufficient_budget`（16384）。**`every_field_at_its_limit_still_fits_the_default_budget` は削れない枠の見張り番のままで、取り決めは入らない。**
+  前の1本は、返答の長さの目安を未設定にして回す（目安も最悪ケースにすると取り決めが1件も載らず、古い側から落ちる順が観測できない）。
+  目安も最悪ケースにした腕は `agreements_at_their_limit_with_the_worst_response_length_are_all_dropped_and_reported` で、全部落ちてその件数が報告されることを見る（[ADR-0065](adr/0065-the-response-length-target-is-a-character-field.md) §結果）。
 
 #### 1行壊れたときに何が止まるか
 
@@ -739,6 +742,10 @@ LoRA を導入する前でも、固定部を持つだけで一貫性は相当改
 > **プロンプトに載らない**（載るのは `display_name`）ので、削れない枠を食わない。
 > 上限は依然として必要だが、それは `model` フィールドと UI のためであって予算のためではない。
 > **見張りテストの想定値に `name` を数え直さないこと。**
+
+> **返答の長さの目安（`character.response_length_min` / `_max`）はこの表に載せない。** 自由文ではなく数の1組で、
+> 載る行は定数の文に漢数字を差し込んだもの（[ADR-0065](adr/0065-the-response-length-target-is-a-character-field.md)）。
+> ただし削れない枠に載るので、見張り番の最悪ケースには入れてある（下限・上限とも 9999 = 漢数字で最長）。
 
 **件数に上限が無いもの**（軸・記憶・会話履歴・今回の発言）は、この規則の対象外。
 

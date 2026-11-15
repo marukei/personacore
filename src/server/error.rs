@@ -35,7 +35,8 @@ use utoipa::ToSchema;
 use crate::domain::{
     AgreementContentError, AttributeKeyError, AttributeSetError, AttributeValueError,
     AxisDiscoverySlotsError, AxisError, CategoryError, ContentError, DisplayNameError, HandleError,
-    OutputFormatError, PersonaError, ScaleError, SelectorError, StatDriftModeError, ValueError,
+    OutputFormatError, PersonaError, ResponseLengthError, ScaleError, SelectorError,
+    StatDriftModeError, ValueError,
 };
 
 /// エラー応答の本文。
@@ -354,6 +355,35 @@ impl ApiError {
             AxisDiscoverySlotsError::TooLarge => (
                 "軸を見いだす枠の数が大きすぎます",
                 "axis_discovery_slots_too_large",
+            ),
+        };
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message,
+            kind: "invalid_request_error",
+            code: Some(code),
+        }
+    }
+
+    /// **返答の長さの目安が受け付けられない**（ADR-0065 §決定1 / 作業単位 A-22a）。**理由ごとに別の定数を選ぶ。**
+    ///
+    /// **400**（キャラクターの他の欄の検証と同じ）。上下限そのものは載せない（`Display` を定数に保つ絶対制約）。
+    /// 「小さすぎる」「大きすぎる」「逆転」を潰すと、**送り直しの向き**が応答から読めない。
+    /// 片方だけ・負の数・整数でない値はここに来ない（本文として読めず `invalid_body`）。
+    #[must_use]
+    pub const fn invalid_response_length(reason: ResponseLengthError) -> Self {
+        let (message, code) = match reason {
+            ResponseLengthError::TooSmall => (
+                "返答の長さの目安が小さすぎます",
+                "response_length_too_small",
+            ),
+            ResponseLengthError::TooLarge => (
+                "返答の長さの目安が大きすぎます",
+                "response_length_too_large",
+            ),
+            ResponseLengthError::Inverted => (
+                "返答の長さの目安の下限が上限を超えています",
+                "response_length_inverted",
             ),
         };
         Self {
@@ -1451,6 +1481,12 @@ impl From<AxisDiscoverySlotsError> for ApiError {
     }
 }
 
+impl From<ResponseLengthError> for ApiError {
+    fn from(reason: ResponseLengthError) -> Self {
+        Self::invalid_response_length(reason)
+    }
+}
+
 impl From<StatDriftModeError> for ApiError {
     fn from(reason: StatDriftModeError) -> Self {
         match reason {
@@ -1615,6 +1651,10 @@ pub fn error_catalog() -> Vec<(&'static str, ErrorShape)> {
         every!(AxisDiscoverySlotsError: TooLarge)
     );
     entry!(invalid_stat_drift_mode);
+    entry!(
+        invalid_response_length,
+        every!(ResponseLengthError: TooSmall, TooLarge, Inverted)
+    );
     entry!(invalid_stat_value, every!(ValueError: AboveScale));
     entry!(stat_scale_below_stored_value);
     entry!(stat_scale_changed);
@@ -1858,6 +1898,10 @@ mod tests {
             ApiError::invalid_stat_drift_mode(),
             // **見いだす枠の数**（ADR-0046 / 作業単位 A-9a）。尺度（`invalid_stat_scale`）と潰さない。
             ApiError::invalid_axis_discovery_slots(AxisDiscoverySlotsError::TooLarge),
+            // **返答の長さの目安**（ADR-0065 / 作業単位 A-22a）。尺度・枠の数と潰さない。
+            ApiError::invalid_response_length(ResponseLengthError::TooSmall),
+            ApiError::invalid_response_length(ResponseLengthError::TooLarge),
+            ApiError::invalid_response_length(ResponseLengthError::Inverted),
             // **取り決め**（ADR-0051 / 作業単位 A-12a）。属性・記憶の理由と潰さない。
             ApiError::invalid_agreement_content(AgreementContentError::Empty),
             ApiError::invalid_agreement_content(AgreementContentError::Control),
@@ -1926,6 +1970,9 @@ mod tests {
             ApiError::duplicate_attribute(),
             ApiError::invalid_stat_drift_mode(),
             ApiError::invalid_axis_discovery_slots(AxisDiscoverySlotsError::TooLarge),
+            ApiError::invalid_response_length(ResponseLengthError::TooSmall),
+            ApiError::invalid_response_length(ResponseLengthError::TooLarge),
+            ApiError::invalid_response_length(ResponseLengthError::Inverted),
             ApiError::invalid_agreement_content(AgreementContentError::TooLong),
             ApiError::invalid_agreement_kind(),
             ApiError::invalid_agreement_keeper(),

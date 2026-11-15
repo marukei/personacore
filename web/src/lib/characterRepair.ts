@@ -117,10 +117,18 @@ export const UNREPAIRABLE_COLUMN = "handle";
  * 直す口は `PATCH` の `archived: false`（時刻を消す＝戻す。`true` は壊れた値を残す）で、
  * **画面の入口は、読み出せなかった行の「しまった時刻を消す」**（[`archivedAtFixOf`]）。
  * 全欄モードの修復に混ぜないのは、時刻だけが壊れた行で、読めている他の欄まで打ち直させないため。
+ *
+ * `response_length_min` / `response_length_max`（返答の長さの目安 / ADR-0065 §決定1 / 作業単位 A-22a）も
+ * **修復の下書きには欄が無い**（作業単位の範囲は作成・編集の画面）。サーバは1組が読めなければ2列とも指し示す。
+ * 直す口は `PATCH` の `response_length`（`null` で未設定に戻すか、1組を入れ直す）。
+ * **⚠ この2列だけが壊れた行は、この画面ではまだ直せない**（見出しは「知らない綴りはそのまま返す」に落ちる）。
+ * **並びは末尾に足す**（`ARCHIVED_AT_COLUMN` が添字 1 を読むため）。
  */
 export const COLUMNS_WITHOUT_A_FIELD = [
   "axis_discovery_slots",
   "archived_at",
+  "response_length_min",
+  "response_length_max",
 ] as const;
 
 /** しまった時刻の列名（**`src/domain/character.rs` の写し**。上の一覧と同じ見張り番が見る）。 */

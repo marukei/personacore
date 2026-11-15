@@ -398,6 +398,7 @@ async fn a_value_beyond_the_stored_scale_is_counted_as_not_moved() {
                 stat_drift_mode: FieldUpdate::Keep,
                 axis_discovery_slots: None,
                 archived: None,
+                response_length: FieldUpdate::Keep,
             },
         )
         .await

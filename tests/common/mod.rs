@@ -496,6 +496,55 @@ pub async fn set_axis_discovery_slots_ignoring_checks(store: &Store, id: i64, sl
     );
 }
 
+/// **CHECK 制約を無効にしたまま、既存行の返答の長さの目安（2列）を書き換える**（作業単位 A-22a）。
+///
+/// `character.response_length_min` / `response_length_max` には1組の CHECK がある
+/// （`migrations/0019_character_response_length.sql`）ので、**片方だけ・範囲外・逆転の行は普通の SQL では作れない。**
+/// それでも読み出し側で `ResponseLength::parse` を通しているのは **CHECK が外せる**から
+/// （[`set_stat_scale_ignoring_checks`] と同じ話・同じ仕掛け）。
+pub async fn set_response_length_ignoring_checks(
+    store: &Store,
+    id: i64,
+    min: Option<i64>,
+    max: Option<i64>,
+) {
+    let mut conn = store
+        .pool()
+        .acquire()
+        .await
+        .expect("プールから接続を取得できること");
+
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(&mut *conn)
+        .await
+        .expect("CHECK 制約を一時的に無効にできること");
+
+    let result = sqlx::query(
+        "UPDATE character SET response_length_min = ?, response_length_max = ? WHERE id = ?",
+    )
+    .bind(min)
+    .bind(max)
+    .bind(id)
+    .execute(&mut *conn)
+    .await;
+
+    // **必ず戻す。** 接続はプールへ返されて他のテストが引き当てる。
+    sqlx::query("PRAGMA ignore_check_constraints = OFF")
+        .execute(&mut *conn)
+        .await
+        .expect("CHECK 制約を戻せること");
+
+    assert_checks_are_back_on(&mut conn).await;
+
+    let done = result
+        .unwrap_or_else(|err| panic!("返答の長さの目安を書き換えられること: id = {id}: {err}"));
+    assert_eq!(
+        done.rows_affected(),
+        1,
+        "書き換え対象がちょうど1件であること: id = {id}"
+    );
+}
+
 /// テストで使う性格ステータスの尺度。**必ず既定（`StatScale::DEFAULT`）と違う値。**
 ///
 /// # なぜ既定を使ってはいけないのか
