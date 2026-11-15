@@ -5524,6 +5524,84 @@ async fn a_character_written_before_0015_has_no_slots_and_no_candidates() {
     );
 }
 
+/// **`0019` より前に作った行は、返答の長さの目安が未設定で読める**
+/// （作業単位 A-22a / ADR-0065 §決定1「既存のキャラクターは未設定になる」）。
+///
+/// **他のテストはすべて空の DB から作った行を見る**ので、この移行が既存の行に何を書くかは
+/// ここでしか観測できない。**生の値（2列とも NULL）**と、読み出しの両方の経路（1件読み・一覧）で見る。
+#[tokio::test]
+async fn a_character_written_before_0019_has_no_response_length() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作成できること");
+    let path = dir.path().join("legacy.sqlite");
+
+    {
+        let (_subset, pool) = apply_migrations_up_to(&path, 18).await;
+
+        // **列がまだ無いこと**を確かめてから入れる（あると、このテストは何も見ていない）。
+        let err = sqlx::query("SELECT response_length_min FROM character")
+            .fetch_all(&pool)
+            .await
+            .expect_err("移行前は response_length_min 列が存在しないこと");
+        assert!(
+            err.to_string().contains("response_length_min"),
+            "実際のエラー = {err}"
+        );
+
+        for (id, handle) in [(3_i64, "aoi"), (8, "rin")] {
+            sqlx::query(
+                "INSERT INTO character (id, handle, display_name, base_persona, stat_scale, \
+                 stat_drift_mode) VALUES (?, ?, ?, ?, 7, 'shadow')",
+            )
+            .bind(id)
+            .bind(handle)
+            .bind("葵")
+            .bind("ペルソナ本文")
+            .execute(&pool)
+            .await
+            .expect("キャラクターを入れられること");
+        }
+        pool.close().await;
+    }
+
+    let store = Store::connect(&path)
+        .await
+        .expect("既存データのある DB にも 0019 を適用できること");
+
+    let stored: Vec<(Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT response_length_min, response_length_max FROM character ORDER BY id",
+    )
+    .fetch_all(store.pool())
+    .await
+    .expect("列を読めること");
+    assert_eq!(stored, vec![(None, None), (None, None)], "既存の行は未設定");
+
+    let found = store
+        .find_character_by_handle(&Handle::parse("aoi").expect("正当な識別子"))
+        .await
+        .expect("移行前の行を1件読みで読めること")
+        .expect("対象を引けること");
+    assert_eq!(found.response_length, None, "1件読みで未設定");
+    assert_eq!(
+        found.stat_drift_mode,
+        Some(StatDriftMode::Shadow),
+        "既存の列は変わらないこと"
+    );
+
+    let listed = store.list_characters().await.expect("一覧を取得できること");
+    let lengths: Vec<(i64, bool)> = listed
+        .iter()
+        .map(|entry| match entry {
+            CharacterEntry::Readable(character) => {
+                (character.id.get(), character.response_length.is_none())
+            }
+            CharacterEntry::Unreadable(broken) => {
+                panic!("移行前の行が読めない行になった: {broken:?}")
+            }
+        })
+        .collect();
+    assert_eq!(lengths, vec![(3, true), (8, true)], "一覧でも未設定");
+}
+
 /// **枠の数の CHECK が、範囲外と整数でない値を全部止める**（`0015`）。
 ///
 /// 整数に見える TEXT（`'3'`）と整数値の REAL（`3.0`）は**型アフィニティで整数へ直って**入る

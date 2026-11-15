@@ -35,6 +35,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 pub use agreement::{AgreementProposalsRecorded, AgreementTransition};
 pub use attribute::AttributeRevision;
 pub use axis_candidate::{AxisCandidate, AxisCandidateTransition};
+pub use character::CharacterSettings;
 pub use drift::{DriftVoteRecord, DriftVoteTally, DriftWrite, StoredDriftCharge, StoredDriftVote};
 pub use memory::RecallScope;
 pub use session::{

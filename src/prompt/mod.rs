@@ -23,8 +23,9 @@
 //! 1. **`SafeText`** — 制御文字と行区切りを正規化し、行頭・行末の空白を落とす。
 //!    無害化を通っていない文字列は**型として作れない**。
 //! 2. **`PromptWriter`** — システムプロンプトへ書ける手段は
-//!    「開発者が書いた `&'static str`」と「`SafeText` を引用接頭辞つきで書く」の2つだけ。
-//!    したがって**引用接頭辞で始まらない行は必ず定数**という不変条件が立つ
+//!    「開発者が書いた `&'static str`」「`SafeText` を引用接頭辞つきで書く」
+//!    「定数と `KanjiNumeral` だけの指示行（`directive` / ADR-0065 §決定2）」の3つだけ。
+//!    したがって**引用接頭辞で始まらない行は、定数か、定数と漢数字だけの指示行**という不変条件が立つ
 //!    （`forged_role_lines_never_escape_the_quoted_region` が固定している）。
 //!
 //! 会話履歴と今回の発言は**引用しない。** それぞれが役割付きの独立した `ChatMessage` で、
@@ -70,6 +71,7 @@ mod counted;
 mod estimate;
 mod recall;
 mod relevance;
+mod response_length;
 mod safe;
 mod writer;
 
@@ -120,8 +122,8 @@ use std::collections::BTreeSet;
 
 use crate::domain::{
     Agreement, AgreementKeeper, AgreementKind, Character, CharacterAttribute, ChatMessage,
-    ChatRole, Memory, Message, Role, StatAlloc, StatScale, Subject, fold_runaway_repetition,
-    strip_leaked_thinking,
+    ChatRole, Memory, Message, ResponseLength, Role, StatAlloc, StatScale, Subject,
+    fold_runaway_repetition, strip_leaked_thinking,
 };
 use writer::{PromptWriter, QuotedLine, Seg, quote_line};
 
@@ -698,6 +700,10 @@ struct SanitizedCharacter {
     stat_scale: StatScale,
     stats: Vec<QuotedLine>,
     output_format: Option<SafeText>,
+    /// 返答の長さの目安（ADR-0065 §決定1）。**`None` なら行を書かない**（プロンプトは1バイトも変わらない）。
+    ///
+    /// 自由文ではない（数の1組）ので無害化の対象ではない。行の組み立ては `render_system` の最後。
+    response_length: Option<ResponseLength>,
 }
 
 /// プロンプトを組み立てる。**純粋関数**（I/O も乱数も時刻も見ない）。
@@ -1224,6 +1230,7 @@ fn sanitize_character(input: &PromptInput<'_>) -> SanitizedCharacter {
             .as_ref()
             .map(|instruction| SafeText::sanitize(instruction.as_str()))
             .filter(|instruction| !instruction.is_empty()),
+        response_length: input.character.response_length,
     }
 }
 
@@ -1517,8 +1524,9 @@ const MEMORY_SUBJECT_HEADINGS: [(Subject, &str); 2] = [
 
 /// システムプロンプトを組み立てる。
 ///
-/// **引用されていない行はすべてこの関数に書かれた定数**であり、
-/// 実行時の値は `PromptWriter::quoted` / `quoted_block` を通ってしか入らない。
+/// **引用されていない行は、この関数に書かれた定数か、定数と `KanjiNumeral` だけの指示行**
+/// （返答の長さの目安 / `PromptWriter::directive` / ADR-0065 §決定2）であり、
+/// 運用者の書いた値は `PromptWriter::quoted` / `quoted_block` を通ってしか入らない。
 fn render_system(
     character: &SanitizedCharacter,
     agreements: &[AgreementLine],
@@ -1632,6 +1640,20 @@ fn render_system(
         writer.quoted_block(instruction);
     }
 
+    // **返答の長さの目安は system の最後の行**（ADR-0065 §決定2 / 作業単位 A-22a）。
+    // 出力形式の節の後（出力形式が無ければ、その手前の節の後）に、**見出しも空行も挟まずに**1行。
+    // 測った形（system の本文の末尾に改行1つ＋文）と同じになる —— `PromptWriter` は行ごとに改行を足し、
+    // `finish` が末尾の改行を落とすので、直前の行との間は改行1つだけ。
+    // **引用にしない**（`QUOTE_NOTE` がこの行を無効化する）。**未設定なら何も書かない。**
+    // 見張り番は `an_unset_target_changes_nothing_and_a_set_one_only_appends_the_line`。
+    //
+    // **`memories` / `agreements` を空で組む削れない枠の見積もり（`price`）にも載る** —— 削れない枠に入る行。
+    if let Some(target) = character.response_length {
+        let low = response_length::kanji_numeral(target.min());
+        let high = response_length::kanji_numeral(target.max());
+        writer.directive(&response_length::response_length_segments(&low, &high));
+    }
+
     writer.finish()
 }
 
@@ -1666,8 +1688,8 @@ mod tests {
     use crate::domain::{
         AgreementContent, AgreementId, AgreementState, AttributeKey, AttributeSet, AttributeValue,
         CharacterId, DisplayName, Handle, LINE_BREAKS, MAX_ACTIVE_AGREEMENTS, MemoryCategory,
-        MemoryContent, MemoryId, MessageId, OutputFormat, Persona, Role, SessionId, StatAxis,
-        StatScale, TRIMMABLE,
+        MemoryContent, MemoryId, MessageId, OutputFormat, Persona, ResponseLength, Role, SessionId,
+        StatAxis, StatScale, TRIMMABLE,
     };
     use crate::prompt::safe::contains_control_token_shape;
     use crate::prompt::writer::QUOTE_PREFIX;
@@ -1700,6 +1722,27 @@ mod tests {
         FORMAT_NOTE,
     ];
 
+    /// **返答の長さの目安の行か**（作業単位 A-22a）。`LITERAL_LINES` の外で、引用されずに載ってよい唯一の形。
+    ///
+    /// 頭と尾は定数、間は「漢数字〜漢数字」だけ（運用者の文が混ざる余地が無いことを、形で見る）。
+    fn is_response_length_line(line: &str) -> bool {
+        let Some(middle) = line
+            .strip_prefix(response_length::RESPONSE_LENGTH_HEAD)
+            .and_then(|rest| rest.strip_suffix(response_length::RESPONSE_LENGTH_TAIL))
+        else {
+            return false;
+        };
+        let numeral = |part: &str| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|character| "一二三四五六七八九十百千".contains(character))
+        };
+        middle
+            .split_once(response_length::RESPONSE_LENGTH_BETWEEN)
+            .is_some_and(|(low, high)| numeral(low) && numeral(high))
+    }
+
     /// 既定のキャラクター。**識別子（`aoi`）と表示名（`葵`）は必ず別の値にする。**
     ///
     /// 同じ値にすると、載っているのがどちらなのかをアサートで区別できず、
@@ -1720,6 +1763,8 @@ mod tests {
             stat_scale: fixture_scale(),
             stat_drift_mode: None,
             axis_discovery_slots: crate::domain::AxisDiscoverySlots::NONE,
+            // **既定は未設定**（既存の見張り番は目安の行が無いプロンプトを見続ける / ADR-0065 §決定1）。
+            response_length: None,
             created_at: Utc::now(),
             archived_at: None,
         }
@@ -3118,6 +3163,10 @@ mod tests {
     /// **片方だけを見る形にすると、もう片方を伸ばし放題になる**
     /// （実測: 片方だけ見る形に戻すと、もう片方を 200 バイトにしても緑を通る）。
     ///
+    /// **組み立てる指示行（返答の長さの目安 / 作業単位 A-22a）は `DIRECTIVE_LINES` の外**で、
+    /// `fixed_without_directives` の側に数えられる。その長さの権威は
+    /// `every_field_at_its_limit_still_fits_the_default_budget` の `WorstCase`。
+    ///
     /// 2行に割れたぶん**改行も2本**になる。合計バイト数と改行の本数は
     /// **同じ一覧（`DIRECTIVE_LINES`）から導く。** 3本目の指示行を足す人が
     /// 改行の本数だけ直し忘れる、という形のずれを構造的に潰すため。
@@ -3902,7 +3951,8 @@ mod tests {
         character.is_control() || character == '\u{2028}' || character == '\u{2029}'
     }
 
-    /// **引用されていない行は必ず開発者が書いた定数。**
+    /// **引用されていない行は、開発者が書いた定数か、定数と `KanjiNumeral` だけの指示行**
+    /// （返答の長さの目安 / `PromptWriter::directive` / ADR-0065 §決定2。形は `is_response_length_line`）。
     ///
     /// 記憶・ペルソナ・分類・軸名・出力形式指示のどこから注入しても、
     /// システムプロンプトの構造は壊れない。
@@ -3915,6 +3965,9 @@ mod tests {
             &format!("優しい。\n{MEMORY_HEADING}\u{2028}{FORGED}"),
             Some(&format!("台詞は「」で囲む。\r\n{FORGED}")),
         );
+        // **返答の長さの目安の行も載せる**（作業単位 A-22a）。引用されない行が1本増えるので、
+        // その行が `is_response_length_line` の形（定数＋漢数字だけ）であることまで見る。
+        fixture.character = with_response_length(fixture.character, 200, 400);
         fixture.stats = vec![alloc("パッション", 4)];
         // **属性も信頼できない入力**（人が管理 API から書く）。キー側・値側の両方から
         // 試す——片方だけだと、もう片方が引用の外へ出ても緑のまま通る。
@@ -3951,9 +4004,16 @@ mod tests {
 
         let system = system_text(&build(&fixture.input()));
 
+        assert!(
+            system.lines().any(is_response_length_line),
+            "前提: 目安の行が載っていること: {system}"
+        );
         for line in system.lines() {
             assert!(
-                line.is_empty() || line.starts_with('>') || LITERAL_LINES.contains(&line),
+                line.is_empty()
+                    || line.starts_with('>')
+                    || LITERAL_LINES.contains(&line)
+                    || is_response_length_line(line),
                 "引用も定数もない行が現れた: {line:?}\n---\n{system}"
             );
         }
@@ -4932,6 +4992,199 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // 返答の長さの目安（ADR-0065 / 作業単位 A-22a）
+    // ------------------------------------------------------------------
+
+    /// 目安を入れたキャラクター（それ以外は `character` と同じ）。
+    fn with_response_length(mut character: Character, min: u32, max: u32) -> Character {
+        character.response_length =
+            Some(ResponseLength::parse(min, max).expect("正当な目安であること"));
+        character
+    }
+
+    /// **測った文がそのまま載る**（期待値は ADR-0065 §決定2 の文に、測った漢数字を入れたリテラル）。
+    ///
+    /// 見出しなし・引用なし・**system の最後の行**。
+    #[test]
+    fn the_line_is_the_measured_sentence_on_the_last_line() {
+        for (min, max, expected) in [
+            (
+                200,
+                400,
+                "返答は毎回、地の文・「」の台詞・（）の心情描写を合わせて、二百〜四百字を目安に書く。利用者の発言が短いときほど、情景・動作・心情を描き足し、前の返答より短くしない。",
+            ),
+            (
+                800,
+                1200,
+                "返答は毎回、地の文・「」の台詞・（）の心情描写を合わせて、八百〜千二百字を目安に書く。利用者の発言が短いときほど、情景・動作・心情を描き足し、前の返答より短くしない。",
+            ),
+            (
+                400,
+                800,
+                "返答は毎回、地の文・「」の台詞・（）の心情描写を合わせて、四百〜八百字を目安に書く。利用者の発言が短いときほど、情景・動作・心情を描き足し、前の返答より短くしない。",
+            ),
+        ] {
+            let mut fixture = Fixture::new();
+            fixture.character = with_response_length(fixture.character, min, max);
+            let system = system_text(&build(&fixture.input()));
+            assert_eq!(
+                system.lines().last(),
+                Some(expected),
+                "最後の行が測った文であること: {system}"
+            );
+            assert_eq!(
+                system.matches(expected).count(),
+                1,
+                "1回だけ載ること: {system}"
+            );
+        }
+    }
+
+    /// **未設定なら1バイトも変わらず、設定すれば「改行1つ＋文」が末尾に足されるだけ**（ADR-0065 §決定1・2）。
+    ///
+    /// 出力形式の有無・記憶・取り決め・性格ステータス・属性の組み合わせで見る
+    /// （出力形式が無いキャラクターでは、その手前の節の後に来る）。
+    ///
+    /// * 未設定の system に目安の文の断片が無い（**未設定でも行を出す変異**はここで赤）。
+    /// * 設定した system ＝ 未設定の system ＋ `"\n"` ＋ 文（**空行を挟まない・置き場所を前へずらさない・
+    ///   引用にしない**変異はどれも、この等式で赤）。
+    #[test]
+    fn an_unset_target_changes_nothing_and_a_set_one_only_appends_the_line() {
+        /// フィクスチャを組み替える手（腕ごとに1つ）。
+        type Arrange = Box<dyn Fn(&mut Fixture)>;
+        let expected_line = "返答は毎回、地の文・「」の台詞・（）の心情描写を合わせて、百五〜千二百字を目安に書く。利用者の発言が短いときほど、情景・動作・心情を描き足し、前の返答より短くしない。";
+        let variants: [(&str, Arrange); 4] = [
+            ("既定（出力形式あり）", Box::new(|_: &mut Fixture| {})),
+            (
+                "出力形式なし",
+                Box::new(|fixture: &mut Fixture| {
+                    fixture.character = character("落ち着いた口調で話す。", None);
+                }),
+            ),
+            (
+                "記憶・取り決め・性格ステータス・属性あり",
+                Box::new(|fixture: &mut Fixture| {
+                    fixture.stats = vec![alloc("パッション", 4)];
+                    fixture.attributes = vec![attribute(Subject::User, "職業", "図書館員")];
+                    fixture.agreements = vec![active_agreement(
+                        AgreementKeeper::Both,
+                        AgreementKind::Promise,
+                        "毎朝挨拶する",
+                    )];
+                    fixture.memories = vec![memory(Subject::User, "猫が好き", Some("好み"))];
+                }),
+            ),
+            (
+                "出力形式なし・記憶あり",
+                Box::new(|fixture: &mut Fixture| {
+                    fixture.character = character("落ち着いた口調で話す。", None);
+                    fixture.memories = vec![memory(Subject::User, "猫が好き", None)];
+                }),
+            ),
+        ];
+
+        for (label, arrange) in &variants {
+            let mut unset = Fixture::new();
+            arrange(&mut unset);
+            assert_eq!(unset.character.response_length, None, "前提: {label}");
+            let unset_system = system_text(&build(&unset.input()));
+            for fragment in [
+                response_length::RESPONSE_LENGTH_HEAD,
+                response_length::RESPONSE_LENGTH_TAIL,
+                "字を目安",
+            ] {
+                assert!(
+                    !unset_system.contains(fragment),
+                    "未設定なのに目安の文が載った（{label}）: {unset_system}"
+                );
+            }
+
+            let mut set = Fixture::new();
+            arrange(&mut set);
+            set.character = with_response_length(set.character, 105, 1200);
+            let set_system = system_text(&build(&set.input()));
+            assert_eq!(
+                set_system,
+                format!("{unset_system}\n{expected_line}"),
+                "未設定の system の末尾に、改行1つと文だけが足されること（{label}）"
+            );
+        }
+    }
+
+    /// **出力形式の節の後**（出力形式があれば、その節の引用ブロックの直後の行）。
+    #[test]
+    fn the_line_comes_after_the_output_format_section() {
+        let mut fixture = Fixture::new();
+        fixture.character = with_response_length(fixture.character, 200, 400);
+        let system = system_text(&build(&fixture.input()));
+        let lines: Vec<&str> = system.lines().collect();
+        let format_line = lines
+            .iter()
+            .position(|line| *line == "> 台詞は「」で囲む。")
+            .expect("形式指示があること");
+        let target_line = lines
+            .iter()
+            .position(|line| line.starts_with(response_length::RESPONSE_LENGTH_HEAD))
+            .expect("目安の行があること");
+        assert_eq!(
+            target_line,
+            format_line + 1,
+            "形式指示の直後の行（空行を挟まない）: {system}"
+        );
+        assert!(
+            system.find(FORMAT_HEADING) < system.find(response_length::RESPONSE_LENGTH_HEAD),
+            "{system}"
+        );
+    }
+
+    /// **引用にしない**（`QUOTE_NOTE` がその行を無効化する / ADR-0065 §決定2）。
+    #[test]
+    fn the_line_is_never_quoted() {
+        let mut fixture = Fixture::new();
+        fixture.character = with_response_length(fixture.character, 200, 400);
+        let system = system_text(&build(&fixture.input()));
+        let line = system
+            .lines()
+            .find(|line| line.contains("字を目安に書く。"))
+            .expect("目安の行があること");
+        assert!(
+            line.starts_with(response_length::RESPONSE_LENGTH_HEAD),
+            "行頭は文の頭（引用接頭辞も見出しも付かない）: {line:?}"
+        );
+        assert!(!line.starts_with('>'), "{line:?}");
+        assert!(
+            !response_length::RESPONSE_LENGTH_HEAD.starts_with('>')
+                && !response_length::RESPONSE_LENGTH_HEAD.starts_with('#'),
+            "定数そのものも引用・見出しの形で始めないこと"
+        );
+    }
+
+    /// **裏方の依頼には載らない**（本文の system だけ / ADR-0065）。
+    ///
+    /// 抽出・変容・軸の候補・試用・取り決めの提案の依頼の組立は、どれも `Character` を受け取らない
+    /// （キャラクターの欄から行を作る経路が型として無い）。ここでは本文の組立が `messages` の先頭
+    /// （system）にだけ載せ、履歴や今回の発言の側に混ぜないことを見る。
+    #[test]
+    fn the_line_reaches_only_the_system_message() {
+        let mut fixture = Fixture::new();
+        fixture.character = with_response_length(fixture.character, 200, 400);
+        fixture.history = vec![
+            message(Role::User, "こんにちは"),
+            message(Role::Assistant, "「こんにちは」"),
+        ];
+        let built = build(&fixture.input());
+        for (index, message) in built.messages.iter().enumerate() {
+            let carries = message.content.contains("字を目安に書く。");
+            assert_eq!(
+                carries,
+                index == 0,
+                "目安の行は system（先頭）にだけ載ること: {index} / {:?}",
+                message.content
+            );
+        }
+    }
+
     /// **無害化で空になるペルソナは、もう作れない**（作業単位 0009 で畳んだ検査）。
     ///
     /// 以前ここには `a_persona_that_sanitizes_to_nothing_omits_the_section` があり、
@@ -5264,6 +5517,9 @@ mod tests {
             // 見いだす枠の数（ADR-0046）。**プロンプトには載らない**（候補を出すかを決めるだけ）。
             // 0〜4 の整数で自由文ではない。
             axis_discovery_slots: _,
+            // 返答の長さの目安（ADR-0065）。**指示行として載る**が、数の1組（1〜9999）で自由文ではない
+            // （文面は `ja` の束の定数、数は漢数字 / `response_length`）。最大の長さは削れない枠の見張り番が持つ。
+            response_length: _,
             created_at: _, // 日時。自由文ではない。
             // しまった時刻（ADR-0049）。**プロンプトには載らない**（しまったキャラクターとは話さない）。
             // 日時で自由文ではない。
@@ -6862,6 +7118,15 @@ mod tests {
         character
     }
 
+    /// **返答の長さの目安の最悪ケース**（下限・上限とも 9999 = 漢数字で最もバイト数が大きい数）。
+    fn worst_response_length() -> ResponseLength {
+        ResponseLength::parse(
+            u32::from(ResponseLength::HIGHEST),
+            u32::from(ResponseLength::HIGHEST),
+        )
+        .expect("上限ちょうどの目安は正当であること")
+    }
+
     /// 同じアストラル面の文字を `count` 個並べた文字列。
     fn astral_run(offset: usize, count: usize) -> String {
         std::iter::repeat_n(astral(offset), count).collect()
@@ -6947,13 +7212,24 @@ mod tests {
     /// **当時は `Persona::MAX_CHARS` を 1000 のままにすると入らなかった**（12b の実測で
     /// `BudgetExhausted`）。上限を戻せるかどうかは `FIXED_FRAME_SLACK` で判断する。
     ///
+    /// # 作業単位 A-22a での増減（**当時の実測。いまの値ではない**）
+    ///
+    /// 返答の長さの目安の行（ADR-0065）を最悪ケース（下限・上限とも 9999 = 漢数字 7 文字）で足した。
+    /// 削れない枠は **+277**（文 276 バイト ＋ 改行）。足せる量（`FIXED_FRAME_SLACK`）は 360 → 83 に減り、
+    /// **既定の予算では古い側の履歴が削られる**（10 件 → 最新の 4 件）。履歴は削れる枠なので組み立ては成功し、
+    /// 直近の記憶も1件載る。それに合わせて前提の assert を「全件」から「最新の1往復」へ緩め、
+    /// 載る件数は `WorstCase::included_history` で固定した（`assert_every_limit_fits` の注記）。
+    ///
     /// # 取り決めはここに入れない（作業単位 A-12a の決め直し / ADR-0051 §決定4 の追記）
     ///
     /// 取り決めは**削れない枠ではなく、その次の優先の枠**（入りきらないときだけ古い側から落とす）。
     /// 上限いっぱい（16 件 × 60 字）を削れない枠に入れると、削れない枠が 6644 → 10883 になり、
     /// 取り分 7168 を超えた（当時（A-12a）の実測。いまの値ではない。節は 4239 = 1行 257 × 16 ＋ 見出し・小見出し3本・空行の 127）。
-    /// **既定の予算は上げない**（ADR-0036）。取り決めの側の見張り番は2本:
-    /// `agreements_at_their_limit_never_exhaust_the_default_budget_and_the_drop_is_reported`（既定の予算）と
+    /// **既定の予算は上げない**（ADR-0036）。取り決めの側の見張り番は3本:
+    /// `agreements_at_their_limit_never_exhaust_the_default_budget_and_the_drop_is_reported`
+    /// （既定の予算。返答の長さの目安は外して、落とす順を見る）、
+    /// `agreements_at_their_limit_with_the_worst_response_length_are_all_dropped_and_reported`
+    /// （既定の予算。目安も最悪ケースで、全部落ちて報告される / 作業単位 A-22a）と
     /// `agreements_at_their_limit_all_fit_a_sufficient_budget`（16384）。
     ///
     /// # 何を保証しているか
@@ -6994,15 +7270,17 @@ mod tests {
                 headroom: allowance - plan.fixed_tokens(),
                 included_memories: plan.included_memories(),
                 newest_memory: plan.memory_tokens(),
+                included_history: plan.included_history(),
                 history: plan.history_tokens(),
             },
             WorstCase {
-                fixed: 6644,
+                fixed: 6921,
                 allowance: 7168,
-                headroom: 524,
+                headroom: 247,
                 included_memories: 1,
                 newest_memory: 104,
-                history: 300,
+                included_history: 4,
+                history: 120,
             },
         );
         // 削れない枠に**あと何バイト足せるか**の境目（＝新しい欄の上限を決める材料）。
@@ -7021,7 +7299,7 @@ mod tests {
 
     /// 最悪ケースで、削れない枠に**あと足せるバイト数**。これを1バイト超えると
     /// 直近の記憶が1件も載らなくなる。権威は `every_field_at_its_limit_still_fits_the_default_budget`。
-    const FIXED_FRAME_SLACK: u32 = 360;
+    const FIXED_FRAME_SLACK: u32 = 83;
 
     /// 最悪ケースの数（**数の権威**）。単位はすべて `estimate_tokens`（= UTF-8 バイト数）。
     #[derive(Debug, PartialEq, Eq)]
@@ -7031,6 +7309,8 @@ mod tests {
         headroom: u32,
         included_memories: usize,
         newest_memory: u32,
+        /// 既定の予算で載った履歴の件数（作業単位 A-22a で足した。古い側は削れる枠）。
+        included_history: usize,
         history: u32,
     }
 
@@ -7076,6 +7356,10 @@ mod tests {
                 .expect("上限ちょうどの尺度は正当であること"),
             stat_drift_mode: None,
             axis_discovery_slots: crate::domain::AxisDiscoverySlots::NONE,
+            // **返答の長さの目安も最悪ケース**（作業単位 A-22a / ADR-0065 §決定1）。
+            // 削れない枠に指示行1行として載る。漢数字のバイト数が最大になる数（9999 = 7 文字。
+            // `response_length::tests::no_value_is_longer_than_9999`）を下限と上限の両方に入れる。
+            response_length: Some(worst_response_length()),
             created_at: Utc::now(),
             archived_at: None,
         };
@@ -7186,10 +7470,21 @@ mod tests {
         // **前提: 履歴が実際に枠を使っていること。** 役割の並びが崩れた履歴は
         // 往復に畳む段で丸ごと落ちるので、この前提が無いと
         // 「履歴が1件も無い状態で上限を確かめた」ことに黙って変わる。
+        //
+        // > **作業単位 A-22a で「全件載っていること」から、この2つに分けた**（返答の長さの目安の行を
+        // > 最悪ケースに足すと、既定の予算では古い側の履歴が削られる。履歴は削れる枠で、
+        // > `FIXED_FRAME_SLACK` は最初から「最新の1往復を残して古い側は削れる」前提の量だった）。
+        // > 既定の予算で何件載るかは `WorstCase::included_history` が数で固定し、
+        // > 十分な予算の腕（`agreements_at_their_limit_all_fit_a_sufficient_budget`）は全件を見る。
         assert_eq!(
-            built.plan.included_history(),
+            history_turns(&fixture.history, None).len(),
             fixture.history.len(),
-            "前提: 履歴が全件載っていること"
+            "前提: フィクスチャの履歴が往復に畳む段で1件も落ちないこと"
+        );
+        assert!(
+            built.plan.included_history() >= 2,
+            "前提: 最新の1往復は載っていること（履歴が枠を使っている）: {:?}",
+            built.plan
         );
         assert!(
             built.plan.prompt_tokens() <= allowance,
@@ -7275,11 +7570,20 @@ mod tests {
     ///   —— 載ったのは**新しい側の連続した列**で、落ちたのは古い側の列であること。
     /// * 落とした件数は `BudgetPlan` に出る（ログの1行は `dropped_agreements_are_reported_on_one_warn_line`）。
     /// * 取り決めが記憶と履歴の残りを先に取っても、**合計は取り分を超えず**、見積もりは実体を下回らない。
+    ///
+    /// # 返答の長さの目安だけは外す（作業単位 A-22a）
+    ///
+    /// 目安の行を最悪ケース（+277 バイト）で載せると、既定の予算では**取り決めが1件も入らない**
+    /// （最新の1往復を取った残りが、上限いっぱいの取り決め1件に届かない）。それでは「古い側から落ちる」
+    /// 並びが観測できないので、この腕だけ目安を未設定にする。**目安も最悪ケースのまま組んだときに
+    /// 組み立てが失敗せず、全部落ちたことが報告される**のは、次の
+    /// `agreements_at_their_limit_with_the_worst_response_length_are_all_dropped_and_reported` が見る。
     #[test]
     fn agreements_at_their_limit_never_exhaust_the_default_budget_and_the_drop_is_reported() {
         let budget = TokenBudget::default();
         let mut fixture = fixture_at_every_limit();
         fixture.agreements = agreements_at_their_limit();
+        fixture.character.response_length = None;
 
         let built = build_prompt(&fixture.input(), budget)
             .expect("取り決めが上限いっぱいでも既定の予算で組み立てられること");
@@ -7343,6 +7647,67 @@ mod tests {
         );
     }
 
+    /// **返答の長さの目安まで最悪ケースにしても、取り決めは `BudgetExhausted` を起こさず、
+    /// 落とした件数が報告される**（作業単位 A-22a。上の見張り番 (a) が目安を外した分を、ここで見る）。
+    ///
+    /// いまの最悪ケースでは**全部落ちる**（載る件数 0）。目安の行が削れない枠を太らせた結果で、
+    /// 取り決めは優先の枠なので組み立ては止まらない。**黙って落とさない**ことだけは変わらない。
+    #[test]
+    fn agreements_at_their_limit_with_the_worst_response_length_are_all_dropped_and_reported() {
+        let budget = TokenBudget::default();
+        let mut fixture = fixture_at_every_limit();
+        assert_eq!(
+            fixture.character.response_length,
+            Some(worst_response_length()),
+            "前提: 目安も最悪ケース"
+        );
+        fixture.agreements = agreements_at_their_limit();
+
+        let built = build_prompt(&fixture.input(), budget)
+            .expect("目安と取り決めが上限いっぱいでも既定の予算で組み立てられること");
+        let plan = built.plan;
+        assert_eq!(
+            (plan.included_agreements(), plan.dropped_agreements()),
+            (0, MAX_ACTIVE_AGREEMENTS),
+            "いまの最悪ケースでは全部落ち、その件数が報告されること: {plan:?}"
+        );
+        assert!(
+            plan.included_history() >= 2,
+            "最新の1往復は取り決めより先に確保されること: {plan:?}"
+        );
+        assert!(
+            plan.included_memories() >= 1,
+            "直近の記憶は載ること: {plan:?}"
+        );
+        assert!(
+            plan.prompt_tokens() <= budget.prompt_allowance(),
+            "{plan:?}"
+        );
+        assert!(assembled_tokens(&built) <= plan.prompt_tokens());
+        assert!(
+            system_text(&built)
+                .lines()
+                .last()
+                .is_some_and(is_response_length_line),
+            "目安の行は最後の行に載ったまま"
+        );
+
+        // **全部落ちた（`kept=0`）ときも、warn の1行が出る**（作業単位 A-22a の再レビュー）。
+        // 照合の仕方は `dropped_agreements_are_reported_on_one_warn_line` と同じ（同じ1行の欄で見る）。
+        let output = crate::testlog::captured_under_default_filter(|| {
+            let _ = build_prompt(&fixture.input(), budget);
+        });
+        let line = crate::testlog::line_containing(&output, AGREEMENTS_DROPPED_MESSAGE);
+        // 件数は定数から作らず、外の値（16）で押さえる。
+        for field in ["dropped=16", "kept=0"] {
+            assert!(
+                crate::testlog::has_field(line, field),
+                "欄が無い（か、値が違う）: {field} / {line:?}"
+            );
+        }
+        assert!(line.contains("WARN"), "水準は warn: {line:?}");
+    }
+
     /// **十分な予算（16384）では、上限いっぱいの取り決めが全部載る**（見張り番 (b)）。
     ///
     /// 他の枠も上限いっぱい。**削れない枠の主張（`every_field_…`）も同じ形で成り立つ**ことまで見る。
@@ -7356,6 +7721,13 @@ mod tests {
         let built = build_prompt(&fixture.input(), budget).expect("組み立てられること");
         assert_eq!(built.plan.included_agreements(), MAX_ACTIVE_AGREEMENTS);
         assert_eq!(built.plan.dropped_agreements(), 0);
+        // **十分な予算では履歴も全件載る**（`assert_every_limit_fits` の前提が「最新の1往復」まで
+        // 緩んだ分を、この腕で全件まで見る / 作業単位 A-22a）。
+        assert_eq!(
+            built.plan.included_history(),
+            fixture.history.len(),
+            "十分な予算では履歴が全件載ること"
+        );
         // 上限の値そのものは関数の外の値で押さえる（定数を変える変異を通さない）。
         assert_eq!(MAX_ACTIVE_AGREEMENTS, 16);
 
@@ -7442,12 +7814,20 @@ mod tests {
     }
 
     /// **落とした件数と載せた件数を、ログの同じ1行（`warn`）に出す**。落とさなければ出さない。
+    ///
+    /// **返答の長さの目安は外す**（作業単位 A-22a のレビュー）。目安まで最悪ケースにすると載る件数が 0 になり、
+    /// ログの `kept=0` が「数を写さずに 0 を書く」実装と区別できない（`kept = 0_usize` の変異が緑になる）。
     #[test]
     fn dropped_agreements_are_reported_on_one_warn_line() {
         let mut fixture = fixture_at_every_limit();
         fixture.agreements = agreements_at_their_limit();
+        fixture.character.response_length = None;
         let plan = build(&fixture.input()).plan;
         assert!(plan.dropped_agreements() > 0, "前提");
+        assert!(
+            plan.included_agreements() > 0,
+            "前提: 載る件数が 0 でないこと（`kept=0` を定数の 0 と区別するため）: {plan:?}"
+        );
         assert_ne!(
             plan.dropped_agreements(),
             plan.included_agreements(),

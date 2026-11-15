@@ -3395,6 +3395,7 @@ async fn a_partial_update_leaves_the_other_columns_alone() {
             "stat_scale": TARGET_SCALE,
             "stat_drift_mode": TARGET_DRIFT_MODE,
             "axis_discovery_slots": 0,
+            "response_length": null,
             "created_at": created_at,
             // **しまう欄を省いた更新は、しまった状態に触らない**（作業単位 A-10）。
             "archived_at": null,
@@ -3421,6 +3422,7 @@ async fn a_partial_update_leaves_the_other_columns_alone() {
             "stat_scale": TARGET_SCALE,
             "stat_drift_mode": TARGET_DRIFT_MODE,
             "axis_discovery_slots": 0,
+            "response_length": null,
             "created_at": created_at,
             // **しまう欄を省いた更新は、しまった状態に触らない**（作業単位 A-10）。
             "archived_at": null,
@@ -3447,6 +3449,7 @@ async fn a_partial_update_leaves_the_other_columns_alone() {
             "stat_scale": TARGET_SCALE,
             "stat_drift_mode": TARGET_DRIFT_MODE,
             "axis_discovery_slots": 0,
+            "response_length": null,
             "created_at": created_at,
             // **しまう欄を省いた更新は、しまった状態に触らない**（作業単位 A-10）。
             "archived_at": null,
@@ -3477,6 +3480,7 @@ async fn a_partial_update_leaves_the_other_columns_alone() {
             "stat_scale": NEW_SCALE,
             "stat_drift_mode": TARGET_DRIFT_MODE,
             "axis_discovery_slots": 0,
+            "response_length": null,
             "created_at": created_at,
             // **しまう欄を省いた更新は、しまった状態に触らない**（作業単位 A-10）。
             "archived_at": null,
@@ -3506,6 +3510,7 @@ async fn a_partial_update_leaves_the_other_columns_alone() {
             "stat_scale": NEW_SCALE,
             "stat_drift_mode": NEW_DRIFT_MODE,
             "axis_discovery_slots": 0,
+            "response_length": null,
             "created_at": created_at,
             // **しまう欄を省いた更新は、しまった状態に触らない**（作業単位 A-10）。
             "archived_at": null,
@@ -3542,6 +3547,7 @@ async fn a_partial_update_leaves_the_other_columns_alone() {
             "stat_scale": NEW_SCALE,
             "stat_drift_mode": NEW_DRIFT_MODE,
             "axis_discovery_slots": 0,
+            "response_length": null,
             "created_at": created_at,
             // **しまう欄を省いた更新は、しまった状態に触らない**（作業単位 A-10）。
             "archived_at": null,
@@ -3780,6 +3786,22 @@ async fn invalid_updates_are_rejected_with_distinguishable_reasons() {
             "軸を見いだす枠の数が大きすぎます",
             "axis_discovery_slots_too_large",
         ),
+        // **返答の長さの目安も更新の入口で止める**（ADR-0065 §決定1 / 作業単位 A-22a）。
+        (
+            json!({"response_length": {"min": 0, "max": 400}}),
+            "返答の長さの目安が小さすぎます",
+            "response_length_too_small",
+        ),
+        (
+            json!({"response_length": {"min": 200, "max": 10_000}}),
+            "返答の長さの目安が大きすぎます",
+            "response_length_too_large",
+        ),
+        (
+            json!({"response_length": {"min": 401, "max": 400}}),
+            "返答の長さの目安の下限が上限を超えています",
+            "response_length_inverted",
+        ),
     ] {
         let (status, body) = server.patch(&character_path(TARGET_HANDLE), &patch).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{code}: {body}");
@@ -3803,6 +3825,7 @@ async fn invalid_updates_are_rejected_with_distinguishable_reasons() {
             "stat_scale": TARGET_SCALE,
             "stat_drift_mode": TARGET_DRIFT_MODE,
             "axis_discovery_slots": 0,
+            "response_length": null,
             "created_at": character_in(&body, TARGET_HANDLE)["created_at"],
             "archived_at": null,
         }),
@@ -4475,5 +4498,169 @@ async fn an_alias_of_the_drift_mode_is_refused_over_http() {
         "拒否された更新は1列も書かない: {body}"
     );
 
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// 返答の長さの目安（ADR-0065 §決定1 / 作業単位 A-22a）
+// ---------------------------------------------------------------------------
+
+/// **作成・一覧・`PATCH` の3値が HTTP の入口を通って往復する**（ADR-0065 §決定1）。
+///
+/// * 作成で書いた1組が、作成の応答と一覧の両方から戻る（**下限 ≠ 上限**で取り違えを見る）。
+/// * **省いた作成と `null` の作成は未設定**（`null` で返る。キーごと落とさない）。
+/// * `PATCH` で省けば残す・値で置き換える・**`null` で未設定に戻す**（`null` を「残す」に潰す実装はここで赤）。
+/// * 片方だけの本文は `invalid_body` で、1列も書かない。
+#[tokio::test]
+async fn the_response_length_round_trips_through_the_real_entry_points() {
+    let server = TestServer::start().await;
+
+    let (status, body) = server
+        .post(
+            "/admin/characters",
+            &json!({
+                "handle": "aoi",
+                "base_persona": "落ち着いた物腰の司書。",
+                "response_length": {"min": 200, "max": 400},
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        parse_json(&body)["response_length"],
+        json!({"min": 200, "max": 400}),
+        "{body}"
+    );
+    for (handle, extra) in [
+        ("rin", json!({})),
+        ("mio", json!({"response_length": null})),
+    ] {
+        let mut request = json!({"handle": handle, "base_persona": "ペルソナ本文"});
+        if let (Some(target), Some(extra)) = (request.as_object_mut(), extra.as_object()) {
+            target.extend(extra.clone());
+        }
+        let (status, body) = server.post("/admin/characters", &request).await;
+        assert_eq!(status, StatusCode::CREATED, "{handle}: {body}");
+        let created = parse_json(&body);
+        assert_eq!(
+            created.get("response_length"),
+            Some(&Value::Null),
+            "省略・null の作成は未設定（キーは残る）: {body}"
+        );
+    }
+
+    let (_, body) = server.get("/admin/characters").await;
+    assert_eq!(
+        [
+            character_in(&body, "aoi")["response_length"].clone(),
+            character_in(&body, "rin")["response_length"].clone(),
+            character_in(&body, "mio")["response_length"].clone(),
+        ],
+        [json!({"min": 200, "max": 400}), Value::Null, Value::Null],
+        "一覧からも行ごとの値が読めること: {body}"
+    );
+
+    // --- 省けば残す ---
+    let (status, body) = server
+        .patch(&character_path("aoi"), &json!({"display_name": "葵"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        parse_json(&body)["character"]["response_length"],
+        json!({"min": 200, "max": 400}),
+        "{body}"
+    );
+
+    // --- 値で置き換える ---
+    let (status, body) = server
+        .patch(
+            &character_path("aoi"),
+            &json!({"response_length": {"min": 800, "max": 1200}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        parse_json(&body)["character"]["response_length"],
+        json!({"min": 800, "max": 1200}),
+        "{body}"
+    );
+
+    // --- 片方だけは本文として読めず、1列も書かない ---
+    for broken in [
+        json!({"response_length": {"min": 200}}),
+        json!({"response_length": {"max": 400}}),
+    ] {
+        let (status, body) = server.patch(&character_path("aoi"), &broken).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{broken}: {body}");
+        assert_eq!(
+            parse_json(&body)["error"]["code"],
+            json!("invalid_body"),
+            "{body}"
+        );
+    }
+    let (_, body) = server.get("/admin/characters").await;
+    assert_eq!(
+        character_in(&body, "aoi")["response_length"],
+        json!({"min": 800, "max": 1200}),
+        "拒否された更新は書かない: {body}"
+    );
+
+    // --- `null` で未設定に戻す ---
+    let (status, body) = server
+        .patch(&character_path("aoi"), &json!({"response_length": null}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        parse_json(&body)["character"].get("response_length"),
+        Some(&Value::Null),
+        "{body}"
+    );
+    let stored: (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT response_length_min, response_length_max FROM character WHERE handle = 'aoi'",
+    )
+    .fetch_one(server.store.pool())
+    .await
+    .expect("2列を読めること");
+    assert_eq!(stored, (None, None), "2列とも NULL に戻ること");
+
+    server.stop().await;
+}
+
+/// **作成の入口でも範囲外は理由つきの 400**（`PATCH` の側は
+/// `invalid_updates_are_rejected_with_distinguishable_reasons` の一覧が見る）。1行も作らない。
+#[tokio::test]
+async fn invalid_response_lengths_are_refused_at_creation() {
+    let server = TestServer::start().await;
+    for (length, message, code) in [
+        (
+            json!({"min": 0, "max": 400}),
+            "返答の長さの目安が小さすぎます",
+            "response_length_too_small",
+        ),
+        (
+            json!({"min": 200, "max": 10_000}),
+            "返答の長さの目安が大きすぎます",
+            "response_length_too_large",
+        ),
+        (
+            json!({"min": 401, "max": 400}),
+            "返答の長さの目安の下限が上限を超えています",
+            "response_length_inverted",
+        ),
+    ] {
+        let (status, body) = server
+            .post(
+                "/admin/characters",
+                &json!({
+                    "handle": "aoi",
+                    "base_persona": "ペルソナ本文",
+                    "response_length": length,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{code}: {body}");
+        assert_eq!(parse_json(&body), invalid_request(message, code), "{code}");
+    }
+    assert_eq!(server.character_count().await, 0, "1行も作らないこと");
     server.stop().await;
 }

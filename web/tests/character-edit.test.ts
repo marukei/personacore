@@ -21,6 +21,8 @@ import { describe, expect, it } from "vitest";
 import type { CharacterView } from "../src/lib/api";
 import {
   LIMITS,
+  RESPONSE_LENGTH_HALF_MESSAGE,
+  RESPONSE_LENGTH_MESSAGE,
   buildCreate,
   buildUpdate,
   countChars,
@@ -39,6 +41,7 @@ const ORIGINAL: CharacterView = {
   stat_scale: 5,
   stat_drift_mode: null,
   axis_discovery_slots: 0,
+  response_length: null,
   archived_at: null,
   created_at: "2026-08-27T00:00:00Z",
 };
@@ -494,6 +497,143 @@ describe("上限の帰属 —— どの欄の上限か", () => {
       return;
     }
     expect(built.body).toEqual({ display_name: "藍" });
+  });
+});
+
+/**
+ * **返答の長さの目安**（作業単位 A-22a / ADR-0065 §決定1）。
+ *
+ * | 下書き | 作成 | 編集 |
+ * |---|---|---|
+ * | 両方空 | キーごと省く（未設定） | 元が設定済みなら `null`（未設定に戻す）、元も未設定ならキー無し |
+ * | 両方入っている | `{ min, max }` | 元と違えば `{ min, max }`、同じならキー無し |
+ * | 片方だけ | **送らない**（理由を返す） | 同左 |
+ * | 整数でない | **送らない**（理由を返す） | 同左 |
+ *
+ * **範囲（1〜9999・下限 ≤ 上限）は見ない**（サーバが理由つきで返す。尺度と同じ立場）。
+ */
+describe("返答の長さの目安", () => {
+  const SET: CharacterView = {
+    ...ORIGINAL,
+    response_length: { min: 200, max: 400 },
+  };
+
+  function created(min: string, max: string) {
+    return buildCreate({
+      ...emptyDraft(),
+      handle: "rin",
+      base_persona: "早口で話す。",
+      response_length_min: min,
+      response_length_max: max,
+    });
+  }
+
+  it("下書きは、未設定なら両方空、設定済みならその数", () => {
+    expect([emptyDraft().response_length_min, emptyDraft().response_length_max]).toEqual([
+      "",
+      "",
+    ]);
+    expect([draftOf(ORIGINAL).response_length_min, draftOf(ORIGINAL).response_length_max]).toEqual(
+      ["", ""],
+    );
+    // **下限と上限を取り違えない**（違う値で見る）。
+    expect([draftOf(SET).response_length_min, draftOf(SET).response_length_max]).toEqual([
+      "200",
+      "400",
+    ]);
+  });
+
+  it("作成: 両方入れれば整数の組で載り、両方空ならキーごと省く", () => {
+    const set = created("200", " 400 ");
+    expect(set.ok && set.kind === "create" && set.body.response_length).toEqual({
+      min: 200,
+      max: 400,
+    });
+    const unset = created("", "  ");
+    expect(unset.ok).toBe(true);
+    if (unset.ok) {
+      expect("response_length" in unset.body).toBe(false);
+    }
+  });
+
+  it("片方だけは送らず、両方入れるよう案内する（作成でも編集でも）", () => {
+    for (const [min, max] of [
+      ["200", ""],
+      ["", "400"],
+    ] as const) {
+      const create = created(min, max);
+      expect(create.ok).toBe(false);
+      if (!create.ok) {
+        expect(create.message).toBe(RESPONSE_LENGTH_HALF_MESSAGE);
+      }
+      const update = buildUpdate(SET, {
+        ...draftOf(SET),
+        response_length_min: min,
+        response_length_max: max,
+      });
+      expect(update.ok).toBe(false);
+      if (!update.ok) {
+        expect(update.message).toBe(RESPONSE_LENGTH_HALF_MESSAGE);
+      }
+    }
+    expect(RESPONSE_LENGTH_HALF_MESSAGE).toContain("両方");
+  });
+
+  it("整数でなければ送らない（範囲はサーバが判定する）", () => {
+    for (const [min, max] of [
+      ["二百", "400"],
+      ["200", "4.5"],
+      ["-1", "400"],
+    ] as const) {
+      const built = created(min, max);
+      expect(built.ok, `${min} / ${max}`).toBe(false);
+      if (!built.ok) {
+        expect(built.message).toBe(RESPONSE_LENGTH_MESSAGE);
+      }
+    }
+    // **範囲外でも整数なら送る**（0・下限 > 上限・10000 はサーバが理由を返す）。
+    for (const [min, max] of [
+      ["0", "400"],
+      ["401", "400"],
+      ["200", "10000"],
+    ] as const) {
+      expect(created(min, max).ok, `${min} / ${max}`).toBe(true);
+    }
+  });
+
+  it("編集: 触らなければキー無し、変えれば組で載り、両方空にすると null", () => {
+    const untouchedSet = buildUpdate(SET, draftOf(SET));
+    expect(untouchedSet.ok && untouchedSet.kind === "update" && untouchedSet.body).toEqual({});
+
+    const changed = buildUpdate(SET, {
+      ...draftOf(SET),
+      response_length_max: "800",
+    });
+    expect(changed.ok && changed.kind === "update" && changed.body).toEqual({
+      response_length: { min: 200, max: 800 },
+    });
+
+    const cleared = buildUpdate(SET, {
+      ...draftOf(SET),
+      response_length_min: "",
+      response_length_max: "",
+    });
+    expect(cleared.ok && cleared.kind === "update" && cleared.body).toEqual({
+      response_length: null,
+    });
+
+    // **元から未設定で空のままなら、消す指示は載らない**（「変えない」を「未設定に戻す」に化けさせない）。
+    const stillUnset = buildUpdate(ORIGINAL, draftOf(ORIGINAL));
+    expect(stillUnset.ok && stillUnset.kind === "update" && stillUnset.body).toEqual({});
+
+    const firstSet = buildUpdate(ORIGINAL, {
+      ...draftOf(ORIGINAL),
+      response_length_min: "800",
+      response_length_max: "1200",
+    });
+    expect(firstSet.ok && firstSet.kind === "update" && firstSet.body).toEqual({
+      response_length: { min: 800, max: 1200 },
+    });
   });
 });
 

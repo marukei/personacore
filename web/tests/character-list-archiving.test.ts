@@ -35,6 +35,7 @@ function character(id: number, handle: string, display_name: string): CharacterV
     stat_scale: 5,
     stat_drift_mode: null,
     axis_discovery_slots: 0,
+    response_length: null,
     created_at: "2026-10-21T00:00:00Z",
     archived_at: null,
   };

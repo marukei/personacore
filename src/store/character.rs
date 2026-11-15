@@ -15,9 +15,21 @@ use sqlx::Row;
 use super::{Store, StoreError};
 use crate::domain::{
     AxisDiscoverySlots, Character, CharacterColumn, CharacterEntry, CharacterId, CharacterUpdate,
-    DisplayName, FieldUpdate, Handle, OutputFormat, Persona, StatAlloc, StatAxis, StatDriftMode,
-    StatScale, UnreadableCharacter,
+    DisplayName, FieldUpdate, Handle, OutputFormat, Persona, ResponseLength, StatAlloc, StatAxis,
+    StatDriftMode, StatScale, UnreadableCharacter,
 };
+
+/// **作るときに書ける任意の欄**（[`Store::create_character_with_settings`] / 作業単位 A-22a）。
+///
+/// `Default` は「全部未設定」（[`Store::create_character`] と同じ）。**既定の値で埋めない**
+/// —— 埋めると「未設定」と「既定と同じ値を選んだ」が区別できない（`Character::stat_drift_mode` の doc）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CharacterSettings {
+    /// 変容の走らせ方（ADR-0045 §決定3）。`None` は未設定。
+    pub stat_drift_mode: Option<StatDriftMode>,
+    /// 返答の長さの目安（ADR-0065 §決定1）。`None` は未設定（2列とも NULL）。
+    pub response_length: Option<ResponseLength>,
+}
 
 /// 一覧に使う SELECT。列の並びは `Character` の組み立てと対応させる。
 ///
@@ -44,15 +56,24 @@ use crate::domain::{
 /// `created_at` の DEFAULT と同じ `strftime`。**読みは `Option<String>` で受けて
 /// [`archived_at_from_row`] が日時に直す**（`try_get::<DateTime>` にすると、
 /// 読めない値1つで一覧が丸ごと落ちる）。
+///
+/// # `response_length_min` / `response_length_max` も同じ2つだけが読む（作業単位 A-22a / ADR-0065 §決定1）
+///
+/// **過去の書き手は全部 NULL を通る**——`0019` の `ADD COLUMN` は DEFAULT を持たず、
+/// 既存の INSERT（`create_character` / `create_character_with_drift_mode`）は NULL を渡す。
+/// 書くのは [`Store::create_character_with_settings`] と [`UPDATE_CHARACTER`] だけで、値は `ResponseLength` を通っている。
+/// **だから読み始めても既存の行のデコードは割れない**（CLAUDE.md §2 の ⚠）。
+/// **ただし上の注記と同じく、列を落とすとキャラクターを読む経路が全部止まる。**
 const SELECT_ALL: &str = "SELECT id, handle, display_name, base_persona, output_format_instruction, \
-     stat_scale, stat_drift_mode, axis_discovery_slots, created_at, archived_at \
+     stat_scale, stat_drift_mode, axis_discovery_slots, created_at, archived_at, \
+     response_length_min, response_length_max \
      FROM character ORDER BY handle";
 
 /// 識別子による完全一致検索。**trim しない**（ADR-0004: 検索側で trim すると
 /// `"aoi"` と `" aoi "` の両方に一致し、書き込み先が不定になる）。
 const SELECT_BY_HANDLE: &str = "SELECT id, display_name, base_persona, \
      output_format_instruction, stat_scale, stat_drift_mode, axis_discovery_slots, created_at, \
-     archived_at FROM character WHERE handle = ?";
+     archived_at, response_length_min, response_length_max FROM character WHERE handle = ?";
 
 /// 識別子で id だけを引く。**完全一致**（`SELECT_BY_HANDLE` と同じ照合）。
 ///
@@ -106,6 +127,9 @@ const SELECT_ID_BY_HANDLE: &str = "SELECT id FROM character WHERE handle = ?";
 ///   NULL なら触らない、真ならしまう（**すでに時刻があればそのまま**）、偽なら戻す（NULL にする）。
 ///   **時刻は呼び出し側から受け取らない**——書くのはこの文の `strftime` で、綴りは
 ///   `created_at` の DEFAULT（`migrations/0001_initial.sql`）と同じ。
+/// * **返答の長さの目安（ADR-0065 / 作業単位 A-22a）は `?11`（置き換えるか）と `?12` / `?13`（下限 / 上限）。**
+///   形式指示と同じ3値で、**2列を同じ `?11` で切り替える**——片方の列だけを書く形は文として書けない
+///   （1組の CHECK もそれを止める / `migrations/0019_character_response_length.sql`）。
 /// * **`handle` はこの文に現れない。** 識別子は不変（ADR-0016 §1）。
 ///
 /// **引き当ては行を読まずに WHERE で行う。** `find_character_by_handle` を先に呼ぶ形にすると
@@ -153,7 +177,9 @@ const UPDATE_CHARACTER: &str = "UPDATE character SET \
      axis_discovery_slots = coalesce(?9, axis_discovery_slots), \
      archived_at = CASE WHEN ?10 IS NULL THEN archived_at \
                         WHEN ?10 THEN coalesce(archived_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
-                        ELSE NULL END \
+                        ELSE NULL END, \
+     response_length_min = CASE WHEN ?11 THEN ?12 ELSE response_length_min END, \
+     response_length_max = CASE WHEN ?11 THEN ?13 ELSE response_length_max END \
      WHERE handle = ?8 \
      AND NOT EXISTS (SELECT 1 FROM stat_alloc \
                      WHERE stat_alloc.character_id = character.id AND stat_alloc.value > ?5)";
@@ -355,11 +381,45 @@ impl Store {
         stat_scale: StatScale,
         stat_drift_mode: Option<StatDriftMode>,
     ) -> Result<CharacterId, StoreError> {
+        self.create_character_with_settings(
+            handle,
+            display_name,
+            base_persona,
+            output_format_instruction,
+            stat_scale,
+            CharacterSettings {
+                stat_drift_mode,
+                response_length: None,
+            },
+        )
+        .await
+    }
+
+    /// **任意の欄まで指定して**キャラクターを作る（作業単位 A-22a。`POST /admin/characters` の入口）。
+    ///
+    /// `settings` の欄が `None` なら、その列は未設定（NULL）で作る ——
+    /// `CharacterSettings::default()` を渡せば [`Self::create_character`] と同じ。
+    ///
+    /// **返答の長さの目安は2列を同じ値から書く**（`ResponseLength` の下限と上限 / ADR-0065 §決定1）。
+    /// 検証済みの型しか受け取らないので、片方だけ・範囲外の値が DB に届く経路は無い。
+    pub async fn create_character_with_settings(
+        &self,
+        handle: &Handle,
+        display_name: &DisplayName,
+        base_persona: &Persona,
+        output_format_instruction: Option<&OutputFormat>,
+        stat_scale: StatScale,
+        settings: CharacterSettings,
+    ) -> Result<CharacterId, StoreError> {
+        let CharacterSettings {
+            stat_drift_mode,
+            response_length,
+        } = settings;
         let done = sqlx::query(
             "INSERT INTO character \
              (handle, display_name, base_persona, output_format_instruction, stat_scale, \
-              stat_drift_mode) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+              stat_drift_mode, response_length_min, response_length_max) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(handle.as_str())
         .bind(display_name.as_str())
@@ -369,6 +429,8 @@ impl Store {
         .bind(output_format_instruction.map(OutputFormat::as_str))
         .bind(stat_scale.get())
         .bind(stat_drift_mode.map(StatDriftMode::label))
+        .bind(response_length.map(ResponseLength::min))
+        .bind(response_length.map(ResponseLength::max))
         .execute(&self.pool)
         .await
         .map_err(StoreError::Query)?;
@@ -491,6 +553,17 @@ impl Store {
             // `0017` の CHECK が TEXT 以外を止めるが、CHECK は外せる）。
             let stored_archived_at: Option<String> =
                 row.try_get("archived_at").map_err(StoreError::Query)?;
+            // **NULL は「未設定」**（ADR-0065 §決定1）。**`try_get::<Option<u16>>` にしない**
+            // （`stat_scale` と同じ理由。範囲外の整数を「読めない行」として指し示すため）。
+            // 整数でない値（TEXT / REAL / BLOB）が入っていれば、今でも一覧ごと落ちる（同じ構造的な限界）。
+            let stored_length = StoredResponseLength {
+                min: row
+                    .try_get("response_length_min")
+                    .map_err(StoreError::Query)?,
+                max: row
+                    .try_get("response_length_max")
+                    .map_err(StoreError::Query)?,
+            };
 
             entries.push(character_entry(
                 id,
@@ -503,6 +576,7 @@ impl Store {
                 stored_slots,
                 created_at,
                 stored_archived_at.as_deref(),
+                stored_length,
             ));
         }
 
@@ -539,6 +613,14 @@ impl Store {
             .map_err(StoreError::Query)?;
         let stored_archived_at: Option<String> =
             row.try_get("archived_at").map_err(StoreError::Query)?;
+        let stored_length = StoredResponseLength {
+            min: row
+                .try_get("response_length_min")
+                .map_err(StoreError::Query)?,
+            max: row
+                .try_get("response_length_max")
+                .map_err(StoreError::Query)?,
+        };
         Ok(Some(Character {
             id: CharacterId::from_row(id),
             // WHERE で完全一致させているので、格納値は引数と同一。
@@ -552,6 +634,8 @@ impl Store {
             stat_scale: stat_scale_from_row(id, stored_stat_scale)?,
             stat_drift_mode: stat_drift_mode_from_row(id, stored_drift_mode.as_deref())?,
             axis_discovery_slots: axis_discovery_slots_from_row(id, stored_slots)?,
+            // **読めない1組を「未設定」に落とさない**（`CharacterColumn::ResponseLengthMin` の doc）。
+            response_length: response_length_from_row(id, stored_length)?,
             created_at: row.try_get("created_at").map_err(StoreError::Query)?,
             // **読めない時刻を「しまっていない」に落とさない**（`CharacterColumn::ArchivedAt` の doc）。
             archived_at: archived_at_from_row(id, stored_archived_at.as_deref())?,
@@ -614,6 +698,12 @@ impl Store {
             FieldUpdate::Set(mode) => (true, Some(mode.label())),
             FieldUpdate::Clear => (true, None),
         };
+        // 返答の長さの目安も同じ3値（ADR-0065 §決定1）。**2列は同じ「置き換えるか」で切り替える。**
+        let (replaces_length, new_length) = match update.response_length {
+            FieldUpdate::Keep => (false, None),
+            FieldUpdate::Set(length) => (true, Some(length)),
+            FieldUpdate::Clear => (true, None),
+        };
 
         let mut tx = self.pool.begin().await.map_err(StoreError::Query)?;
 
@@ -634,6 +724,10 @@ impl Store {
             .bind(update.axis_discovery_slots.map(AxisDiscoverySlots::get))
             // **`?10`**（しまう／戻す / ADR-0049 §決定1）。`None` は「変えない」。
             .bind(update.archived)
+            // **`?11` / `?12` / `?13`**（返答の長さの目安 / ADR-0065）。下限と上限は同じ1組から。
+            .bind(replaces_length)
+            .bind(new_length.map(ResponseLength::min))
+            .bind(new_length.map(ResponseLength::max))
             .execute(&mut *tx)
             .await
             .map_err(StoreError::Query)?;
@@ -1099,7 +1193,7 @@ const SELECT_MAX_STAT_AXES: &str = "SELECT COALESCE(MAX(axes), 0) AS axes \
 /// （数え漏れがあっても、その行は読めない側に落ちる）。
 #[expect(
     clippy::too_many_arguments,
-    reason = "格納値を列ごとに受ける形のまま、A-8 で走らせ方の列、A-9a で枠の数の列、A-10 でしまった時刻の列が増えた"
+    reason = "格納値を列ごとに受ける形のまま、A-8 で走らせ方の列、A-9a で枠の数の列、A-10 でしまった時刻の列、A-22a で返答の長さの目安の1組が増えた"
 )]
 fn character_entry(
     id: i64,
@@ -1112,6 +1206,7 @@ fn character_entry(
     stored_slots: i64,
     created_at: DateTime<Utc>,
     stored_archived_at: Option<&str>,
+    stored_length: StoredResponseLength,
 ) -> CharacterEntry {
     let mut invalid_columns = Vec::new();
 
@@ -1187,6 +1282,14 @@ fn character_entry(
         invalid_columns.push(CharacterColumn::ArchivedAt);
     }
 
+    // **両方 NULL は「未設定」であって不正ではない**（ADR-0065 §決定1）。
+    // **1組が読めなければ2列とも指し示す**（`CharacterColumn::ResponseLengthMin` の doc）。
+    let response_length = parse_response_length(stored_length);
+    if response_length.is_none() {
+        invalid_columns.push(CharacterColumn::ResponseLengthMin);
+        invalid_columns.push(CharacterColumn::ResponseLengthMax);
+    }
+
     match (
         handle,
         display_name,
@@ -1196,6 +1299,7 @@ fn character_entry(
         stat_drift_mode,
         axis_discovery_slots,
         archived_at,
+        response_length,
     ) {
         (
             Some(handle),
@@ -1206,6 +1310,7 @@ fn character_entry(
             Some(stat_drift_mode),
             Some(axis_discovery_slots),
             Some(archived_at),
+            Some(response_length),
         ) => CharacterEntry::Readable(Character {
             id: CharacterId::from_row(id),
             handle,
@@ -1215,6 +1320,7 @@ fn character_entry(
             stat_scale,
             stat_drift_mode,
             axis_discovery_slots,
+            response_length,
             created_at,
             archived_at,
         }),
@@ -1371,6 +1477,52 @@ fn axis_discovery_slots_from_row(
             );
             StoreError::InvalidStoredValue
         })
+}
+
+/// 返答の長さの目安の**格納値の1組**（2列。NULL は `None`）。読み出しの2経路が同じ形で受け渡す。
+#[derive(Debug, Clone, Copy)]
+struct StoredResponseLength {
+    min: Option<i64>,
+    max: Option<i64>,
+}
+
+/// 格納値の1組を目安に直す（ADR-0065 §決定1 / 作業単位 A-22a）。
+///
+/// | 格納値 | 結果 |
+/// |---|---|
+/// | 両方 NULL | `Some(None)`（未設定。読めた） |
+/// | 両方が整数で `ResponseLength::parse` を通る | `Some(Some(..))` |
+/// | 片方だけ NULL・`u32` に収まらない・範囲外・逆転 | `None`（読めない） |
+///
+/// **片方だけの行を「未設定」に落とさない** —— 落とすと、目安を入れたはずのキャラクターから行が黙って消える。
+fn parse_response_length(stored: StoredResponseLength) -> Option<Option<ResponseLength>> {
+    match (stored.min, stored.max) {
+        (None, None) => Some(None),
+        (Some(min), Some(max)) => {
+            let min = u32::try_from(min).ok()?;
+            let max = u32::try_from(max).ok()?;
+            ResponseLength::parse(min, max).ok().map(Some)
+        }
+        _ => None,
+    }
+}
+
+/// 格納されている返答の長さの目安を検証して返す。両方 NULL は未設定として `None`。
+///
+/// **尺度と同じ扱い**（CHECK があっても検証を省かない。握り潰さず `InvalidStoredValue` で止める）。
+///
+/// **格納値そのものはログにも出さない**（他の列と同じ。手掛かりは id）。
+fn response_length_from_row(
+    character_id: i64,
+    stored: StoredResponseLength,
+) -> Result<Option<ResponseLength>, StoreError> {
+    parse_response_length(stored).ok_or_else(|| {
+        tracing::warn!(
+            character_id,
+            "返答の長さの目安が不正なキャラクターがあります。未設定に戻すか入れ直すと直ります"
+        );
+        StoreError::InvalidStoredValue
+    })
 }
 
 /// しまった時刻の格納値を日時に直す（ADR-0049 §決定1 / 作業単位 A-10）。読めなければ `None`。

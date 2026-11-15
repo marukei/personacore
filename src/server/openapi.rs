@@ -178,7 +178,14 @@ const STABILITY_EXTENSION: &str = "x-personacore-stability";
 /// 打ち切った回の保存は ADR-0047 の「意味の変更」との境目に当たるが小さい側とした（理由は ADR-0062 §決定9 の3つ ——
 /// 上流の `max_tokens` で `"length"` に終わった回は前から保存されていた／`"length"` は既にある値／使い手が切った回・上流が
 /// 壊れた回を保存しないことは変わらない）。
-pub const API_VERSION: &str = "1.10";
+///
+/// **`1.11`**（作業単位 A-22a / ADR-0065 §決定1）: キャラクターの応答（`CharacterView`）に欄 `response_length`
+/// （`{"min", "max"}` か `null`）、作成の依頼と `PATCH` の依頼に同じ名前の**任意の欄**（`PATCH` は省けば残す・`null` で
+/// 未設定に戻す・値で置き換える）、読めない列の `invalid_columns` の `enum` に値 `response_length_min` /
+/// `response_length_max`、新しい失敗 400 `response_length_too_small` / `response_length_too_large` /
+/// `response_length_inverted`。応答の欄・要求の任意の欄・応答の `enum` の値・新しい失敗の追加だけなので小さい側。
+/// **省いた依頼の意味は変えていない**（作成は未設定、`PATCH` は残す）。
+pub const API_VERSION: &str = "1.11";
 
 /// **ルータに届いた要求への全部の応答に付ける、API の版のヘッダの名前**
 /// （HTTP では大文字小文字を区別しない。仕様書の `headers` の鍵もこの綴り）。
@@ -2040,6 +2047,7 @@ mod tests {
         for name in [
             "CreateCharacterRequest",
             "UpdateCharacterRequest",
+            "ResponseLengthRequest",
             "ReplaceStatsRequest",
             "StatAllocRequest",
             "ReplaceAttributesRequest",
@@ -2075,6 +2083,8 @@ mod tests {
         for field in [
             "output_format_instruction",
             "stat_drift_mode",
+            // 返答の長さの目安（作業単位 A-22a）。値はオブジェクト（`ResponseLengthRequest`）。
+            "response_length",
             "display_name",
         ] {
             assert!(
@@ -2096,6 +2106,16 @@ mod tests {
         assert!(admits_null(
             &response["properties"]["output_format_instruction"]
         ));
+        // 返答の長さの目安も同じ（常に載って `null` になりうる / 作業単位 A-22a）。
+        assert!(
+            required(response).contains(&"response_length"),
+            "応答の response_length は常に載ること: {response}"
+        );
+        assert!(
+            admits_null(&response["properties"]["response_length"]),
+            "{}",
+            response["properties"]["response_length"]
+        );
         assert!(
             !admits_null(&response["properties"]["handle"]),
             "対照: null にならない欄は null を許さないこと"

@@ -126,7 +126,7 @@ import {
   type WireField,
 } from "./support/rust-wire";
 
-/** `admin.rs` と `api.ts` の両方にあり、綴りも同じもの。**この 41 個を突き合わせる。** */
+/** `admin.rs` と `api.ts` の両方にあり、綴りも同じもの。**この 43 個を突き合わせる。** */
 const MIRRORED = [
   "CharacterListView",
   "CharacterView",
@@ -134,6 +134,9 @@ const MIRRORED = [
   "UpdatedCharacterView",
   "CreateCharacterRequest",
   "UpdateCharacterRequest",
+  // **返答の長さの目安の2つ**（作業単位 A-22a。サーバと画面を同じ単位で足した）。
+  "ResponseLengthRequest",
+  "ResponseLengthView",
   "StatsView",
   "StatAllocView",
   "ReplaceStatsRequest",

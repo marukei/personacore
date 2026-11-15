@@ -12,8 +12,8 @@
 use chrono::Utc;
 use personacore::domain::{
     AxisDiscoverySlots, Character, CharacterColumn, CharacterEntry, CharacterId, CharacterUpdate,
-    DisplayName, FieldUpdate, Handle, OutputFormat, Persona, StatAlloc, StatAxis, StatDriftMode,
-    StatScale, UnreadableCharacter,
+    DisplayName, FieldUpdate, Handle, OutputFormat, Persona, ResponseLength, StatAlloc, StatAxis,
+    StatDriftMode, StatScale, UnreadableCharacter,
 };
 use personacore::store::{Store, StoreError};
 use sqlx::error::ErrorKind;
@@ -1773,6 +1773,7 @@ async fn an_update_repairs_a_row_that_cannot_be_read() {
                 stat_drift_mode: FieldUpdate::Keep,
                 axis_discovery_slots: None,
                 archived: None,
+                response_length: FieldUpdate::Keep,
             },
         )
         .await
@@ -2031,6 +2032,7 @@ async fn an_update_never_changes_the_identifier() {
                 stat_drift_mode: FieldUpdate::Keep,
                 axis_discovery_slots: None,
                 archived: None,
+                response_length: FieldUpdate::Keep,
             },
         )
         .await
@@ -3037,6 +3039,7 @@ async fn a_broken_row_can_be_repaired_with_what_the_listing_returns() {
                 stat_drift_mode: FieldUpdate::Keep,
                 axis_discovery_slots: None,
                 archived: None,
+                response_length: FieldUpdate::Keep,
             },
         )
         .await
@@ -4903,6 +4906,11 @@ async fn every_updatable_column_lands_in_its_own_place() {
                 ),
                 // **しまう（`?10` / 作業単位 A-10）。** `handle`（`?8`）・枠の数（`?9`）の後ろに足した。
                 archived: Some(true),
+                // **返答の長さの目安（`?11`〜`?13` / 作業単位 A-22a）。** 下限・上限は互いに違い、
+                // 尺度（42）とも枠の数（2）とも違う値（取り違えはどの組でも赤になる）。
+                response_length: FieldUpdate::Set(
+                    ResponseLength::parse(105, 1200).expect("正当な目安であること"),
+                ),
             },
         )
         .await
@@ -4918,6 +4926,9 @@ async fn every_updatable_column_lands_in_its_own_place() {
             after.stat_scale,
             after.stat_drift_mode,
             after.axis_discovery_slots.get(),
+            after
+                .response_length
+                .map(|length| (length.min(), length.max())),
         ),
         (
             display("碧"),
@@ -4926,6 +4937,7 @@ async fn every_updatable_column_lands_in_its_own_place() {
             scale,
             Some(StatDriftMode::Shadow),
             2,
+            Some((105, 1200)),
         )
     );
 }

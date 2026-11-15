@@ -491,6 +491,7 @@ async fn a_category_named_after_a_control_token_is_not_special_in_the_prompt() {
         stat_scale: fixture_scale(),
         stat_drift_mode: None,
         axis_discovery_slots: AxisDiscoverySlots::NONE,
+        response_length: None,
         created_at: Utc::now(),
         archived_at: None,
     };

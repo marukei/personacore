@@ -73,6 +73,7 @@ function characterOf(handle: string, id: number, scale: number): CharacterView {
     stat_scale: scale,
     stat_drift_mode: null,
     axis_discovery_slots: 0,
+    response_length: null,
     archived_at: null,
     created_at: "2026-08-28T00:00:00Z",
   };

@@ -392,6 +392,46 @@
     既定に従うと、サーバの起動時の設定に従います。
   </p>
 
+  <!--
+    **返答の長さの目安**（作業単位 A-22a / ADR-0065 §決定1）。下限と上限の2つで1組。
+    **上下限（1〜9999）を書かない**（`ResponseLength::LOWEST` / `HIGHEST` を写さない）。
+    範囲外・下限 > 上限はサーバが理由つきで返す。片方だけなら `characterEdit.ts` が送らずに案内する。
+  -->
+  <label>
+    <span>返答の長さの目安（字）</span>
+    <span class="flex items-center gap-2">
+      <input
+        class="w-24"
+        name="response_length_min"
+        inputmode="numeric"
+        placeholder="200"
+        aria-label="返答の長さの目安の下限（字）"
+        bind:value={draft.response_length_min}
+        disabled={saving}
+      />
+      〜
+      <input
+        class="w-24"
+        name="response_length_max"
+        inputmode="numeric"
+        placeholder="400"
+        aria-label="返答の長さの目安の上限（字）"
+        bind:value={draft.response_length_max}
+        disabled={saving}
+      />
+    </span>
+  </label>
+  <!--
+    **この欄がしないこと**（ADR-0065 §決定4）を欄の近くに書く ——
+    **上限としては働かない**（高い目安ほど上の端を超えて伸びる）と、**縮んだ会話は戻さない**
+    （縮んでから設定しても戻らないことを測った）。
+    **⚠ 出典（ADR の番号）を画面に書かないこと**（作業単位 F-8 / `tests/screen-wording.test.ts`）。
+  -->
+  <p class="hint" data-hint="response_length">
+    地の文・台詞・心情描写を合わせた返答の字数の目安です。両方空にすると未設定になります。変えると次のやり取りから効きます。
+    この上限で返答が切られることはなく、目安より長くなることがあります。短くなってしまった会話は、この欄を設定しても元に戻りません（新しい会話を始めてください）。
+  </p>
+
   {#if !built.ok}
     <p class="error" role="alert">{built.message}</p>
   {/if}

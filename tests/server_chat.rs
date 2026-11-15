@@ -3844,3 +3844,89 @@ async fn the_memory_boundary_coincides_with_the_turn_the_history_window_moves() 
 
     server.stop().await;
 }
+
+/// **`PATCH` した返答の長さの目安が、次のターンの system の最後の行に載る**（ADR-0065 §決定1・2 /
+/// 作業単位 A-22a）。本番と同じ入口（`App::bind`）と HTTP の `PATCH` を通す。
+///
+/// * 未設定のターン（1回目）には載らない。
+/// * 設定した次のターン（2回目）には、測った文が漢数字で、**system の最後の行**として載る。
+/// * `null` で戻した次のターン（3回目）の system は、1回目と1バイトも違わない。
+#[tokio::test]
+async fn a_patched_response_length_reaches_the_last_line_of_the_next_system_prompt() {
+    let upstream = MockServer::start().await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"id":"chatcmpl-1","object":"chat.completion","created":1,
+                "model":"m","choices":[{"index":0,
+                "message":{"role":"assistant","content":"「はい」"},
+                "finish_reason":"stop"}]}"#,
+            "application/json",
+        ))
+        .mount(&upstream)
+        .await;
+    let server = BoundServer::start(&[(ENV_LLM_ENDPOINT, &upstream.uri())]).await;
+
+    // 1ターンごとに、上流へ渡った system を読む（**新しいセッション**で、履歴の差を混ぜない）。
+    let (bound, mock) = (&server, &upstream);
+    let turn = || async move {
+        let response = bound
+            .client
+            .post(format!("http://{}/v1/chat/completions", bound.addr))
+            .json(&request_of("aoi@new", "こんにちは"))
+            .send()
+            .await
+            .expect("サーバへ接続できること");
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = mock
+            .received_requests()
+            .await
+            .expect("要求を記録していること");
+        // **本文の要求だけを拾う**（裏方の抽出も同じ口へ届くので、本文の system の冒頭で見分ける）。
+        requests
+            .iter()
+            .rev()
+            .filter(|request| request.url.path() == "/v1/chat/completions")
+            .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+            .filter_map(|body| body["messages"][0]["content"].as_str().map(str::to_owned))
+            .find(|system| {
+                system.starts_with("あなたはこれから提示するキャラクターとして応答してください。")
+            })
+            .expect("本文の要求を上流へ中継していること")
+    };
+    let patch = |body: Value| {
+        let client = server.client.clone();
+        let addr = server.addr;
+        async move {
+            let response = client
+                .patch(format!("http://{addr}/admin/characters/aoi"))
+                .json(&body)
+                .send()
+                .await
+                .expect("サーバへ接続できること");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    };
+
+    let unset = turn().await;
+    assert!(!unset.contains("字を目安に書く。"), "{unset}");
+
+    patch(json!({"response_length": {"min": 200, "max": 400}})).await;
+    let set = turn().await;
+    assert_eq!(
+        set.lines().last(),
+        Some(
+            "返答は毎回、地の文・「」の台詞・（）の心情描写を合わせて、二百〜四百字を目安に書く。利用者の発言が短いときほど、情景・動作・心情を描き足し、前の返答より短くしない。"
+        ),
+        "{set}"
+    );
+
+    patch(json!({"response_length": null})).await;
+    let cleared = turn().await;
+    assert_eq!(
+        cleared, unset,
+        "未設定に戻せば1回目と同じ system になること"
+    );
+
+    server.stop().await;
+}
