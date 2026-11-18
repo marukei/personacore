@@ -83,6 +83,16 @@ impl ResponseLength {
     pub const fn max(self) -> u16 {
         self.max
     }
+
+    /// **その返答の字数が、目安の下限を割っているか**（[ADR-0066](../../docs/adr/0066-the-end-token-is-lowered-once-a-session-has-shrunk.md)
+    /// §決定2 / 作業単位 A-22b）。
+    ///
+    /// **`<` で比べる**（下限ちょうどは割っていない）。字数は返答の `raw_content` の Unicode のスカラー値の数
+    /// （`str::chars` の数）で、数えるのは呼び出し側（`store` の `shortest_reply_short_of`）。
+    #[must_use]
+    pub fn falls_short(self, chars: usize) -> bool {
+        chars < usize::from(self.min)
+    }
 }
 
 /// [`ResponseLength::parse`] が受け付けなかった理由。
@@ -110,6 +120,24 @@ mod tests {
     /// 通った値の (下限, 上限)。
     fn pair(min: u32, max: u32) -> Result<(u16, u16), ResponseLengthError> {
         ResponseLength::parse(min, max).map(|length| (length.min(), length.max()))
+    }
+
+    /// **下限を割るのは、下限より少ないときだけ**（ADR-0066 §決定2 の「下限ちょうどは割っていない」）。
+    ///
+    /// 下限の前後（下限 − 1・下限・下限 + 1）を、上限と違う下限で見る（下限と上限を取り違える実装を赤にする）。
+    /// 期待値は手で書く。
+    #[test]
+    fn a_reply_falls_short_only_below_the_lower_bound() {
+        let target = ResponseLength::parse(300, 600).expect("範囲の中");
+        assert!(target.falls_short(0));
+        assert!(target.falls_short(299));
+        assert!(!target.falls_short(300), "下限ちょうどは割っていない");
+        assert!(!target.falls_short(301));
+        assert!(!target.falls_short(599));
+        assert!(!target.falls_short(601), "上限を超えても割ってはいない");
+        let lowest = ResponseLength::parse(1, 1).expect("範囲の中");
+        assert!(lowest.falls_short(0));
+        assert!(!lowest.falls_short(1));
     }
 
     /// **端の値は通る。** 期待値は定数から作らない（外の値 1 / 9999 で押さえる）。

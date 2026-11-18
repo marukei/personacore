@@ -179,12 +179,15 @@ pub(crate) struct WrittenFace {
 /// [`WrittenFaceRequest::sampling`] / 作業単位 D-21）。**`null` か、書いた鍵だけのオブジェクト。**
 ///
 /// **鍵・範囲・綴りは読み込みの定義から作る**（写さない）——鍵は `upstreams::SAMPLING_KEYS`、範囲は
-/// `llm::REPEAT_PENALTY_MIN` / `REPEAT_PENALTY_MAX`、思考の量の綴りは `llm::ReasoningEffort::ALL`。
+/// `llm::REPEAT_PENALTY_MIN` / `REPEAT_PENALTY_MAX`、思考の量の綴りは `llm::ReasoningEffort::ALL`、
+/// 終わりのトークンの中の鍵は `upstreams::END_TOKEN_BIAS_FIELDS`、強さの下限は `llm::END_TOKEN_BIAS_MIN`
+/// （上限は 0 を含まない / ADR-0066 §決定1）。
 /// **依頼では、この形に合わない値も 400 にしない**（読み込みが 422 で理由を返す / ADR-0060 §決定2）。
 fn sampling_schema() -> Object {
     use utoipa::openapi::schema::{AdditionalProperties, ObjectBuilder, SchemaType, Type};
 
-    let [repeat_penalty, reasoning_effort] = super::upstreams::SAMPLING_KEYS;
+    let [repeat_penalty, reasoning_effort, end_token_bias] = super::upstreams::SAMPLING_KEYS;
+    let [token, bias] = super::upstreams::END_TOKEN_BIAS_FIELDS;
     ObjectBuilder::new()
         .schema_type(SchemaType::from_iter([Type::Object, Type::Null]))
         .property(
@@ -199,6 +202,28 @@ fn sampling_schema() -> Object {
             openapi::closed_string(
                 crate::llm::ReasoningEffort::ALL.map(crate::llm::ReasoningEffort::as_str),
             ),
+        )
+        .property(
+            end_token_bias,
+            ObjectBuilder::new()
+                .schema_type(Type::Object)
+                .property(
+                    token,
+                    ObjectBuilder::new()
+                        .schema_type(Type::Integer)
+                        .minimum(Some(0.0))
+                        .maximum(Some(f64::from(u32::MAX))),
+                )
+                .property(
+                    bias,
+                    ObjectBuilder::new()
+                        .schema_type(Type::Number)
+                        .minimum(Some(crate::llm::END_TOKEN_BIAS_MIN))
+                        .exclusive_maximum(Some(0.0)),
+                )
+                .required(token)
+                .required(bias)
+                .additional_properties(Some(AdditionalProperties::FreeForm(false))),
         )
         .additional_properties(Some(AdditionalProperties::FreeForm(false)))
         .build()
@@ -859,9 +884,13 @@ fn same_sampling(sent: &Map<String, Value>, written: &Map<String, Value>) -> boo
         })
 }
 
-/// **2つの値が同じ意味か**（数は [`SAME_NUMBER_ULPS`] 以内。ほかは等しさ）。
+/// **2つの値が同じ意味か**（数は [`SAME_NUMBER_ULPS`] 以内。オブジェクトは鍵ごとに同じ規則。ほかは等しさ）。
+///
+/// **オブジェクトの中へ降りる**のは `end_token_bias`（`{"token", "bias"}` / ADR-0066 §決定1 / 作業単位 A-22b）のため ——
+/// 降りないと、桁の多い `bias` を送った保存が、書き換えた後に 500 になる（`repeat_penalty` で踏んだ穴と同じ）。
 fn same_meaning(left: &Value, right: &Value) -> bool {
     match (left, right) {
+        (Value::Object(left), Value::Object(right)) => same_sampling(left, right),
         (Value::Number(left), Value::Number(right)) => match (left.as_f64(), right.as_f64()) {
             (Some(left), Some(right)) => {
                 // **符号の違う2つは、ビット列の隔たりが 2^63 前後になるので、ここでは同じにならない**
@@ -2488,6 +2517,35 @@ mod tests {
         other.insert("reasoning_effort".to_owned(), Value::from("none"));
         assert!(!same_sampling(&both, &other), "綴りが違う");
         assert!(same_sampling(&both, &both.clone()));
+
+        // **オブジェクトの中の数も同じ規則**（`end_token_bias` / ADR-0066 §決定1 / 作業単位 A-22b）。
+        let ended = |bias: Value, token: u64| {
+            let mut inner = Map::new();
+            inner.insert("token".to_owned(), Value::from(token));
+            inner.insert("bias".to_owned(), bias);
+            let mut map = Map::new();
+            map.insert("end_token_bias".to_owned(), Value::Object(inner));
+            map
+        };
+        let negative = -2.889_326_166_248_924_6_f64;
+        let nudged = |ulps: u64| Value::from(f64::from_bits(negative.to_bits() + ulps));
+        let sent = ended(Value::from(negative), 248_046);
+        assert!(
+            same_sampling(&sent, &ended(nudged(1), 248_046)),
+            "中の 1 ULP"
+        );
+        assert!(
+            same_sampling(&sent, &ended(nudged(4), 248_046)),
+            "中の 4 ULP"
+        );
+        assert!(
+            !same_sampling(&sent, &ended(nudged(5), 248_046)),
+            "中の 5 ULP"
+        );
+        assert!(
+            !same_sampling(&sent, &ended(Value::from(negative), 2)),
+            "番号が違う"
+        );
     }
 
     /// **`context_tokens` を書いていない面は、A-13a-2 の前と1バイトも違わない形で書く**
@@ -2661,6 +2719,91 @@ mod tests {
                 "    \"sub\": {\n",
                 "      \"endpoint\": \"http://127.0.0.1:44003\",\n",
                 "      \"model\": \"only-sub\"\n",
+                "    }\n",
+                "  }\n",
+                "}\n",
+            )
+        );
+    }
+
+    /// **手で書いた終わりのトークンを下げる値（`sampling.end_token_bias`）は、画面の保存が `sampling` を送らなければ残る。
+    /// `endpoint` や `model` を変えても残す**（ADR-0066 §決定3 / ADR-0058 §決定6 の形 / 作業単位 A-22b）。
+    ///
+    /// 前例 [`a_written_sampling_is_kept_from_the_same_name_and_face`] と同じ形。**値を名前ごとに違える**
+    /// （番号 248046・強さ -3.0 と、番号 2・強さ -1.5）—— 別の名前から写す実装を赤にする。新しい名前には生えない。
+    #[test]
+    fn a_written_end_token_bias_is_kept_from_the_same_name_and_face() {
+        let current = r#"{
+            "lowered": { "main": { "endpoint": "http://127.0.0.1:45201", "model": "lowered-main",
+                                    "sampling": { "repeat_penalty": 1.05,
+                                                  "end_token_bias": { "token": 248046, "bias": -3.0 } } } },
+            "other":   { "main": { "endpoint": "http://127.0.0.1:45203", "model": "other-main",
+                                    "sampling": { "end_token_bias": { "token": 2, "bias": -1.5 } } } } }"#;
+        let lowered = edit(face("http://127.0.0.1:45209", "lowered-main-2"), None);
+        let written = apply_edit(Some(current), "lowered", &lowered, None).expect("保存できること");
+        let after: Value = serde_json::from_str(&written).expect("JSON");
+        assert_eq!(
+            (
+                &after["lowered"]["main"]["endpoint"],
+                &after["lowered"]["main"]["model"],
+            ),
+            (
+                &Value::from("http://127.0.0.1:45209"),
+                &Value::from("lowered-main-2")
+            ),
+            "前提: 依頼どおりに保存されたこと: {after}"
+        );
+        assert_eq!(
+            (
+                &after["lowered"]["main"]["sampling"],
+                &after["other"]["main"]["sampling"],
+            ),
+            (
+                &serde_json::json!({ "repeat_penalty": 1.05,
+                                     "end_token_bias": { "token": 248_046, "bias": -3.0 } }),
+                &serde_json::json!({ "end_token_bias": { "token": 2, "bias": -1.5 } }),
+            ),
+            "同じ名前・同じ面の値が消えた／他の名前が動いた: {after}"
+        );
+
+        let fresh = edit(face("http://127.0.0.1:45206", "fresh-main"), None);
+        let written = apply_edit(Some(current), "fresh", &fresh, None).expect("保存できること");
+        let after: Value = serde_json::from_str(&written).expect("JSON");
+        assert_eq!(
+            after["fresh"]["main"].get("sampling"),
+            None,
+            "新しい名前に他の名前の値が写った: {after}"
+        );
+    }
+
+    /// **`end_token_bias` を書いていない面は、A-22b の前と1バイトも違わない形で書く**（ADR-0058 §決定6 の対照の形 /
+    /// ADR-0066 §決定1 の「書かない面は1バイトも変えない」/ 作業単位 A-22b）。
+    ///
+    /// いまのファイルの本文の面は `repeat_penalty` だけを書いている（A-22b の前に書けた形）。画面の保存が `sampling` を
+    /// 送らなければ、その `sampling` がそのまま残り、`end_token_bias` が生えない。**期待値は直書き**。
+    #[test]
+    fn a_face_without_end_token_bias_is_written_byte_for_byte_as_before() {
+        let current = r#"{ "only": {
+            "main": { "endpoint": "http://127.0.0.1:44201", "model": "only-main",
+                      "sampling": { "repeat_penalty": 1.05 } } } }"#;
+        let written = apply_edit(
+            Some(current),
+            "only",
+            &edit(face("http://127.0.0.1:44201", "only-main-2"), None),
+            None,
+        )
+        .expect("書けること");
+        assert_eq!(
+            written,
+            concat!(
+                "{\n",
+                "  \"only\": {\n",
+                "    \"main\": {\n",
+                "      \"endpoint\": \"http://127.0.0.1:44201\",\n",
+                "      \"model\": \"only-main-2\",\n",
+                "      \"sampling\": {\n",
+                "        \"repeat_penalty\": 1.05\n",
+                "      }\n",
                 "    }\n",
                 "  }\n",
                 "}\n",

@@ -275,8 +275,11 @@ const FE_ONLY = ["ErrorBody", "ApiErrorDetail"] as const;
  * **写し元が構造体ではないもの**（作業単位 D-21）。`WrittenSampling` は `profile_editor.rs` の `WrittenFace.sampling`
  * （`Map<String, Value>`）の形で、**鍵の集合の写し元は `upstreams.rs` の `SAMPLING_KEYS`**。突き合わせは下の
  * 「`WrittenSampling` の欄は `SAMPLING_KEYS` と一致する」が持つ。
+ *
+ * **`WrittenEndTokenBias` も同じ立場**（作業単位 A-22b / ADR-0066 §決定1）。写し元は `upstreams.rs` の
+ * `END_TOKEN_BIAS_FIELDS` で、突き合わせは下の「`WrittenEndTokenBias` の欄は `END_TOKEN_BIAS_FIELDS` と一致する」が持つ。
  */
-const SAMPLING_KEYS_MIRRORED = ["WrittenSampling"] as const;
+const SAMPLING_KEYS_MIRRORED = ["WrittenSampling", "WrittenEndTokenBias"] as const;
 
 const ADMIN_RS = readFileSync(
   fileURLToPath(new URL("../../src/server/admin.rs", import.meta.url)),
@@ -318,6 +321,15 @@ function samplingKeysOf(source: string): string[] {
   const found = /^pub const SAMPLING_KEYS: \[&str; \d+\] = \[([^\]]*)\];\r?$/mu.exec(source);
   if (found?.[1] === undefined) {
     throw new Error("SAMPLING_KEYS の宣言が読めません");
+  }
+  return [...found[1].matchAll(/"([^"]*)"/gu)].map((spelled) => spelled[1] as string);
+}
+
+/** **`pub const END_TOKEN_BIAS_FIELDS: [&str; N] = ["…", …];` の綴り**（作業単位 A-22b。読み方は [`samplingKeysOf`] と同じ）。 */
+function endTokenBiasFieldsOf(source: string): string[] {
+  const found = /^pub const END_TOKEN_BIAS_FIELDS: \[&str; \d+\] = \[([^\]]*)\];\r?$/mu.exec(source);
+  if (found?.[1] === undefined) {
+    throw new Error("END_TOKEN_BIAS_FIELDS の宣言が読めません");
   }
   return [...found[1].matchAll(/"([^"]*)"/gu)].map((spelled) => spelled[1] as string);
 }
@@ -474,6 +486,17 @@ describe("上流プロファイルの欄名は写し元と一致する（`profil
         .map((key) => `${key}?`)
         .sort(),
     );
+  });
+
+  /**
+   * **`WrittenEndTokenBias` の欄は `END_TOKEN_BIAS_FIELDS` と一致する**（作業単位 A-22b / ADR-0066 §決定1）。
+   * **どちらも省けない**（サーバは番号も値も既定を持たない）ので、`?` の付かない欄で比べる。
+   */
+  it("`WrittenEndTokenBias` の欄は `END_TOKEN_BIAS_FIELDS` と一致する", () => {
+    expect(labelsOf(tsFieldsOf(API_TS, "WrittenEndTokenBias"))).toEqual(
+      [...endTokenBiasFieldsOf(UPSTREAMS_RS)].sort(),
+    );
+    expect(endTokenBiasFieldsOf('pub const END_TOKEN_BIAS_FIELDS: [&str; 1] = ["p"];\n')).toEqual(["p"]);
   });
 
   it("対照: 植えたソースの `SAMPLING_KEYS` を読む", () => {

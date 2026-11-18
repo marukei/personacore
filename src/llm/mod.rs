@@ -65,10 +65,10 @@ pub use lmstudio::{
     LmStudioConfig, ModelsReport,
 };
 pub use request::{
-    API_KEY_MAX_BYTES, ApiKey, ApiKeyError, ChatRequest, HostLookup, HostResolver,
-    KeyOverPlainHttp, ModelId, ModelIdError, REPEAT_PENALTY_MAX, REPEAT_PENALTY_MIN,
-    ReasoningEffort, RepeatPenalty, SUB_LLM_TEMPERATURE, Sampling, SentSamplers, endpoint_for_log,
-    endpoint_has_userinfo,
+    API_KEY_MAX_BYTES, ApiKey, ApiKeyError, ChatRequest, END_TOKEN_BIAS_MIN, EndTokenBias,
+    HostLookup, HostResolver, KeyOverPlainHttp, ModelId, ModelIdError, REPEAT_PENALTY_MAX,
+    REPEAT_PENALTY_MIN, ReasoningEffort, RepeatPenalty, SUB_LLM_TEMPERATURE, Sampling,
+    SentSamplers, endpoint_for_log, endpoint_has_userinfo,
 };
 
 // メッセージの値型は `domain` に置いてある（`prompt` が reqwest を引き込まないため。

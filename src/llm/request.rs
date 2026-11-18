@@ -534,6 +534,13 @@ pub struct ChatRequest {
     /// `sub` 面の無い構成では裏方のクライアントが本文のクライアントの複製なので、面の設定に載せると本文の思考が
     /// 裏方へ写る（抽出の予算 320 を思考で使い切る）。
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// **終わりのトークンを下げる値**（[ADR-0066](../../docs/adr/0066-the-end-token-is-lowered-once-a-session-has-shrunk.md)
+    /// §決定2 / 作業単位 A-22b）。**本文の経路だけが、条件が揃った回にだけ載せる。**
+    ///
+    /// `Some` なら、線の最上位に `logit_bias: {"<番号>": <値>}` が1つ載る（`None` なら欄ごと出ない）。
+    /// **裏方の経路は常に `None`**（[`Self::background`]）—— `sub` 面の無い構成でも裏方へは送らない（ADR-0066 §決定1）。
+    /// **面の設定（[`Sampling`]）に載せないのは [`Self::reasoning_effort`] と同じ理由。**
+    pub end_token_bias: Option<EndTokenBias>,
 }
 
 impl ChatRequest {
@@ -544,6 +551,7 @@ impl ChatRequest {
             temperature: None,
             max_tokens: None,
             reasoning_effort: None,
+            end_token_bias: None,
         }
     }
 
@@ -552,6 +560,9 @@ impl ChatRequest {
     /// **温度は [`SUB_LLM_TEMPERATURE`]、思考の量は上書きしない（線は既定の `"none"`）**。応答の上限だけが経路ごとに違う。
     /// 5か所で欄を直書きしていたのをここにまとめた —— **裏方の経路が思考の量を持てる形を、呼び出し側に書かせない**
     /// （ADR-0059 §決定1: 裏方は常に `"none"`）。思考の量を載せるのは本文の経路だけで、それは欄を直に組む。
+    ///
+    /// **終わりのトークンも下げない**（`end_token_bias` は `None` / ADR-0066 §決定1 —— 裏方の出力は JSON で、
+    /// 終わりを遅らせる理由が無い）。
     #[must_use]
     pub fn background(messages: Vec<ChatMessage>, max_tokens: u32) -> Self {
         Self {
@@ -559,6 +570,7 @@ impl ChatRequest {
             temperature: Some(SUB_LLM_TEMPERATURE),
             max_tokens: Some(max_tokens),
             reasoning_effort: None,
+            end_token_bias: None,
         }
     }
 }
@@ -1163,6 +1175,122 @@ impl std::fmt::Display for SentSamplers {
     }
 }
 
+/// **[`EndTokenBias`] の強さの下限**（含む / [ADR-0066](../../docs/adr/0066-the-end-token-is-lowered-once-a-session-has-shrunk.md)
+/// §決定1 の「範囲は実装で決める」）。**上限は 0（含まない）** —— 負の値だけを受ける。
+///
+/// # 範囲を「-10 以上、0 未満」にした理由
+///
+/// `logit_bias` は、そのトークンの logit に**この値を足す**（確率では `e^bias` 倍）。
+///
+/// | 値 | 何が起きるか | 扱い |
+/// |---|---|---|
+/// | NaN・無限 | 送る本文に書けない（JSON は数として表せない） | **止める** |
+/// | 0 | 何も変わらない（書いたのに効かない） | **止める** |
+/// | 正 | 終わりを早める。この欄の目的（縮んだ会話を戻す）と逆 | **止める** |
+/// | -10 以上 0 未満 | 測る意味のある範囲（ADR-0066 の実測は -1.5・-3・-5。-5 で既にキャラクターの外の一文が出た） | 通す |
+/// | -10 未満 | 終わりのトークンの確率を `e^-10`（約 2 万分の 1）より小さくする。実質「終わらせない」で、返答の上限まで書き続けて切れる。`-3.0` を `-30` と打ち損じた値もここに落ちる | **止める** |
+///
+/// **`f32` へ落としてから 0 になる値も止める**（`-f64::from_bits(1)` のような、`f64` では負でも `f32` では
+/// `-0.0` になる値。送る本文の欄は `f32` —— [`EndTokenBias::parse`]）。
+///
+/// **⚠ この範囲は測って決めたものではない**（[`REPEAT_PENALTY_MIN`] と同じく、壊れた値と打ち損じを止める柵）。
+/// 範囲の外に正当な値があると分かったら、ここを広げる。
+pub const END_TOKEN_BIAS_MIN: f64 = -10.0;
+
+/// **終わりのトークンの番号と、その logit に足す値**
+/// （[ADR-0066](../../docs/adr/0066-the-end-token-is-lowered-once-a-session-has-shrunk.md) §決定1 / 作業単位 A-22b）。
+///
+/// **[`Self::parse`] が唯一のコンストラクタ**（[`RepeatPenalty`] と同じ発想）。範囲は [`END_TOKEN_BIAS_MIN`] の表。
+/// **番号も強さも書いた人が決め、personacore は既定を持たない** —— 番号はモデル（トークナイザ）ごとに違い、
+/// 測った推論サーバは終わりのトークンを答えない（ADR-0066 §決定4）。
+///
+/// # 線の形は `logit_bias: {"<番号>": <値>}`（[`LogitBias`]）
+///
+/// **載せるのは本文の経路が条件を満たした回だけ**（[`ChatRequest::end_token_bias`]）。面の設定（[`Sampling`]）には
+/// 入れない —— `sub` 面の無い構成では裏方のクライアントが本文のクライアントの複製で、面の設定は複製に写る
+/// （[`ChatRequest::reasoning_effort`] と同じ理由。ADR-0066 §決定1「`sub` 面が無いときも、裏方には送らない」）。
+///
+/// # `Eq` を手で書く
+///
+/// 中身の `bias` は `f32` だが、**NaN と ±0 を作れない**（[`Self::parse`] が止める）ので、ビット列の比較が値の比較になる。
+/// `Eq` が要るのは、走ったままの切り替えが本文の面の値（`server::config::BodyFace`）を比べるから。
+#[derive(Debug, Clone, Copy)]
+pub struct EndTokenBias {
+    token: u32,
+    bias: f32,
+}
+
+impl PartialEq for EndTokenBias {
+    fn eq(&self, other: &Self) -> bool {
+        self.token == other.token && self.bias.to_bits() == other.bias.to_bits()
+    }
+}
+
+impl Eq for EndTokenBias {}
+
+impl EndTokenBias {
+    /// 唯一のコンストラクタ。**強さが範囲の外なら `None`**（[`END_TOKEN_BIAS_MIN`] の表）。番号は `u32` なら何でも通す
+    /// （番号が語彙の中かは、上流でなければ分からない）。
+    ///
+    /// **判定は受け取った `f64` のまま行い、通った値を `f32` へ落としてから、もう一度 0 未満かを見る**
+    /// （送る本文の欄は `f32`。`f64` で負でも、`f32` では `-0.0` になる値がある）。
+    #[must_use]
+    pub fn parse(token: u32, bias: f64) -> Option<Self> {
+        if !bias.is_finite() || !(END_TOKEN_BIAS_MIN..0.0).contains(&bias) {
+            return None;
+        }
+        // **範囲の中の `f64` は `f32` に収まる**（落ちるのは精度だけ）。
+        let narrowed = bias as f32;
+        if narrowed >= 0.0 {
+            return None;
+        }
+        Some(Self {
+            token,
+            bias: narrowed,
+        })
+    }
+
+    /// 終わりのトークンの番号。
+    #[must_use]
+    pub const fn token(self) -> u32 {
+        self.token
+    }
+
+    /// 足す値（負）。
+    #[must_use]
+    pub const fn bias(self) -> f32 {
+        self.bias
+    }
+
+    /// **線に載る綴り**（`{"248046":-3.0}`）。ログに出す値（ADR-0058 §決定3・ADR-0066 §決定2）。
+    ///
+    /// **送る本文と同じ直列化（[`LogitBias`]）から作る** —— ログと線が食い違わない。
+    #[must_use]
+    pub fn wire_spelling(self) -> String {
+        serde_json::to_string(&LogitBias(self))
+            // **有限の `f32` と文字列の鍵だけなので、失敗しない。** それでも `unwrap` に寄りかからない。
+            .unwrap_or_else(|_| "<綴れない値>".to_owned())
+    }
+}
+
+/// **線の上の `logit_bias`**（`{"<番号>": <値>}` / OpenAI 互換の綴り）。**鍵は番号の10進の文字列。**
+///
+/// **鍵は1つだけ**（終わりのトークンだけ）。値は `f32` の最短表記（`-3.0`）。
+#[derive(Debug, Clone, Copy)]
+struct LogitBias(EndTokenBias);
+
+impl Serialize for LogitBias {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(&self.0.token.to_string(), &self.0.bias)?;
+        map.end()
+    }
+}
+
 /// 送信本文。`stream` は呼び出し方（補完か中継か）で決まるので引数で受ける。
 #[derive(Debug, Serialize)]
 pub(super) struct WireRequest<'a> {
@@ -1180,6 +1308,13 @@ pub(super) struct WireRequest<'a> {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// **終わりのトークンを下げる値**（ADR-0066 §決定2）。**本文の経路が条件を満たした回だけ載る**
+    /// （[`ChatRequest::end_token_bias`]）。載らない回は欄ごと出ない —— 書かない面の要求のバイト列は変わらない。
+    ///
+    /// **[`RequestPolicy`] には置かない**（あちらは `flatten` で全経路に載る1組。ここは要求ごとの値）。
+    /// 最上位に1回だけ載ることは `tests::the_wire_bytes_carry_each_top_level_key_exactly_once` が見る。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logit_bias: Option<LogitBias>,
 }
 
 /// ストリーミングの追加要求（OpenAI 互換）。
@@ -1246,6 +1381,11 @@ struct WireMessage<'a> {
 /// **[`ChatRequest::reasoning_effort`] があるときだけ、`reasoning_effort` の欄の値をそれに置き換える。**
 /// 値の出どころは要求の側（本文の経路だけが載せる）で、`sampling`（面の設定）ではない ——
 /// `sub` 面の無い構成で、本文の思考を裏方へ写さないため。
+///
+/// # 終わりのトークン（ADR-0066 §決定2 / 作業単位 A-22b）
+///
+/// **[`ChatRequest::end_token_bias`] があるときだけ、最上位に `logit_bias` を1つ足す**（[`LogitBias`]）。
+/// 出どころは思考の量と同じく要求の側 —— 本文の経路が「その会話が目安の下限を割ったか」を見て載せる。
 pub(super) fn wire_request<'a>(
     model: &'a ModelId,
     request: &'a ChatRequest,
@@ -1275,6 +1415,8 @@ pub(super) fn wire_request<'a>(
         }),
         temperature: request.temperature,
         max_tokens: request.max_tokens,
+        // **終わりのトークンは要求の側から載せる**（ADR-0066 §決定2 —— 本文の経路が条件を満たした回だけ。裏方は常に `None`）。
+        logit_bias: request.end_token_bias.map(LogitBias),
     }
 }
 
@@ -1811,6 +1953,7 @@ mod tests {
             temperature: Some(0.5),
             max_tokens: None,
             reasoning_effort: None,
+            end_token_bias: None,
         };
         let written = to_wire_with(
             &request,
@@ -2095,6 +2238,7 @@ mod tests {
                     temperature: Some(0.5),
                     max_tokens: Some(512),
                     reasoning_effort: None,
+                    end_token_bias: None,
                 },
                 &["temperature", "max_tokens"][..],
             ),
@@ -2108,6 +2252,17 @@ mod tests {
                     ..ChatRequest::new(vec![ChatMessage::user("x")])
                 },
                 &[][..],
+            ),
+            // **本文の経路が終わりのトークンを下げた回**（ADR-0066 §決定2 / 作業単位 A-22b）。**`logit_bias` が1つ増える** ——
+            // `RequestPolicy` 側にも同じ名前の欄を足す実装はここで赤になる（2回出る）。
+            (
+                "終わりのトークンを下げた",
+                ChatRequest {
+                    end_token_bias: EndTokenBias::parse(248_046, -3.0),
+                    reasoning_effort: Some(ReasoningEffort::Low),
+                    ..ChatRequest::new(vec![ChatMessage::user("x")])
+                },
+                &["logit_bias"][..],
             ),
         ];
 
@@ -2196,6 +2351,7 @@ mod tests {
             temperature: Some(0.5),
             max_tokens: Some(512),
             reasoning_effort: None,
+            end_token_bias: None,
         };
 
         assert_eq!(
@@ -2238,6 +2394,7 @@ mod tests {
                     temperature: Some(0.5),
                     max_tokens: Some(512),
                     reasoning_effort: None,
+                    end_token_bias: None,
                 },
             ),
         ];
@@ -2292,6 +2449,7 @@ mod tests {
                     temperature: Some(0.5),
                     max_tokens: Some(512),
                     reasoning_effort: None,
+                    end_token_bias: None,
                 },
             ),
         ];
@@ -2345,6 +2503,7 @@ mod tests {
                     temperature: Some(0.5),
                     max_tokens: Some(512),
                     reasoning_effort: None,
+                    end_token_bias: None,
                 },
             ),
         ];
@@ -2383,6 +2542,7 @@ mod tests {
             temperature: Some(0.5),
             max_tokens: None,
             reasoning_effort: None,
+            end_token_bias: None,
         };
         let low = ChatRequest {
             reasoning_effort: Some(ReasoningEffort::Low),
@@ -2497,6 +2657,7 @@ mod tests {
             temperature: Some(0.5),
             max_tokens: Some(512),
             reasoning_effort: None,
+            end_token_bias: None,
         };
         let body = to_value(&request, true);
         assert_eq!(body["temperature"], json!(0.5));
@@ -2533,6 +2694,7 @@ mod tests {
             temperature: Some(SUB_LLM_TEMPERATURE),
             max_tokens: Some(320),
             reasoning_effort: None,
+            end_token_bias: None,
         };
         let wire = to_wire(&request, false);
 
@@ -2557,9 +2719,134 @@ mod tests {
             ),
             (Some(0.8), Some(77), None)
         );
+        // **終わりのトークンも下げない**（ADR-0066 §決定1）。
+        assert_eq!(request.end_token_bias, None);
         let body = to_value(&request, false);
         assert_eq!(body["reasoning_effort"], json!("none"));
         assert_eq!(body["max_tokens"], json!(77));
+        assert!(body.get("logit_bias").is_none(), "{body}");
+    }
+
+    fn end_token(token: u32, bias: f64) -> EndTokenBias {
+        EndTokenBias::parse(token, bias).unwrap_or_else(|| panic!("{token} / {bias} は通ること"))
+    }
+
+    /// **終わりのトークンを下げる値は、最上位の `logit_bias` に1つだけ載る**
+    /// （[ADR-0066](../../docs/adr/0066-the-end-token-is-lowered-once-a-session-has-shrunk.md) §決定2 / 作業単位 A-22b）。
+    ///
+    /// **期待値は手で書いたバイト列**（[`the_wire_bytes_spell_the_request_exactly`] と同じ形）。値は `f32` で割り切れない
+    /// `-1.3` にしてある —— `to_value` を経由する実装に変わると `-1.2999999523162842` になって赤くなる。
+    ///
+    /// | 腕 | 期待 |
+    /// |---|---|
+    /// | `Some`・非ストリーミング | 末尾に `"logit_bias":{"248046":-1.3}`（鍵は番号の10進の文字列） |
+    /// | `Some`・ストリーミング | 同じ綴りが末尾に載る（ストリーミングの分岐の外側にあること） |
+    /// | `None` | 上の綴りからその1欄を除いたものと同じ（**書かない面の要求は1バイトも変わらない**） |
+    /// | `Some` ＋ 思考の上書き ＋ 面の `repeat_penalty` | 3つとも置き換わる（どれも他を消さない） |
+    #[test]
+    fn an_end_token_bias_adds_one_logit_bias_at_the_top_level() {
+        let plain = ChatRequest {
+            messages: vec![ChatMessage::user("こんにちは")],
+            temperature: Some(0.5),
+            max_tokens: Some(512),
+            reasoning_effort: None,
+            end_token_bias: None,
+        };
+        let lowered = ChatRequest {
+            end_token_bias: Some(end_token(248_046, -1.3)),
+            ..plain.clone()
+        };
+        let written = to_wire(&lowered, false);
+        assert_eq!(
+            written,
+            concat!(
+                r#"{"model":"ministral-3-14b-instruct-2512","#,
+                r#""messages":[{"role":"user","content":"こんにちは"}],"#,
+                r#""stream":false,"reasoning_effort":"none","#,
+                r#""top_k":40,"top_p":0.95,"min_p":0.05,"repeat_penalty":1.1,"#,
+                r#""presence_penalty":0.0,"temperature":0.5,"max_tokens":512,"#,
+                r#""logit_bias":{"248046":-1.3}}"#,
+            )
+        );
+        assert!(
+            to_wire(&lowered, true).ends_with(r#""max_tokens":512,"logit_bias":{"248046":-1.3}}"#),
+            "ストリーミングでも載ること: {}",
+            to_wire(&lowered, true)
+        );
+        // **対照**: 載せなければ、その1欄が無いだけ。
+        assert_eq!(
+            to_wire(&plain, false),
+            written.replace(r#","logit_bias":{"248046":-1.3}"#, "")
+        );
+        // **思考の量と面の値と重なっても、どれも置き換わる。**
+        let all = ChatRequest {
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..lowered.clone()
+        };
+        assert_eq!(
+            to_wire_with(&all, false, Sampling::with_repeat_penalty(penalty(1.05))),
+            written
+                .replace(
+                    r#""reasoning_effort":"none""#,
+                    r#""reasoning_effort":"low""#
+                )
+                .replace(r#""repeat_penalty":1.1"#, r#""repeat_penalty":1.05"#)
+        );
+        // **ログの綴りは線の綴りと同じ。**
+        assert_eq!(
+            end_token(248_046, -1.3).wire_spelling(),
+            r#"{"248046":-1.3}"#
+        );
+    }
+
+    /// **強さの範囲**（[`END_TOKEN_BIAS_MIN`] の表）。**-10 以上 0 未満を通し、外は止める。** 番号は `u32` なら何でも通す。
+    ///
+    /// **期待値は定数から作らない**（`-10.0` を手で書く）。`f64` では負でも `f32` では `-0.0` になる下端
+    /// （`-f64::from_bits(1)`）も止める（`f32` へ落とした後の検査が要る）。
+    #[test]
+    fn an_end_token_bias_admits_exactly_the_documented_range() {
+        for (token, bias) in [
+            (248_046, -3.0),
+            (0, -1.5),
+            (u32::MAX, -0.1),
+            (2, -10.0),
+            (2, -9.999_999),
+            (2, -1e-30),
+        ] {
+            let parsed = end_token(token, bias);
+            assert_eq!(parsed.token(), token);
+            assert_eq!(f64::from(parsed.bias()), f64::from(bias as f32), "{bias}");
+            assert!(parsed.bias() < 0.0, "{bias}");
+        }
+        for bias in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -0.0,
+            3.0,
+            f64::from_bits(1),
+            -f64::from_bits(1),
+            -1e-50,
+            -10.000_001,
+            -30.0,
+            -100.0,
+            f64::MIN,
+        ] {
+            assert_eq!(
+                EndTokenBias::parse(248_046, bias),
+                None,
+                "{bias} は止めること"
+            );
+        }
+    }
+
+    /// **番号と強さの両方で比べる**（手で書いた `Eq` / 切り替えの比較が使う）。
+    #[test]
+    fn end_token_biases_compare_by_token_and_value() {
+        assert_eq!(end_token(248_046, -3.0), end_token(248_046, -3.0));
+        assert_ne!(end_token(248_046, -3.0), end_token(248_046, -1.5));
+        assert_ne!(end_token(248_046, -3.0), end_token(2, -3.0));
     }
 
     /// メッセージが空でも組み立てられる（拒否は上流の仕事。ここで panic しない）。

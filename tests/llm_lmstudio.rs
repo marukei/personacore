@@ -513,6 +513,59 @@ async fn both_call_shapes_carry_the_requested_reasoning_effort() {
     }
 }
 
+/// **要求が終わりのトークンを下げる値を載せたら、どちらの呼び方でも `logit_bias` が上流へ出る**
+/// （[ADR-0066](../docs/adr/0066-the-end-token-is-lowered-once-a-session-has-shrunk.md) §決定2 / 作業単位 A-22b）。
+///
+/// **ストリーミング（画面の会話が通る形）でも載ること**を、この層で見る。**`post` が要求の値を捨てて別の本文を組む実装は、
+/// この層でしか見えない**（思考の量の腕と同じ）。期待値は手で書く（`{"248046": -3.0}`）。
+/// **対照**: 載せない要求（[`request`]）では欄ごと出ない。
+#[tokio::test]
+async fn both_call_shapes_carry_the_requested_end_token_bias() {
+    let lowered = ChatRequest {
+        end_token_bias: personacore::llm::EndTokenBias::parse(248_046, -3.0),
+        ..request()
+    };
+    assert!(lowered.end_token_bias.is_some(), "前提: 範囲の中の値");
+    for (label, chat) in [("載せた", &lowered), ("載せない", &request())] {
+        let plain = mock_server(
+            ResponseTemplate::new(200)
+                .set_body_raw(completion_body("はい", "stop"), "application/json"),
+        )
+        .await;
+        client_for(&plain.uri())
+            .complete(chat)
+            .await
+            .expect("正常な応答を解釈できること");
+        let streaming = sse_server(format!("{}data: [DONE]\n\n", sse_delta("こん"))).await;
+        let mut chat_stream = client_for(&streaming.uri())
+            .stream(chat)
+            .await
+            .expect("ストリームを開けること");
+        drain(&mut chat_stream).await;
+
+        for (shape, server) in [("非ストリーミング", &plain), ("ストリーミング", &streaming)]
+        {
+            let requests = server
+                .received_requests()
+                .await
+                .expect("記録が有効であること");
+            assert_eq!(
+                requests.len(),
+                1,
+                "{label} / {shape}: 上流へは1回だけ投げること"
+            );
+            let sent: serde_json::Value =
+                serde_json::from_slice(&requests[0].body).expect("送信本文が JSON であること");
+            let expected = (label == "載せた").then(|| serde_json::json!({ "248046": -3.0 }));
+            assert_eq!(
+                sent.get("logit_bias").cloned(),
+                expected,
+                "{label} / {shape}: {sent}"
+            );
+        }
+    }
+}
+
 /// **上流へ出た HTTP 本文に、サンプラー5欄が綴りどおりに載る**
 /// （ADR-0038 §決定2 / 作業単位 A-7c。`presence_penalty` は A-14 で足した）。
 ///
@@ -636,6 +689,7 @@ async fn both_call_shapes_carry_the_requested_temperature_on_the_wire() {
         temperature: Some(temperature),
         max_tokens: None,
         reasoning_effort: None,
+        end_token_bias: None,
     };
 
     // 非ストリーミング（裏方の抽出・変容が通る形）。

@@ -62,8 +62,8 @@ use crate::domain::{
     DriftTuningError, StatDriftMode,
 };
 use crate::llm::{
-    ApiKey, DEFAULT_ENDPOINT, DEFAULT_MAIN_MODEL, DEFAULT_SUB_MODEL, EndpointError, LmStudioConfig,
-    ModelId, ModelIdError, ReasoningEffort, Sampling,
+    ApiKey, DEFAULT_ENDPOINT, DEFAULT_MAIN_MODEL, DEFAULT_SUB_MODEL, EndTokenBias, EndpointError,
+    LmStudioConfig, ModelId, ModelIdError, ReasoningEffort, Sampling,
 };
 use crate::prompt::TokenBudget;
 
@@ -927,6 +927,12 @@ pub(in crate::server) struct BodyFace {
     pub(in crate::server) reasoning_effort: Option<ReasoningEffort>,
     /// **書いた返答の上限**（`main` 面の `response_tokens`）。**検証済み**（1 以上）。書いていなければ `None`（1024）。
     pub(in crate::server) response_tokens: Option<u32>,
+    /// **書いた終わりのトークンを下げる値**（`main` 面の `sampling.end_token_bias` / ADR-0066 §決定1 / 作業単位 A-22b）。
+    /// 書いていなければ `None`。
+    ///
+    /// **書いてあっても毎回は送らない** —— 本文の経路が「その会話の返答が目安の下限を割ったか」を見て、割っていた回だけ
+    /// `llm::ChatRequest::end_token_bias` に載せる（ADR-0066 §決定2 / `super::end_token`）。
+    pub(in crate::server) end_token_bias: Option<EndTokenBias>,
 }
 
 impl BodyFace {
@@ -962,6 +968,7 @@ impl ProfileContext {
         let body = BodyFace {
             reasoning_effort: settings.reasoning_effort(),
             response_tokens: settings.response_tokens(),
+            end_token_bias: settings.end_token_bias(),
         };
         if body.response_tokens == Some(0) {
             return Err(ConfigError::ResponseTokens);
@@ -3221,20 +3228,25 @@ mod tests {
     fn the_body_face_rides_with_the_profile_context_and_its_room_must_fit_the_explicit_window() {
         let profiles = super::super::upstreams::parse_profiles(
             r#"{ "thinking": { "main": { "endpoint": "http://127.0.0.1:1", "model": "m", "response_tokens": 3000,
-                                          "sampling": { "reasoning_effort": "low" } } },
+                                          "sampling": { "reasoning_effort": "low",
+                                                        "end_token_bias": { "token": 248046, "bias": -3.0 } } } },
                  "windowed": { "main": { "endpoint": "http://127.0.0.1:1", "model": "m", "response_tokens": 3000,
                                           "context_tokens": 8192 } },
                  "plain":    { "main": { "endpoint": "http://127.0.0.1:1", "model": "m" } } }"#,
             None,
         )
         .expect("読めること");
+        // **終わりのトークンを下げる値も同じ器で運ぶ**（ADR-0066 §決定1 / 作業単位 A-22b）。
         let thinking = BodyFace {
             reasoning_effort: Some(ReasoningEffort::Low),
             response_tokens: Some(3000),
+            end_token_bias: EndTokenBias::parse(248_046, -3.0),
         };
+        assert!(thinking.end_token_bias.is_some(), "前提: 範囲の中の値");
         let windowed = BodyFace {
             reasoning_effort: None,
             response_tokens: Some(3000),
+            end_token_bias: None,
         };
 
         for (name, environment, expected) in [

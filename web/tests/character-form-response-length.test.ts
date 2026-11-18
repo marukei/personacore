@@ -179,10 +179,11 @@ describe("編集", () => {
   });
 
   /**
-   * **ADR-0065 §決定4 の「しないこと」を欄の近くに書く**（縮んだ会話は戻さない・上限としては働かない）。
+   * **ADR-0065 §決定4 の「しないこと」を欄の近くに書く**（この欄だけでは縮んだ会話は戻さない・上限としては働かない）。
+   * **戻す向きに働く手（上流モデルの画面の、本文生成の「終わりのトークン」）も同じ場所で言う**（作業単位 A-22b のレビュー）。
    * 出典（ADR の番号）は画面に書かない（`tests/screen-wording.test.ts`）。
    */
-  it("欄の近くに、この欄がしないことを書く", async () => {
+  it("欄の近くに、この欄がしないことと、縮んだ会話を戻す手を書く", async () => {
     const view = mount(CharacterForm, { target, props: { character: MIO } });
 
     const hint = target.querySelector('[data-hint="response_length"]');
@@ -190,7 +191,11 @@ describe("編集", () => {
     const text = (hint as HTMLElement).textContent ?? "";
     expect(text).toContain("両方空にすると未設定になります。");
     expect(text).toContain("この上限で返答が切られることはなく");
-    expect(text).toContain("短くなってしまった会話は、この欄を設定しても元に戻りません");
+    expect(text).toContain("この欄だけでは、短くなってしまった会話は元に戻りません。");
+    expect(text).toContain("上流モデルの画面で、本文生成の詳細に「終わりのトークン」の番号と値を書いておくと");
+    expect(text).toContain("返答がこの欄の下限より短くなった会話で、返答を長くする向きに働きます。");
+    // **取り消した案内を残さない**（目安を最初から入れた会話も縮んだので「新しい会話を始めて」は当てにならない）。
+    expect(text).not.toContain("新しい会話を始めてください");
     expect(text).not.toMatch(/ADR/);
 
     await unmount(view, { outro: false });

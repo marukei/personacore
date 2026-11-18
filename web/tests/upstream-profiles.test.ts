@@ -40,6 +40,7 @@ import {
   DEFAULT_REPEAT_PENALTY,
   DEFAULT_RESPONSE_TOKENS,
   EDITABLE_FACE_KEYS,
+  END_TOKEN_BIAS_MIN,
   FACE_KEYS,
   FACES,
   KIND_FIELDS,
@@ -754,6 +755,9 @@ describe("下書きと、送る本文", () => {
       reasoning_effort: "none",
       response_tokens: "",
       repeat_penalty: "",
+      // **書いていない終わりのトークンは、番号も値も空**（作業単位 A-22b）。
+      end_token: "",
+      end_token_bias: "",
     });
     expect(draft.sub).toEqual({
       endpoint: "http://127.0.0.1:41002",
@@ -766,6 +770,8 @@ describe("下書きと、送る本文", () => {
       reasoning_effort: "none",
       response_tokens: "",
       repeat_penalty: "",
+      end_token: "",
+      end_token_bias: "",
     });
     expect(draftOfProfile(GAMMA).hasSub).toBe(false);
   });
@@ -1062,6 +1068,8 @@ describe("思考・返答の上限・繰り返しの罰（作業単位 D-21）",
         ["思考", "入れる（low）", "切る"],
         ["返答の上限", "2,000", "1,024"],
         ["繰り返しの罰", "1.05", "1.1"],
+        // **終わりのトークン**（作業単位 A-22b）。書いていなければ既定の印「下げない」。
+        ["終わりのトークン（縮んだ会話だけ）", null, "下げない"],
       ],
       [["繰り返しの罰", "1.25", "1.1"]],
     ]);
@@ -1070,6 +1078,7 @@ describe("思考・返答の上限・繰り返しの罰（作業単位 D-21）",
         ["思考", null, "切る"],
         ["返答の上限", null, "1,024"],
         ["繰り返しの罰", null, "1.1"],
+        ["終わりのトークン（縮んだ会話だけ）", null, "下げない"],
       ],
       [["繰り返しの罰", null, "1.1"]],
     ]);
@@ -1140,13 +1149,14 @@ describe("思考・返答の上限・繰り返しの罰（作業単位 D-21）",
 
   /** **本文の面にだけ思考と返答の上限を置き、繰り返しの罰は両面とも詳細に畳む**（ADR-0060 §決定3 の表）。 */
   it("欄の置き場所: 思考（サンプリングの組）と返答の上限は本文の面だけですぐ出し、繰り返しの罰は詳細に畳む", () => {
+    // **本文の面の詳細には、終わりのトークンの番号と値も畳む**（作業単位 A-22b / ADR-0066 §決定3。裏方の面には出さない）。
     expect(fieldsOf("main", "launch")).toEqual({
       shown: ["gguf", "model", "endpoint", "api_key", "sampling", "response_tokens"],
-      folded: ["args", "command", "context_tokens", "repeat_penalty"],
+      folded: ["args", "command", "context_tokens", "repeat_penalty", "end_token", "end_token_bias"],
     });
     expect(fieldsOf("main", "connect")).toEqual({
       shown: ["endpoint", "model", "api_key", "context_tokens", "sampling", "response_tokens"],
-      folded: ["repeat_penalty"],
+      folded: ["repeat_penalty", "end_token", "end_token_bias"],
     });
     expect(fieldsOf("sub", "launch")).toEqual({
       shown: ["gguf", "model", "endpoint", "api_key"],
@@ -1246,6 +1256,156 @@ describe("思考・返答の上限・繰り返しの罰（作業単位 D-21）",
     draft.main.response_tokens = "";
     thinkingRoomNote(draft);
     expect(draft.main.response_tokens).toBe("");
+  });
+});
+
+/**
+ * **終わりのトークンを下げる値**（作業単位 A-22b / ADR-0066 §決定3）。
+ *
+ * **3件のうち真ん中の `beta2` にだけ書く**（端に置かない）。値は番号 248046・値 -3 と、もう1件に番号 2・値 -1.5。
+ * **期待値は直書き**（`upstreamProfiles.ts` の定数から作らない）。
+ */
+describe("終わりのトークン（作業単位 A-22b）", () => {
+  const LOWERED: WrittenProfile = {
+    ...BETA,
+    name: "beta2",
+    main: {
+      ...BETA.main,
+      sampling: { repeat_penalty: 1.05, reasoning_effort: "low", end_token_bias: { token: 248046, bias: -3 } },
+    },
+  };
+  const OTHER: WrittenProfile = {
+    ...GAMMA,
+    main: { ...GAMMA.main, sampling: { end_token_bias: { token: 2, bias: -1.5 } } },
+  };
+
+  /** **一覧: 本文の面にだけ、書いた番号と値を出す。書いていなければ既定の印「下げない」**（裏方の面には出さない）。 */
+  it("一覧: 書いた番号と値を本文の面にだけ出し、書いていなければ「下げない」を添える", () => {
+    const sent = (profile: WrittenProfile) =>
+      summaryLines(profile).map((line) =>
+        (line.summary?.sent ?? [])
+          .filter((one) => one.label.startsWith("終わりのトークン"))
+          .map((one) => [one.written, one.fallback]),
+      );
+    expect([ALPHA, LOWERED, OTHER].map(sent)).toEqual([
+      [[[null, "下げない"]], []],
+      [[["248046 に -3", "下げない"]], []],
+      [[["2 に -1.5", "下げない"]], []],
+    ]);
+  });
+
+  /** **下書き: 一覧で読んだ番号と値を、本文の面の2つの欄に入れる**（裏方の面の欄は空のまま）。 */
+  it("下書き: 書いた番号と値が本文の面の欄に入る", () => {
+    const draft = draftOfProfile(LOWERED);
+    expect([draft.main.end_token, draft.main.end_token_bias]).toEqual(["248046", "-3"]);
+    expect([draft.sub.end_token, draft.sub.end_token_bias]).toEqual(["", ""]);
+    expect([draftOfProfile(OTHER).main.end_token, draftOfProfile(OTHER).main.end_token_bias]).toEqual(["2", "-1.5"]);
+  });
+
+  /**
+   * **繰り返しの罰だけを直して保存しても、手で書いた終わりのトークンが消えない**（ADR-0066 §決定3 の見張り番 /
+   * ADR-0058 §決定6 の形）。`sampling` はサーバで丸ごと置き換わるので、下書きの値を必ず載せる。
+   * **思考を「切る」にしても残る**（片方の欄で、もう片方の鍵を落とさない）。
+   */
+  it("繰り返しの罰だけを直しても、思考を切っても、終わりのトークンは依頼に残る", () => {
+    const draft = draftOfProfile(LOWERED);
+    draft.main.repeat_penalty = "0.9";
+    expect(buildSaveRequest(draft, "r").main.sampling).toEqual({
+      repeat_penalty: 0.9,
+      reasoning_effort: "low",
+      end_token_bias: { token: 248046, bias: -3 },
+    });
+    draft.main.reasoning_effort = "none";
+    draft.main.repeat_penalty = "";
+    expect(buildSaveRequest(draft, "r").main.sampling).toEqual({ end_token_bias: { token: 248046, bias: -3 } });
+  });
+
+  /**
+   * **手で書いた指数表記の値（`-1e-7`）を開いたまま、ほかの欄だけを直す保存は止めない**（A-22b のレビュー）。
+   * 一覧の数は `String` で `"-1e-7"` になるので、画面の読みがサーバより狭いと、何を直しても保存が止まる。
+   * 値はそのまま送る（丸めない）。
+   */
+  it("指数表記の値を書いた面でも、ほかの欄だけを直して保存できる", () => {
+    const tiny: WrittenProfile = {
+      ...LOWERED,
+      main: { ...LOWERED.main, sampling: { repeat_penalty: 1.05, end_token_bias: { token: 248046, bias: -1e-7 } } },
+    };
+    const draft = draftOfProfile(tiny);
+    expect(draft.main.end_token_bias).toBe("-1e-7");
+    draft.main.repeat_penalty = "0.9";
+    expect(samplingFailure(draft)).toBeNull();
+    expect(buildSaveRequest(draft, "r").main.sampling).toEqual({
+      repeat_penalty: 0.9,
+      end_token_bias: { token: 248046, bias: -1e-7 },
+    });
+  });
+
+  /** **番号と値を両方空にすると書かない**（ほかの鍵も無ければ `sampling` は `null`）。**裏方の依頼には載せない。** */
+  it("両方空なら書かず、裏方の依頼には載せない", () => {
+    const draft = draftOfProfile(LOWERED);
+    draft.main.end_token = " ";
+    draft.main.end_token_bias = "";
+    draft.main.reasoning_effort = "none";
+    draft.main.repeat_penalty = "";
+    expect(buildSaveRequest(draft, "r").main.sampling).toBeNull();
+    expect(samplingFailure(draft)).toBeNull();
+
+    // **裏方の下書きに値が残る形でも送らない**（画面は欄を出さない）。
+    const withSub = draftOfProfile(LOWERED);
+    withSub.sub.end_token = "248046";
+    withSub.sub.end_token_bias = "-3";
+    expect(buildSaveRequest(withSub, "r").sub?.sampling).toEqual({ repeat_penalty: 1.25 });
+    expect(samplingFailure(withSub)).toBeNull();
+  });
+
+  /**
+   * **保存の前の検査**（便宜で、権威はサーバの 422）。片方だけ・番号が読めない・値が読めないか範囲の外は、その欄で止める。
+   * **端は通す**（番号 0 と 4294967295、値 -10 と -0.001）。
+   */
+  it("片方だけ・読めない・範囲の外は、本文の面のその欄で止める。端は通す", () => {
+    const at = (token: string, bias: string) => {
+      const draft = draftOfProfile(LOWERED);
+      draft.main.end_token = token;
+      draft.main.end_token_bias = bias;
+      return samplingFailure(draft);
+    };
+    for (const [token, bias] of [
+      ["0", "-10"],
+      ["4294967295", "-0.001"],
+      [" 248046 ", " -3 "],
+      ["2", "-.5"],
+      // **指数表記も読む**（サーバの読み込みは JSON の数なら受ける / A-22b のレビュー）。
+      ["2", "-3e0"],
+      ["2", "-1e-7"],
+    ] as const) {
+      expect(at(token, bias), `${token} / ${bias}`).toBeNull();
+    }
+    for (const [token, bias, key] of [
+      ["248046", "", "end_token_bias"],
+      ["", "-3", "end_token"],
+      ["-1", "-3", "end_token"],
+      ["1.5", "-3", "end_token"],
+      ["4294967296", "-3", "end_token"],
+      ["２４８", "-3", "end_token"],
+      ["248046", "0", "end_token_bias"],
+      ["248046", "-0", "end_token_bias"],
+      ["248046", "3", "end_token_bias"],
+      ["248046", "-10.5", "end_token_bias"],
+      ["248046", "-1e2", "end_token_bias"],
+      ["248046", "Infinity", "end_token_bias"],
+      ["248046", "-Infinity", "end_token_bias"],
+      ["248046", "0x1", "end_token_bias"],
+      ["248046", "abc", "end_token_bias"],
+    ] as const) {
+      expect(at(token, bias), `${token} / ${bias}`).toMatchObject({ kind: "field", face: "main", key });
+    }
+    expect(at("248046", "-11")?.message).toContain("-10 以上 0 未満");
+    expect(at("", "-3")?.message).toContain("両方");
+  });
+
+  it("欄の見出しは、ファイルの鍵の綴りを添える", () => {
+    expect(fieldLabel("connect", "end_token")).toBe("終わりのトークンの番号（end_token_bias の token）");
+    expect(fieldLabel("launch", "end_token_bias")).toBe("終わりのトークンに足す値（end_token_bias の bias）");
   });
 });
 
@@ -1803,7 +1963,8 @@ const BUDGET_RS = readFileSync(
  * 宣言がちょうど1つでなければ投げる。
  */
 function numberConstOf(source: string, name: string): number {
-  const pattern = new RegExp(`^\\s*pub const ${name}: [A-Za-z0-9]+ = ([0-9_.]+);\\r?$`, "gmu");
+  // **負の数も読む**（`END_TOKEN_BIAS_MIN` / 作業単位 A-22b）。
+  const pattern = new RegExp(`^\\s*pub const ${name}: [A-Za-z0-9]+ = (-?[0-9_.]+);\\r?$`, "gmu");
   const hits = [...source.matchAll(pattern)].map((found) => found[1]);
   if (hits.length !== 1 || hits[0] === undefined) {
     throw new Error(`const ${name} の数の宣言が ${hits.length} 個あります`);
@@ -1864,10 +2025,16 @@ describe("写し元の綴り", () => {
     const draft = draftOfProfile(BETA);
     draft.main.reasoning_effort = "low";
     draft.main.repeat_penalty = "1.2";
+    draft.main.end_token = "7";
+    draft.main.end_token_bias = "-2";
     const written = buildSaveRequest(draft, "r").main.sampling;
     expect(written).not.toBeNull();
     expect(Object.keys(written ?? {}).sort()).toEqual(
       [...stringArrayConstOf(UPSTREAMS_RS, "SAMPLING_KEYS")].sort(),
+    );
+    // **`end_token_bias` の中の鍵も、読み込みの `END_TOKEN_BIAS_FIELDS` と一致する**（作業単位 A-22b）。
+    expect(Object.keys(written?.end_token_bias ?? {}).sort()).toEqual(
+      [...stringArrayConstOf(UPSTREAMS_RS, "END_TOKEN_BIAS_FIELDS")].sort(),
     );
   });
 
@@ -1877,6 +2044,8 @@ describe("写し元の綴り", () => {
       numberConstOf(REQUEST_RS, "REPEAT_PENALTY_MIN"),
       numberConstOf(REQUEST_RS, "REPEAT_PENALTY_MAX"),
     ]);
+    // **終わりのトークンに足す値の下限**（作業単位 A-22b）。
+    expect(END_TOKEN_BIAS_MIN).toBe(numberConstOf(REQUEST_RS, "END_TOKEN_BIAS_MIN"));
     expect(DEFAULT_REPEAT_PENALTY).toBe(personacoreRepeatPenaltyOf(REQUEST_RS));
     expect(DEFAULT_RESPONSE_TOKENS).toBe(numberConstOf(BUDGET_RS, "DEFAULT_RESPONSE_TOKENS"));
   });

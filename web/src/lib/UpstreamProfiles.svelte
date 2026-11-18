@@ -91,6 +91,8 @@
   } from "./api";
   import {
     DEFAULT_COMMAND,
+    END_TOKEN_BIAS_NOTE,
+    END_TOKEN_NOTE,
     KEY_INPUT_NOTE,
     NAME_TAKEN_MESSAGE,
     REPEAT_PENALTY_NOTE,
@@ -677,6 +679,11 @@
         return [RESPONSE_TOKENS_NOTE];
       case "repeat_penalty":
         return [REPEAT_PENALTY_NOTE];
+      // **終わりのトークン**（ADR-0066 §決定3 / 作業単位 A-22b）。番号と値の欄に、それぞれの説明を置く（利用者の要望）。
+      case "end_token":
+        return [END_TOKEN_NOTE];
+      case "end_token_bias":
+        return [END_TOKEN_BIAS_NOTE];
       case "gguf":
       case "model":
         return [];
@@ -760,11 +767,15 @@
   <!--
     **endpoint の欄は、注記（何を書くかの案内）も欄の説明として結ぶ**（作業単位 B-68 / Issue origin#97）。
     理由が先、案内が後。ほかの欄は今までどおり理由だけを結ぶ。
+    **終わりのトークンの番号と値の欄も、説明を欄の説明として結ぶ**（作業単位 A-22b / 利用者の要望 —— 何を書く欄かが
+    名前だけでは分からないので、読み上げでもその欄の説明として届くようにする）。
   -->
   {@const describedBy =
     [
       ...(problem === null ? [] : [`${id}-error`]),
-      ...(key === "endpoint" ? notes.map((_, index) => `${id}-note-${index}`) : []),
+      ...(key === "endpoint" || key === "end_token" || key === "end_token_bias"
+        ? notes.map((_, index) => `${id}-note-${index}`)
+        : []),
     ].join(" ") || undefined}
   <div class="flex flex-col gap-1.5">
     <!-- **`block`** —— 土台の `form label` は「見出し / 入力 / 文字数」の格子で、見出しが 10rem の列で折り返す。 -->
@@ -808,7 +819,7 @@
         {id}
         class="w-full font-mono"
         type="text"
-        inputmode={key === "context_tokens" || key === "response_tokens"
+        inputmode={key === "context_tokens" || key === "response_tokens" || key === "end_token"
           ? "numeric"
           : key === "repeat_penalty"
             ? "decimal"

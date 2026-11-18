@@ -88,7 +88,7 @@ const ZIP_SCRIPT: &str = "scripts/package-zip.ps1";
 ///
 /// **⚠ 帳簿である。** README が別の画面を指すようになったら、ここへ足さないと赤になる
 /// （足し忘れは赤の側に倒れる）。
-const SCREEN_FILES: [&str; 8] = [
+const SCREEN_FILES: [&str; 9] = [
     "web/src/lib/router.ts",
     "web/src/lib/UpstreamPanel.svelte",
     "web/src/lib/UpstreamProfiles.svelte",
@@ -99,6 +99,9 @@ const SCREEN_FILES: [&str; 8] = [
     "web/src/lib/agreements.ts",
     // 会話の画面の、約束・決まりの提案の問いかけ（同じ節が「違う」を名指しする / 作業単位 A-12c-2）。
     "web/src/lib/ProposalPrompt.svelte",
+    // キャラクターの編集（配布物の README の「返答がだんだん短くなって戻らないとき」が、返答の長さの目安の欄を名指しする /
+    // 作業単位 A-22b）。
+    "web/src/lib/CharacterForm.svelte",
 ];
 
 /// 起こした上流の状態の文面を組んでいる画面のファイル（`失敗しました: …` の形）。
