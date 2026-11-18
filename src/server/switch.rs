@@ -838,16 +838,27 @@ mod tests {
     /// **本文の面だけ**を変えて見る —— 裏方の面は同じまま触らない。**対照**: 同じ値なら触らない。
     /// 値は既定（`none` / 1024）と違える（2048・1536）。思考の量と上限を別々に変える腕を置く
     /// （片方だけを比べる実装を、もう片方の腕が赤にする）。
+    ///
+    /// **終わりのトークンを下げる値だけが変わった面も触る**（ADR-0066 §決定4 の腕8 / 作業単位 A-22b）。
+    /// 番号だけ・強さだけ・あり → なし・なし → ありの4通りと、同じ値の対照。
     #[test]
     fn a_face_whose_body_settings_alone_change_is_touched() {
-        use crate::llm::ReasoningEffort;
-        let body = |effort: Option<ReasoningEffort>, room: Option<u32>| Target {
+        use crate::llm::{EndTokenBias, ReasoningEffort};
+        let lowered = |token: u32, bias: f64| {
+            Some(EndTokenBias::parse(token, bias).expect("範囲の中であること"))
+        };
+        let full = |effort: Option<ReasoningEffort>,
+                    room: Option<u32>,
+                    end_token_bias: Option<EndTokenBias>| Target {
             body: BodyFace {
                 reasoning_effort: effort,
                 response_tokens: room,
+                end_token_bias,
             },
             ..target("http://127.0.0.1:1/v1/chat/completions", "main")
         };
+        let body = |effort: Option<ReasoningEffort>, room: Option<u32>| full(effort, room, None);
+        let ended = |end_token_bias: Option<EndTokenBias>| full(None, None, end_token_bias);
         let sub = target("http://127.0.0.1:2/v1/chat/completions", "sub");
         let low = Some(ReasoningEffort::Low);
         for (before, after, touched) in [
@@ -858,6 +869,19 @@ mod tests {
             (body(low, Some(2048)), body(None, None), true),
             (body(low, Some(2048)), body(low, Some(2048)), false),
             (body(None, None), body(None, None), false),
+            (ended(None), ended(lowered(248_046, -3.0)), true),
+            (ended(lowered(248_046, -3.0)), ended(None), true),
+            (
+                ended(lowered(248_046, -3.0)),
+                ended(lowered(248_046, -1.5)),
+                true,
+            ),
+            (ended(lowered(248_046, -3.0)), ended(lowered(2, -3.0)), true),
+            (
+                ended(lowered(248_046, -3.0)),
+                ended(lowered(248_046, -3.0)),
+                false,
+            ),
         ] {
             let plan = plan_switch(
                 &[],

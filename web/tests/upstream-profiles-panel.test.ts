@@ -2009,6 +2009,11 @@ describe("面の種類", () => {
     WINDOW_LABEL,
     "繰り返しの罰（repeat_penalty）",
   ];
+  /** **作業単位 A-22b で、本文の面の詳細の最後に終わりのトークンの番号と値が入った**（ADR-0066 §決定3。裏方の面には無い）。 */
+  const END_TOKEN_LABELS = [
+    "終わりのトークンの番号（end_token_bias の token）",
+    "終わりのトークンに足す値（end_token_bias の bias）",
+  ];
   const LAUNCH_LABELS = [
     "gguf のパス（gguf）",
     "依頼するモデルの綴り（model）",
@@ -2019,6 +2024,7 @@ describe("面の種類", () => {
     "実行ファイル（command）",
     WINDOW_LABEL,
     "繰り返しの罰（repeat_penalty）",
+    ...END_TOKEN_LABELS,
   ];
   /** **鍵は両方の種類の欄**（作業単位 A-13b-3 で足した）。 */
   const CONNECT_LABELS = [
@@ -2028,6 +2034,7 @@ describe("面の種類", () => {
     WINDOW_LABEL,
     "返答の上限（response_tokens）",
     "繰り返しの罰（repeat_penalty）",
+    ...END_TOKEN_LABELS,
   ];
 
   async function openEditor(name: string): Promise<Record<string, unknown>> {
@@ -2062,9 +2069,10 @@ describe("面の種類", () => {
       "実行ファイル（command）",
       WINDOW_LABEL,
       "繰り返しの罰（repeat_penalty）",
+      ...END_TOKEN_LABELS,
     ]);
     expect(flat(fieldsetOf(MAIN_LEGEND).querySelector("details > summary"))).toBe(
-      "詳細（起動の引数・実行ファイル・コンテキスト長・繰り返しの罰）",
+      "詳細（起動の引数・実行ファイル・コンテキスト長・繰り返しの罰・終わりのトークン）",
     );
     mustButton(target.querySelector("form") as HTMLFormElement, "やめる").click();
     await vi.waitFor(() => {
@@ -2077,8 +2085,8 @@ describe("面の種類", () => {
     });
     expect(pressedOf(MAIN_LEGEND)).toEqual(["false", "true"]);
     expect(labelsOf(MAIN_LEGEND)).toEqual(CONNECT_LABELS);
-    // **繋ぐ面の詳細は、繰り返しの罰だけ**（作業単位 D-21。D-19 の間は繋ぐ面に詳細が無かった）。
-    expect(foldedLabels(MAIN_LEGEND)).toEqual(["繰り返しの罰（repeat_penalty）"]);
+    // **繋ぐ面の詳細は、繰り返しの罰と終わりのトークン**（作業単位 D-21・A-22b。D-19 の間は繋ぐ面に詳細が無かった）。
+    expect(foldedLabels(MAIN_LEGEND)).toEqual(["繰り返しの罰（repeat_penalty）", ...END_TOKEN_LABELS]);
     await unmount(view, { outro: false });
   });
 
@@ -3017,6 +3025,8 @@ describe("思考・返答の上限・繰り返しの罰（作業単位 D-21）",
           ["思考 入れる（low）", null],
           ["返答の上限 2,000", null],
           ["繰り返しの罰 1.05", null],
+          // **終わりのトークン**（作業単位 A-22b）。
+          ["終わりのトークン（縮んだ会話だけ） 書いていない", "既定 下げない"],
         ],
       ],
       ["裏方", [["繰り返しの罰 1.25", null]]],
@@ -3028,6 +3038,7 @@ describe("思考・返答の上限・繰り返しの罰（作業単位 D-21）",
           ["思考 書いていない", "既定 切る"],
           ["返答の上限 書いていない", "既定 1,024"],
           ["繰り返しの罰 書いていない", "既定 1.1"],
+          ["終わりのトークン（縮んだ会話だけ） 書いていない", "既定 下げない"],
         ],
       ],
       ["裏方", [["繰り返しの罰 書いていない", "既定 1.1"]]],
@@ -3207,8 +3218,122 @@ describe("思考・返答の上限・繰り返しの罰（作業単位 D-21）",
 
     expect(notesNear(fieldOf(MAIN_LEGEND, PENALTY_LABEL)).join(" ")).toContain("柵");
     expect(flat(samplingGroup(MAIN_LEGEND))).toContain("同じ名前へ切り替え直すと効きます");
-    // **繋ぐ面にも詳細ができる**（繰り返しの罰）。
-    expect(flat(fieldsetOf(MAIN_LEGEND).querySelector("details > summary"))).toBe("詳細（繰り返しの罰）");
+    // **繋ぐ面にも詳細ができる**（繰り返しの罰と、本文の面では終わりのトークン / 作業単位 A-22b）。
+    expect(flat(fieldsetOf(MAIN_LEGEND).querySelector("details > summary"))).toBe(
+      "詳細（繰り返しの罰・終わりのトークン）",
+    );
+    await unmount(view, { outro: false });
+  });
+});
+
+/**
+ * **終わりのトークン**（作業単位 A-22b / ADR-0066 §決定3）。**画面から繰り返しの罰だけを直しても、手で書いた
+ * `end_token_bias` が消えない**ことを、実際の画面の保存（`PUT` の本文）で見る。
+ *
+ * 値は真ん中の `beta` の本文の面にだけ書く（番号 248046・値 -3）。**文面は直書き**（定数から作らない）。
+ */
+describe("終わりのトークン（作業単位 A-22b）", () => {
+  const TOKEN_LABEL = "終わりのトークンの番号（end_token_bias の token）";
+  const BIAS_LABEL = "終わりのトークンに足す値（end_token_bias の bias）";
+  const PENALTY_LABEL = "繰り返しの罰（repeat_penalty）";
+
+  /** `beta` の本文の面に終わりのトークンを書いた一覧（ほかの2件はそのまま）。 */
+  function withEndToken(): void {
+    const beta = {
+      ...BETA,
+      main: { ...BETA.main, sampling: { ...BETA.main.sampling, end_token_bias: { token: 248046, bias: -3 } } },
+    };
+    listingReplies = [ok(listing({ profiles: [ALPHA, beta, GAMMA] }))];
+  }
+
+  async function openEditor(name: string): Promise<Record<string, unknown>> {
+    const view = await open();
+    mustButton(profileBlock(name), "直す").click();
+    await vi.waitFor(() => {
+      expect(target.querySelector("form")).not.toBeNull();
+    });
+    return view;
+  }
+
+  function lastPut(): { main: Record<string, unknown>; sub: Record<string, unknown> | null } {
+    const puts = sent.filter((s) => s.method === "PUT");
+    return puts.at(-1)?.body as { main: Record<string, unknown>; sub: Record<string, unknown> | null };
+  }
+
+  /**
+   * **繰り返しの罰だけを直して保存しても、`end_token_bias` は依頼に残る**（ADR-0066 §決定3 の見張り番）。
+   * 番号と値は本文の面の詳細に入り、裏方の面には欄が無い。
+   */
+  it("繰り返しの罰だけを直して保存しても、手で書いた終わりのトークンが消えない", async () => {
+    withEndToken();
+    const view = await openEditor("beta");
+    expect([fieldOf(MAIN_LEGEND, TOKEN_LABEL).value, fieldOf(MAIN_LEGEND, BIAS_LABEL).value]).toEqual([
+      "248046",
+      "-3",
+    ]);
+    expect(fieldOf(MAIN_LEGEND, TOKEN_LABEL).closest("details")).not.toBeNull();
+    expect(labelsOf(SUB_LEGEND)).not.toContain(TOKEN_LABEL);
+    expect(labelsOf(SUB_LEGEND)).not.toContain(BIAS_LABEL);
+
+    type(fieldOf(MAIN_LEGEND, PENALTY_LABEL), "0.9");
+    mustButton(target.querySelector("form") as HTMLFormElement, "保存する").click();
+    await vi.waitFor(() => {
+      expect(sent.filter((s) => s.method === "PUT")).toHaveLength(1);
+    });
+    expect(lastPut().main["sampling"]).toEqual({
+      repeat_penalty: 0.9,
+      reasoning_effort: "low",
+      end_token_bias: { token: 248046, bias: -3 },
+    });
+    expect(lastPut().sub?.["sampling"]).toEqual({ repeat_penalty: 1.25 });
+    await unmount(view, { outro: false });
+  });
+
+  /**
+   * **番号と値の欄に、それぞれの説明が出て、その欄の説明として結びつく**（作業単位 A-22b / 利用者の要望）。
+   *
+   * **文面は直書き**（定数から作らない）。番号の説明は番号の欄にだけ、値の説明は値の欄にだけ出る（取り違えると赤）。
+   * 読み上げのために `aria-describedby` でも結ぶ（理由が無いときは説明だけが届く）。
+   */
+  it("番号と値の欄に、それぞれの説明を出して欄に結ぶ", async () => {
+    withEndToken();
+    const view = await openEditor("beta");
+    const tokenHelp =
+      "モデルが「返答はここで終わり」を表す印（トークン）の番号です。数の大小に意味は無く、モデルごとに決まった値を1つ書きます。増やしたり減らしたりするものではありません。違う番号を書くと、別の文字を出しにくくしてしまいます。Qwen3.8-Flash-Next で確かめた番号は 248046 です。モデルを替えたら、そのモデルの番号に書き直してください。";
+    const biasHelp =
+      "終わりの印をどれだけ出しにくくするかです。0 に近いほど弱く、小さく（マイナスに大きく）するほど返答が長くなります。測った範囲では、-1.5 では足りず、-3 で縮んだ会話が戻り、-5 ではキャラクターらしくない一文が出ました。キャラクターに返答の長さの目安があり、その会話の返答が一度でも目安の下限を割ったときだけ、その会話の間ずっと掛かります（裏方には送りません）。";
+    const token = fieldOf(MAIN_LEGEND, TOKEN_LABEL);
+    const bias = fieldOf(MAIN_LEGEND, BIAS_LABEL);
+    expect(notesNear(token)).toEqual([tokenHelp]);
+    expect(notesNear(bias)).toHaveLength(1);
+    expect(notesNear(bias)[0]).toContain(biasHelp);
+    expect(notesNear(bias)[0]).not.toContain("248046");
+    expect(describedText(token)).toBe(tokenHelp);
+    expect(describedText(bias)).toContain(biasHelp);
+    await unmount(view, { outro: false });
+  });
+
+  /** **片方だけの入力は、その欄で言って送らない。両方空にすると書かない**（範囲は柵だと言う）。 */
+  it("片方だけは送らずにその欄で言い、両方空にすると書かない", async () => {
+    withEndToken();
+    const view = await openEditor("beta");
+    type(fieldOf(MAIN_LEGEND, BIAS_LABEL), "");
+    mustButton(target.querySelector("form") as HTMLFormElement, "保存する").click();
+    await vi.waitFor(() => {
+      expect(fieldOf(MAIN_LEGEND, BIAS_LABEL).getAttribute("aria-invalid")).toBe("true");
+    });
+    // **理由の文面で見る**（欄の説明も欄に結ぶので、「両方」だけだと説明の「両方空にすると書きません」で緑になる）。
+    expect(describedText(fieldOf(MAIN_LEGEND, BIAS_LABEL))).toContain("番号と値を両方書いてください");
+    expect((fieldOf(MAIN_LEGEND, BIAS_LABEL).closest("details") as HTMLDetailsElement).open).toBe(true);
+    expect(sent.filter((s) => s.method === "PUT")).toHaveLength(0);
+    expect(notesNear(fieldOf(MAIN_LEGEND, BIAS_LABEL)).join(" ")).toContain("柵");
+
+    type(fieldOf(MAIN_LEGEND, TOKEN_LABEL), "");
+    mustButton(target.querySelector("form") as HTMLFormElement, "保存する").click();
+    await vi.waitFor(() => {
+      expect(sent.filter((s) => s.method === "PUT")).toHaveLength(1);
+    });
+    expect(lastPut().main["sampling"]).toEqual({ repeat_penalty: 1.05, reasoning_effort: "low" });
     await unmount(view, { outro: false });
   });
 });

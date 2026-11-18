@@ -32,6 +32,8 @@
  * | [`REPEAT_PENALTY_MIN`] / [`REPEAT_PENALTY_MAX`] | `src/llm/request.rs` の同じ名前 | 同上 |
  * | [`DEFAULT_REPEAT_PENALTY`] | 同 `RequestPolicy::PERSONACORE` の `repeat_penalty` | 同上 |
  * | [`DEFAULT_RESPONSE_TOKENS`] | `src/prompt/budget.rs` の `TokenBudget::DEFAULT_RESPONSE_TOKENS` | 同上 |
+ * | [`END_TOKEN_BIAS_MIN`] | `src/llm/request.rs` の同じ名前 | 同上 |
+ * | 画面が書く `end_token_bias` の中の鍵（[`buildSaveRequest`] が組む） | `src/server/upstreams.rs` の `END_TOKEN_BIAS_FIELDS` | 同上（**集合が一致する**） |
  */
 
 import {
@@ -111,8 +113,11 @@ export type EditableFaceKey = Exclude<FaceKey, "allow_key_over_plain_http">;
  *
  * **`sampling` は2つの欄の組の見出し**（本文の面では思考の2択も持つ）で、**`repeat_penalty` はその組の片方の入力**。
  * 保存の失敗はこのどれかに結びつく（サーバの 422 は `sampling` を、画面の事前の検査は `repeat_penalty` を名指す）。
+ *
+ * **`end_token` と `end_token_bias` は、本文の面の `sampling.end_token_bias` の番号（`token`）と値（`bias`）の2つの入力**
+ * （ADR-0066 §決定3 / 作業単位 A-22b）。画面だけの名前で、依頼では `sampling.end_token_bias` の1つのオブジェクトになる。
  */
-export type FieldKey = EditableFaceKey | "repeat_penalty";
+export type FieldKey = EditableFaceKey | "repeat_penalty" | "end_token" | "end_token_bias";
 
 /** **下書きの文字列の欄**（入力欄の値そのもの。`sampling` は組の見出しなので入らない）。 */
 export type TextFieldKey = Exclude<FieldKey, "sampling">;
@@ -133,6 +138,16 @@ export const DEFAULT_REPEAT_PENALTY = 1.1;
 
 /** **書いていない面の本文の返答の上限**（`prompt::TokenBudget::DEFAULT_RESPONSE_TOKENS` の写し）。既定の印と案内の条件にだけ使う。 */
 export const DEFAULT_RESPONSE_TOKENS = 1024;
+
+/**
+ * **終わりのトークンを下げる値の下限**（`llm::END_TOKEN_BIAS_MIN` の写し。含む）。**上限は 0（含まない）** —— 負の値だけ。
+ *
+ * **測って決めた範囲ではない**（壊れた値と打ち損じを止める柵 / ADR-0066 §決定1 の追記）—— 画面もそう言う（[`END_TOKEN_BIAS_NOTE`]）。
+ */
+export const END_TOKEN_BIAS_MIN = -10;
+
+/** **終わりのトークンの番号の上限**（`u32` の最大。サーバの読み込みが `u32` に収まらない番号を止める）。 */
+const END_TOKEN_MAX = 4_294_967_295;
 
 /**
  * **`command` を書かなかった面で起こす実行ファイルの名前**（`upstreams.rs` の `DEFAULT_COMMAND` の写し）。
@@ -216,14 +231,20 @@ function kindHasKey(kind: FaceKind, key: EditableFaceKey): boolean {
  * | サンプリングの組（`sampling`。本文の面では思考の2択「切る（既定）／入れる（low）」を持つ） | すぐ出す | 詳細に畳む（組は繰り返しの罰だけ） |
  * | 返答の上限（`response_tokens`） | すぐ出す | **出さない** |
  * | 繰り返しの罰（`repeat_penalty`） | 詳細に畳む | 詳細に畳む |
+ * | 終わりのトークンの番号と値（`end_token` / `end_token_bias`） | 詳細に畳む | **出さない** |
  *
  * **起こす面・繋ぐ面とも同じ置き場所**（思考と返答の上限は、長い会話で返答が縮まないように使う値で、変える人が多いと見て
  * すぐ出す。繰り返しの罰は上流ごとの微調整なので畳む）。**繋ぐ面にも「詳細」ができる**（繰り返しの罰）。
+ * **終わりのトークン**（ADR-0066 §決定3 / 作業単位 A-22b）は、番号がモデルごとに違い、書く人がそのモデルで確かめる値なので畳む。
+ * 本文の面だけの値（裏方へは送らない / ADR-0066 §決定1）。
  */
 export function fieldsOf(face: Face, kind: FaceKind): { shown: readonly FieldKey[]; folded: readonly FieldKey[] } {
   const base = KIND_FIELDS[kind];
   return face === "main"
-    ? { shown: [...base.shown, "sampling", "response_tokens"], folded: [...base.folded, "repeat_penalty"] }
+    ? {
+        shown: [...base.shown, "sampling", "response_tokens"],
+        folded: [...base.folded, "repeat_penalty", "end_token", "end_token_bias"],
+      }
     : { shown: [...base.shown], folded: [...base.folded, "sampling", "repeat_penalty"] };
 }
 
@@ -246,6 +267,9 @@ export function detailsSummary(face: Face, kind: FaceKind): string {
     sampling: null,
     response_tokens: null,
     repeat_penalty: "繰り返しの罰",
+    // **番号と値で1つの名前**（2つ並べると「終わりのトークン」が2回出る）。
+    end_token: "終わりのトークン",
+    end_token_bias: null,
   };
   const names = fieldsOf(face, kind)
     .folded.map((key) => short[key])
@@ -280,6 +304,10 @@ export function fieldLabel(kind: FaceKind, key: FieldKey): string {
       return "返答の上限（response_tokens）";
     case "repeat_penalty":
       return "繰り返しの罰（repeat_penalty）";
+    case "end_token":
+      return "終わりのトークンの番号（end_token_bias の token）";
+    case "end_token_bias":
+      return "終わりのトークンに足す値（end_token_bias の bias）";
   }
 }
 
@@ -347,7 +375,12 @@ function thinkingWritten(effort: string): string {
   }
 }
 
-/** **その面の送る値**（[`SentValue`]）。本文の面は3つ、裏方の面は繰り返しの罰だけ。 */
+/**
+ * **その面の送る値**（[`SentValue`]）。本文の面は4つ、裏方の面は繰り返しの罰だけ。
+ *
+ * **本文の面の4つ目は終わりのトークン**（ADR-0066 §決定3 / 作業単位 A-22b）。**書いても毎回は送らない**（その会話が目安の
+ * 下限を割った往復だけ）ので、見出しで条件を言う。書いた値は「番号 に 値」、書いていなければ既定の印「下げない」。
+ */
 function sentValues(face: Face, written: WrittenFace): SentValue[] {
   const penalty: SentValue = {
     label: "繰り返しの罰",
@@ -369,6 +402,14 @@ function sentValues(face: Face, written: WrittenFace): SentValue[] {
       fallback: grouped(DEFAULT_RESPONSE_TOKENS),
     },
     penalty,
+    {
+      label: "終わりのトークン（縮んだ会話だけ）",
+      written:
+        written.sampling?.end_token_bias === undefined
+          ? null
+          : `${written.sampling.end_token_bias.token} に ${written.sampling.end_token_bias.bias}`,
+      fallback: "下げない",
+    },
   ];
 }
 
@@ -499,6 +540,10 @@ export function summaryLines(profile: WrittenProfile): readonly SummaryLine[] {
  * **思考・返答の上限・繰り返しの罰**（作業単位 D-21）。`reasoning_effort` は2択（[`Thinking`]。書いていなければ「切る」）、
  * `response_tokens` と `repeat_penalty` は文字列のまま持つ（読めない入力を送る前に言う / [`samplingFailure`]）。
  * **空なら書かない**（送る値は既定の 1024・1.1）。裏方の面の `reasoning_effort` / `response_tokens` は欄を出さず、送らない。
+ *
+ * **終わりのトークンの番号と値**（`end_token` / `end_token_bias` / ADR-0066 §決定3 / 作業単位 A-22b）も文字列のまま持つ。
+ * **両方空なら書かない、両方書いてあれば `sampling.end_token_bias` にする**（片方だけは [`samplingFailure`] が止める）。
+ * 本文の面だけ（裏方の面は欄を出さず、送らない）。
  */
 export interface FaceDraft {
   endpoint: string;
@@ -511,6 +556,8 @@ export interface FaceDraft {
   reasoning_effort: Thinking;
   response_tokens: string;
   repeat_penalty: string;
+  end_token: string;
+  end_token_bias: string;
 }
 
 /**
@@ -569,6 +616,8 @@ function emptyFaceDraft(): FaceDraft {
     reasoning_effort: "none",
     response_tokens: "",
     repeat_penalty: "",
+    end_token: "",
+    end_token_bias: "",
   };
 }
 
@@ -620,6 +669,10 @@ function faceDraftOf(face: WrittenFace): FaceDraft {
     reasoning_effort: face.sampling?.reasoning_effort === "low" ? "low" : "none",
     response_tokens: face.response_tokens === null ? "" : String(face.response_tokens),
     repeat_penalty: face.sampling?.repeat_penalty === undefined ? "" : String(face.sampling.repeat_penalty),
+    // **一覧で読んだ値をそのまま下書きに入れる**（ADR-0066 §決定3）—— 入れないと、繰り返しの罰だけを直した保存が
+    // `sampling` を丸ごと置き換えて、手で書いた値を知らせずに消す。
+    end_token: face.sampling?.end_token_bias === undefined ? "" : String(face.sampling.end_token_bias.token),
+    end_token_bias: face.sampling?.end_token_bias === undefined ? "" : String(face.sampling.end_token_bias.bias),
   };
 }
 
@@ -757,12 +810,68 @@ const RESPONSE_TOKENS_NOT_BELOW_WINDOW =
   "保存しませんでした: 返答の上限は、同じ面に書いたコンテキスト長より小さくしてください。";
 
 /**
+ * **終わりのトークンの番号と値を読む**（ADR-0066 §決定3 / 作業単位 A-22b）。
+ *
+ * | 番号 / 値 | 読んだ結果 |
+ * |---|---|
+ * | 両方空（空白だけを含む） | `null`（書かない） |
+ * | 片方だけ空 | その空の欄が足りない |
+ * | 番号が半角の数字だけでない・`u32` の外 | 番号が読めない |
+ * | 値が有限の数として読めない（指数表記 `-1e-7` は読める）・`-10` 以上 `0` 未満の外 | 値が読めない |
+ * | どちらも読める | `{ token, bias }` |
+ *
+ * **範囲の権威はサーバの 422**（`sampling_unusable`）。ここは送る前に、どの欄が悪いかを言うための便宜。
+ */
+type EndTokenReading =
+  | { kind: "value"; value: { token: number; bias: number } | null }
+  | { kind: "bad"; key: "end_token" | "end_token_bias"; message: string };
+
+function readEndToken(draft: FaceDraft): EndTokenReading {
+  const token = draft.end_token.trim();
+  const bias = draft.end_token_bias.trim();
+  if (token === "" && bias === "") {
+    return { kind: "value", value: null };
+  }
+  if (token === "") {
+    return { kind: "bad", key: "end_token", message: END_TOKEN_PAIR };
+  }
+  if (bias === "") {
+    return { kind: "bad", key: "end_token_bias", message: END_TOKEN_PAIR };
+  }
+  const tokenValue = Number(token);
+  if (!/^[0-9]+$/u.test(token) || !Number.isSafeInteger(tokenValue) || tokenValue > END_TOKEN_MAX) {
+    return { kind: "bad", key: "end_token", message: END_TOKEN_UNUSABLE };
+  }
+  // **値は JS の数として読めれば受ける**（指数表記 `-1e-7` も）。サーバの読み込みは JSON の数なら何でも受けるので、
+  // 画面だけが狭いと、手で書いた値を開いたまま他の欄を直す保存が全部止まる（A-22b のレビュー）。
+  // `Number` は `Infinity` / 16 進（`0x…`）も数にするが、前者は有限の判定で、後者は負にならないので範囲で落ちる。
+  // `f32` に落とすと 0 になる値（`-1e-50` など）はここでは見ない（サーバの 422 が権威）。
+  const biasValue = Number(bias);
+  if (!Number.isFinite(biasValue) || !(biasValue >= END_TOKEN_BIAS_MIN && biasValue < 0)) {
+    return { kind: "bad", key: "end_token_bias", message: END_TOKEN_BIAS_UNUSABLE };
+  }
+  return { kind: "value", value: { token: tokenValue, bias: biasValue } };
+}
+
+/** 番号と値の片方だけを書いたときの文面。 */
+const END_TOKEN_PAIR =
+  "保存しませんでした: 終わりのトークンは、番号と値を両方書いてください（両方空にすると書きません）。";
+
+/** 番号が読めないときの文面。 */
+const END_TOKEN_UNUSABLE =
+  "保存しませんでした: 終わりのトークンの番号は、半角の数字（0 以上の整数）で書いてください。";
+
+/** 値が読めない・範囲の外のときの文面（**範囲は柵**だと言う）。 */
+const END_TOKEN_BIAS_UNUSABLE = `保存しませんでした: 終わりのトークンに足す値は、${END_TOKEN_BIAS_MIN} 以上 0 未満の数で書いてください。`;
+
+/**
  * **繰り返しの罰と返答の上限を、送る前に検査する**（作業単位 D-21 / ADR-0060 §決定3）。**便宜で、権威はサーバの 422。**
  *
  * | 欄 | 止める | 結びつける欄 |
  * |---|---|---|
  * | 繰り返しの罰（両面） | 数として読めない・0.5〜2.0 の外（端は通す） | その面の `repeat_penalty` |
  * | 返答の上限（本文の面） | 数字だけでない・0・正確に送れない桁数・**同じ面に書いた窓以上** | 本文の面の `response_tokens` |
+ * | 終わりのトークン（本文の面） | 片方だけ書いた・番号が読めない・値が読めないか `-10` 以上 `0` 未満の外（[`readEndToken`]） | 本文の面の `end_token` / `end_token_bias` |
  *
  * **同じ面に窓を書いていなければ、窓とは比べない**（照会した窓との組は実行時に既定へ戻して `warn` を出す / ADR-0059 §決定2）。
  * 窓の欄が読めない形なら比べない（[`contextTokensFailure`] が先に止める）。
@@ -795,6 +904,10 @@ export function samplingFailure(draft: ProfileDraft): SaveFailure | null {
     const window = readContextTokens(draft.main.context_tokens);
     if (room.value !== null && window.kind === "value" && window.value !== null && room.value >= window.value) {
       return fail(RESPONSE_TOKENS_NOT_BELOW_WINDOW);
+    }
+    const ended = readEndToken(draft.main);
+    if (ended.kind === "bad") {
+      return { kind: "field", face, key: ended.key, message: ended.message };
     }
   }
   return null;
@@ -834,7 +947,25 @@ export const THINKING_NOTE =
 
 /** **保存しただけでは効かないことの案内**（ADR-0060 §決定3 の最後の段 —— 今の画面の案内に揃える）。 */
 export const SAMPLING_APPLY_NOTE =
-  "思考・返答の上限・繰り返しの罰は、保存しただけでは動いている上流に効きません。同じ名前へ切り替え直すと効きます。";
+  "思考・返答の上限・繰り返しの罰・終わりのトークンは、保存しただけでは動いている上流に効きません。同じ名前へ切り替え直すと効きます。";
+
+/**
+ * **終わりのトークンの番号の欄の説明**（ADR-0066 §決定3 / 作業単位 A-22b。利用者の要望で、欄ごとの説明にした）。
+ *
+ * 番号が「調整する値」ではなく「モデルごとに決まった1つの値」であること、外れた番号の害、確かめたモデルの番号を言う。
+ * **例の番号は、測ったモデルの名前（系統）と並べて出す**（利用者の要望。番号だけを例として出すと、別のモデルにそのまま写される）。
+ * 画面の欄の注記と同じ出し方（欄の下の `p.note`。欄の説明として結ぶ —— `UpstreamProfiles.svelte` の `field`）。
+ */
+export const END_TOKEN_NOTE =
+  "モデルが「返答はここで終わり」を表す印（トークン）の番号です。数の大小に意味は無く、モデルごとに決まった値を1つ書きます。増やしたり減らしたりするものではありません。違う番号を書くと、別の文字を出しにくくしてしまいます。Qwen3.8-Flash-Next で確かめた番号は 248046 です。モデルを替えたら、そのモデルの番号に書き直してください。";
+
+/**
+ * **終わりのトークンに足す値の欄の説明**（ADR-0066 §決定2・§決定3 / 作業単位 A-22b）。強さの向き・測った値・いつ掛かるか・
+ * 範囲は柵、を言う。
+ *
+ * 測った値（-1.5 / -3 / -5）は1つのモデルと1つのキャラクターでの観測で、勧める値ではない（「測った範囲では」と言う）。
+ */
+export const END_TOKEN_BIAS_NOTE = `終わりの印をどれだけ出しにくくするかです。0 に近いほど弱く、小さく（マイナスに大きく）するほど返答が長くなります。測った範囲では、-1.5 では足りず、-3 で縮んだ会話が戻り、-5 ではキャラクターらしくない一文が出ました。キャラクターに返答の長さの目安があり、その会話の返答が一度でも目安の下限を割ったときだけ、その会話の間ずっと掛かります（裏方には送りません）。値は ${END_TOKEN_BIAS_MIN} 以上 0 未満の数で書けます。この範囲は、壊れた値と打ち損じを止めるための柵で、勧める範囲ではありません。番号と値を両方空にすると書きません。`;
 
 /**
  * **宛先のパス（末尾の `/` を除く）の最後の区切りが、ちょうど `v1` か**（作業単位 B-68 / Issue origin#97）。
@@ -940,9 +1071,11 @@ function faceOfDraft(draft: ProfileDraft, face: Face): WrittenFaceRequest {
  * |---|---|
  * | 思考が「入れる」（本文の面だけ） | `reasoning_effort: "low"`（「切る」は書かない —— `"none"` を書かない） |
  * | 繰り返しの罰が空でない | `repeat_penalty`（数） |
+ * | 終わりのトークンの番号と値が両方書いてある（本文の面だけ） | `end_token_bias: { token, bias }`（ADR-0066 §決定3） |
  *
  * **丸ごと置き換わる**（サーバは鍵ごとに合成しない）ので、**ここが書ける鍵の集合は、読み込みの `SAMPLING_KEYS` と一致していなければ
  * ならない**（見張り番は `tests/upstream-profiles.test.ts` の「画面のサンプリングの欄の鍵は `SAMPLING_KEYS` と一致する」）。
+ * **繰り返しの罰だけを直した保存でも、下書きに入っている終わりのトークンを載せる**（載せないと、手で書いた値が知らせずに消える）。
  */
 function samplingRequest(draft: ProfileDraft, face: Face): WrittenSampling | null {
   const sampling: WrittenSampling = {};
@@ -952,6 +1085,12 @@ function samplingRequest(draft: ProfileDraft, face: Face): WrittenSampling | nul
   }
   if (face === "main" && draft.main.reasoning_effort === "low") {
     sampling.reasoning_effort = "low";
+  }
+  if (face === "main") {
+    const ended = readEndToken(draft.main);
+    if (ended.kind === "value" && ended.value !== null) {
+      sampling.end_token_bias = ended.value;
+    }
   }
   return Object.keys(sampling).length === 0 ? null : sampling;
 }

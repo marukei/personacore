@@ -62,7 +62,7 @@ use super::error::{ApiError, ErrorBody};
 use super::openapi::ChatCompletionEvent;
 use super::relay::{Redo, Relay, relay_response};
 use super::turn::TurnSink;
-use super::{AppState, counted_plan, openapi, seal, usage};
+use super::{AppState, counted_plan, end_token, openapi, seal, usage};
 use crate::domain::{Character, Handle, ModelSelector, SessionId, SessionRef};
 use crate::llm::{FinishReason, LlmError};
 use crate::prompt::{PromptError, PromptInput};
@@ -216,7 +216,8 @@ pub(super) async fn chat_completions(
     // **新しい値は次のリクエストの組立から効く**（組立中のものには遡らない）。
     // **本文の面の思考の量も同じ1回の読みで取る**（ADR-0059 §決定1）。予算の余白は本文の面の返答の上限
     // （窓が小さければ既定の 1024 / ADR-0059 §決定2）で、下の `max_tokens` の天井にもなる。
-    let (budget, reasoning_effort) = state.budget();
+    // **終わりのトークンを下げる値も同じ読みで取る**（ADR-0066 §決定2。掛けるかは下の 7b で決める）。
+    let (budget, body_face) = state.budget();
 
     // 2. **`max_tokens: 0` は入口で拒否する。** `cap_max_tokens` は上限を切り下げる
     //    関数なので 0 を素通しし、そのまま上流へ「1トークンも生成するな」と送ってしまう。
@@ -338,6 +339,19 @@ pub(super) async fn chat_completions(
         .recent_history(session_id)
         .await
         .map_err(|err| internal(&err, "会話履歴を取得できませんでした"))?;
+    // 7b. **終わりのトークンを下げるか**（ADR-0066 §決定2 / 作業単位 A-22b / `super::end_token`）。
+    //
+    // 本文の面に値があり、キャラクターに目安があり、**その会話の保存済みの返答のどれか1つでも**目安の下限より短いときだけ。
+    // 履歴の窓（上の `history`）ではなく、その会話の全部の返答を見る（窓の外の古い返答で割っていても掛け続ける）。
+    // **上流を呼ぶ前に読む**（読みはトランザクションを取らない）。決めた値は送る本文・封・空の本文の引き直しに同じものが載る。
+    let end_token_bias = end_token::for_turn(
+        state.store(),
+        &character,
+        session_id,
+        body_face.end_token_bias,
+    )
+    .await
+    .map_err(|err| internal(&err, "返答の字数を確かめられませんでした"))?;
 
     // 8. 上流へ送る本文を組む（**数えた計画と封** / ADR-0052 / 作業単位 B-60d-1 / `super::counted_plan`）。
     //
@@ -387,7 +401,9 @@ pub(super) async fn chat_completions(
             temperature: request.temperature,
             max_tokens,
             // **本文の経路だけが思考の量を載せる**（ADR-0059 §決定1 —— 封と送信の本文の両方に載る）。
-            reasoning_effort,
+            reasoning_effort: body_face.reasoning_effort,
+            // **本文の経路だけが、条件が揃った回にだけ載せる**（ADR-0066 §決定2 —— 裏方は `ChatRequest::background` で常に `None`）。
+            end_token_bias,
         },
         &PromptInput {
             character: &character,

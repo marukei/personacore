@@ -15,7 +15,7 @@ use sqlx::sqlite::SqliteRow;
 
 use super::{Store, StoreError};
 use crate::domain::{
-    CharacterId, HISTORY_READ_CAP, Message, MessageId, NewMessage, Role, SessionId,
+    CharacterId, HISTORY_READ_CAP, Message, MessageId, NewMessage, ResponseLength, Role, SessionId,
     first_turn_to_read, memory_boundary_turn,
 };
 
@@ -376,6 +376,24 @@ const SELECT_TURN_END_TIME: &str = "SELECT created_at FROM message WHERE session
 
 /// **セッションの作成時刻**（区切りがまだ無いときの境 / ADR-0064 §決定1）。
 const SELECT_SESSION_CREATED_AT: &str = "SELECT created_at FROM session WHERE id = ?";
+
+/// **下限を割りうる返答の生の出力**（ADR-0066 §決定2 / 作業単位 A-22b / [`Store::shortest_reply_short_of`]）。
+///
+/// `?1` = セッション id / `?2` = 応答の役割の綴り（`role_to_db(Role::Assistant)`）/
+/// `?3` = バイト数の上限（**これ未満**。下限の字数の4倍）。
+///
+/// # バイト数で絞ってから、字数は Rust で数える
+///
+/// **SQLite の `length()` は TEXT を最初の NUL までしか数えない**（2026-11-19 に `sqlite3` で確かめた ——
+/// `'あい' || char(0) || 'うえお'` が 2）。上流の出力は NUL を含みうる（JSON の `\u0000`）ので、`length()` の最小を
+/// 字数にすると、NUL の手前で切れた数で「割った」と読む。**バイト数（`CAST … AS BLOB`）は NUL も数える。**
+/// UTF-8 の1字は4バイト以下なので、**下限より少ない字数の返答は、必ず下限の4倍より少ないバイト数**で、
+/// ここで落ちることは無い（落ちるのは割っていない返答だけ）。
+const SELECT_REPLIES_UNDER_BYTES: &str = "SELECT raw_content FROM message \
+     WHERE session_id = ?1 AND role = ?2 AND length(CAST(raw_content AS BLOB)) < ?3";
+
+/// UTF-8 の1字の最大のバイト数（[`SELECT_REPLIES_UNDER_BYTES`] の絞り込み）。
+const UTF8_MAX_BYTES_PER_CHAR: i64 = 4;
 
 impl Store {
     /// セッションを作成し、作成した行の id を返す（`aoi@new` の意味論）。
@@ -861,6 +879,42 @@ impl Store {
             .await
             .map_err(StoreError::Query)?;
         u32::try_from(counted).map_err(|_| StoreError::InvalidStoredValue)
+    }
+
+    /// **その会話の保存済みの返答に、目安の下限を割ったものがあれば、その中で最も短い字数**
+    /// （[ADR-0066](../../docs/adr/0066-the-end-token-is-lowered-once-a-session-has-shrunk.md) §決定2 / 作業単位 A-22b）。
+    /// 割った返答が無ければ `None`。
+    ///
+    /// * **数えるのは応答（`assistant`）だけ**で、利用者の発言は数えない。**このセッションのものだけ**
+    ///   （同じキャラクターの別の会話の返答では割ったことにならない）。
+    /// * 字数は `raw_content` の Unicode のスカラー値の数（`str::chars` の数）。割ったかは
+    ///   [`ResponseLength::falls_short`]（`<`。下限ちょうどは割っていない）。
+    /// * **全部の返答を見る**（履歴の窓 —— [`Store::recent_history`] —— の外の古い返答も）。一度割ったら、その会話の間は
+    ///   割ったまま（ADR-0066 §決定2 の「一度割ったら掛け続ける」）。**状態を持たない**（毎回、保存済みの返答から決める）。
+    ///
+    /// **読むだけ。トランザクションを取らない**（本文の経路が上流を呼ぶ前に読む —— 絶対制約の「トランザクションの中で
+    /// 外部通信を待たない」とは関わらない）。引くのはバイト数で絞った返答だけ（[`SELECT_REPLIES_UNDER_BYTES`]）。
+    pub async fn shortest_reply_short_of(
+        &self,
+        session_id: SessionId,
+        target: ResponseLength,
+    ) -> Result<Option<u32>, StoreError> {
+        let under_bytes = UTF8_MAX_BYTES_PER_CHAR * i64::from(target.min());
+        let replies: Vec<String> = sqlx::query_scalar(SELECT_REPLIES_UNDER_BYTES)
+            .bind(session_id.get())
+            .bind(role_to_db(Role::Assistant))
+            .bind(under_bytes)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(StoreError::Query)?;
+        replies
+            .iter()
+            .map(|raw| raw.chars().count())
+            .filter(|chars| target.falls_short(*chars))
+            .min()
+            // **下限（9999 以下）より少ない数なので `u32` に収まる。** それでも `as` で切り詰めない。
+            .map(|chars| u32::try_from(chars).map_err(|_| StoreError::InvalidStoredValue))
+            .transpose()
     }
 
     /// **その応答の往復が、会話の何往復目か**（最初の往復が 1 / 作業単位 A-12c-1）。

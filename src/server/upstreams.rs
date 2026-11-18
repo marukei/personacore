@@ -65,7 +65,7 @@ use serde_json::Value as JsonValue;
 
 use super::config::{ENV_LLM_ENDPOINT, ENV_MAIN_MODEL, ENV_SUB_LLM_ENDPOINT, ENV_SUB_MODEL};
 use crate::llm::{ApiKey, endpoint_for_log, endpoint_has_userinfo};
-use crate::llm::{ReasoningEffort, RepeatPenalty, Sampling};
+use crate::llm::{EndTokenBias, ReasoningEffort, RepeatPenalty, Sampling};
 
 /// 上流プロファイルの既定のファイル名。**DB と同じディレクトリに置く**（ADR-0042 §決定1）。
 ///
@@ -148,21 +148,34 @@ pub const RESPONSE_TOKENS_KEY: &str = FACE_KEYS[9];
 
 /// **[`SAMPLING_KEY`] の中で書ける鍵**（ADR-0058 §決定1 / ADR-0059 §決定1）。**これ以外は綴りを挙げて止める。**
 ///
-/// **いまは `repeat_penalty` と `reasoning_effort`。** サンプラの残りの4つ（`top_k` / `top_p` / `min_p` / `presence_penalty`）は、
+/// **いまは `repeat_penalty` と `reasoning_effort` と `end_token_bias`**（3つ目は ADR-0066 §決定1 / 作業単位 A-22b）。
+/// サンプラの残りの4つ（`top_k` / `top_p` / `min_p` / `presence_penalty`）は、
 /// 外すと壊れることを測ってから ADR-0058 に追記して足す —— それまでは知らない鍵として止める
 /// （書いたのに効かない値を作らない）。
 ///
-/// **面で共通の一覧**（知らない鍵の判定はどちらの面でも同じ）。**`reasoning_effort` は `main` 面だけ**で、
-/// `sub` 面に書いたら知らない鍵とは別の理由（[`ShapeReason::MainFaceOnly`]）で止める（[`REASONING_EFFORT_KEY`]）。
+/// **面で共通の一覧**（知らない鍵の判定はどちらの面でも同じ）。**`reasoning_effort` と `end_token_bias` は `main` 面だけ**で、
+/// `sub` 面に書いたら知らない鍵とは別の理由（[`ShapeReason::MainFaceOnly`]）で止める（[`REASONING_EFFORT_KEY`] /
+/// [`END_TOKEN_BIAS_KEY`]）。
 ///
 /// **⚠ 鍵を足すなら、画面の欄も同じ作業単位で足すこと**（ADR-0060 §決定4 / [`FACE_KEYS`] の doc）。
 /// **⚠ 綴りは直書きで並べること** —— 画面の見張り番（`web/tests/upstream-profiles.test.ts`）がこの宣言の文字列リテラルを読む。
-pub const SAMPLING_KEYS: [&str; 2] = ["repeat_penalty", "reasoning_effort"];
+pub const SAMPLING_KEYS: [&str; 3] = ["repeat_penalty", "reasoning_effort", "end_token_bias"];
 
 /// **本文の面の思考の量の鍵**（[`SAMPLING_KEY`] の中 / ADR-0059 §決定1 / 作業単位 A-18a）。値は `"none"` / `"low"`。
 ///
 /// **`main` 面だけに書ける**（裏方は常に `"none"` を送る）。**綴りを写さず、[`SAMPLING_KEYS`] から取る。**
 pub const REASONING_EFFORT_KEY: &str = SAMPLING_KEYS[1];
+
+/// **終わりのトークンを下げる値の鍵**（[`SAMPLING_KEY`] の中 / ADR-0066 §決定1 / 作業単位 A-22b）。
+/// 値は `{"token": <番号>, "bias": <負の数>}`（中の鍵は [`END_TOKEN_BIAS_FIELDS`]）。
+///
+/// **`main` 面だけに書ける**（`sub` 面が無い構成でも裏方には送らない）。**綴りを写さず、[`SAMPLING_KEYS`] から取る。**
+pub const END_TOKEN_BIAS_KEY: &str = SAMPLING_KEYS[2];
+
+/// **[`END_TOKEN_BIAS_KEY`] の中で書ける鍵**（両方とも要る）。**これ以外は綴りを挙げて止める。**
+///
+/// **⚠ 綴りは直書きで並べること** —— 画面の写し（`web/src/lib/upstreamProfiles.ts`）がこの2つの綴りで依頼を組む。
+pub const END_TOKEN_BIAS_FIELDS: [&str; 2] = ["token", "bias"];
 
 /// **面に書ける上流への鍵の綴り**（ADR-0056 §決定1 / 作業単位 A-13b-1。[`FACE_KEYS`] の7つ目）。
 ///
@@ -414,7 +427,8 @@ pub enum ShapeReason {
     /// 真偽値であるべき値が真偽値でない（`allow_key_over_plain_http` / 作業単位 A-13b-2）。
     NotABoolean,
     /// `sampling` が使えない（オブジェクトでない・`repeat_penalty` が数でないか範囲の外 / ADR-0058 §決定1・
-    /// `reasoning_effort` が `none` / `low` の外 / ADR-0059 §決定1）。
+    /// `reasoning_effort` が `none` / `low` の外 / ADR-0059 §決定1・`end_token_bias` がオブジェクトでないか、
+    /// `token` / `bias` が無い・範囲の外 / ADR-0066 §決定1）。
     ///
     /// **鍵（[`ProfileShape::key`]）は [`SAMPLING_KEY`]**（画面は理由を、思考と繰り返しの罰の2つの欄の組の見出しに出す /
     /// 作業単位 D-21 —— `reason` だけでは2つのどちらかを区別できない）。
@@ -422,6 +436,7 @@ pub enum ShapeReason {
     /// `sampling` に知らない鍵がある（書けるのは [`SAMPLING_KEYS`] だけ / ADR-0058 §決定1）。
     ///
     /// **まだ書けないサンプラの4つ（`top_k` 等）もここ。** 鍵は [`SAMPLING_KEY`]。
+    /// **`end_token_bias` の中の知らない鍵（[`END_TOKEN_BIAS_FIELDS`] の外）もここ**（ADR-0066 §決定1）。
     UnknownSamplingKey,
     /// `response_tokens` が使えない（整数でない・0・32 bit に収まらない / ADR-0059 §決定2）。
     ///
@@ -430,7 +445,8 @@ pub enum ShapeReason {
     ResponseTokensUnusable,
     /// **本文の面（`main`）にだけ書ける鍵を、裏方の面（`sub`）に書いた**（ADR-0059 §決定1・2 / 作業単位 A-18a）。
     ///
-    /// `response_tokens`（鍵は [`RESPONSE_TOKENS_KEY`]）と `sampling.reasoning_effort`（鍵は [`SAMPLING_KEY`]）。
+    /// `response_tokens`（鍵は [`RESPONSE_TOKENS_KEY`]）と `sampling.reasoning_effort`・`sampling.end_token_bias`
+    /// （鍵は [`SAMPLING_KEY`]）。
     /// **知らない鍵（[`Self::UnknownKey`] / [`Self::UnknownSamplingKey`]）と区別する** —— 綴りは正しく、
     /// 書いた面が違うだけなので、「知らない」と言うと直す先を取り違える。
     MainFaceOnly,
@@ -533,10 +549,10 @@ impl ShapeReason {
             }
             Self::NotABoolean => "真偽値であるべき値が真偽値ではありません",
             Self::SamplingUnusable => {
-                "sampling が使えません（オブジェクトで書き、repeat_penalty は 0.5 以上 2 以下の数、reasoning_effort は none / low で書いてください）"
+                "sampling が使えません（オブジェクトで書き、repeat_penalty は 0.5 以上 2 以下の数、reasoning_effort は none / low、end_token_bias は token（0 以上の整数）と bias（-10 以上 0 未満の数）の組で書いてください）"
             }
             Self::UnknownSamplingKey => {
-                "sampling に知らない鍵があります（書けるのは repeat_penalty / reasoning_effort だけです）"
+                "sampling に知らない鍵があります（書けるのは repeat_penalty / reasoning_effort / end_token_bias だけで、end_token_bias の中は token / bias だけです）"
             }
             Self::ResponseTokensUnusable => {
                 "response_tokens が使えません（1 以上の整数のトークン数で書いてください）"
@@ -724,9 +740,22 @@ pub struct ProfileFace {
     /// **書いた本文の返答の上限**（[`RESPONSE_TOKENS_KEY`] / ADR-0059 §決定2）。**`main` 面だけ。検証済み**（1 以上・
     /// 面の `context_tokens` より小さい）。
     response_tokens: Option<u32>,
+    /// **書いた終わりのトークンを下げる値**（`sampling.end_token_bias` / ADR-0066 §決定1）。**`main` 面だけ。検証済み**
+    /// （`llm::EndTokenBias::parse`）。
+    ///
+    /// **[`Self::sampling`] には入れない**（[`Self::reasoning_effort`] と同じ理由 —— 面の設定は `sub` 面の無い構成で裏方へ写る）。
+    end_token_bias: Option<EndTokenBias>,
 }
 
 impl ProfileFace {
+    /// **この面に書いた終わりのトークンを下げる値**（`sampling.end_token_bias` / ADR-0066 §決定1）。書いていなければ `None`。
+    ///
+    /// **`main` 面だけが持ちうる**（`sub` 面に書いたファイルは読み込みで止まる）。
+    #[must_use]
+    pub const fn end_token_bias(&self) -> Option<EndTokenBias> {
+        self.end_token_bias
+    }
+
     /// **この面に書いた思考の量**（`sampling.reasoning_effort` / ADR-0059 §決定1）。書いていなければ `None`。
     ///
     /// **`main` 面だけが持ちうる**（`sub` 面に書いたファイルは読み込みで止まる）。
@@ -915,6 +944,9 @@ impl UpstreamProfile {
             // 裏方へは写さない（裏方の側の欄を作らない）。
             reasoning_effort: self.main.reasoning_effort,
             response_tokens: self.main.response_tokens,
+            // **終わりのトークンも本文の面だけのもの**（ADR-0066 §決定1 —— `sub` 面が無くても裏方へは写さない。
+            // ADR-0058 §決定1 の「`sub` 面が無ければ `main` の値を裏方にも使う」の例外）。
+            end_token_bias: self.main.end_token_bias,
         }
     }
 }
@@ -955,9 +987,21 @@ pub struct ProfileSettings {
     reasoning_effort: Option<ReasoningEffort>,
     /// **本文の面の返答の上限**（ADR-0059 §決定2）。**裏方の欄は無い**（裏方の上限は変えない）。
     response_tokens: Option<u32>,
+    /// **本文の面の終わりのトークンを下げる値**（ADR-0066 §決定1）。**裏方の欄は無い**（裏方へは送らない）。
+    end_token_bias: Option<EndTokenBias>,
 }
 
 impl ProfileSettings {
+    /// **本文の面の終わりのトークンを下げる値**（`main` 面の `sampling.end_token_bias` / ADR-0066 §決定1）。
+    /// 書いていなければ `None`。
+    ///
+    /// 渡し方は `AppConfig::with_profile_context`（本文の予算の器へ思考の量と一緒に入る）。
+    /// **`sub` 面が無くても裏方へは写さない**（[`Self::sub_sampling`] の規則はこの欄に当てはめない）。
+    #[must_use]
+    pub const fn end_token_bias(&self) -> Option<EndTokenBias> {
+        self.end_token_bias
+    }
+
     /// **本文の面の思考の量**（`main` 面の `sampling.reasoning_effort` / ADR-0059 §決定1）。書いていなければ `None`。
     ///
     /// 渡し方は `AppConfig::with_profile_context`（本文の予算の器へ窓と一緒に入る。環境変数の口は無い）。
@@ -1417,7 +1461,11 @@ fn parse_face(
         }
     };
 
-    let (sampling, reasoning_effort) = parse_sampling(object, profile, label)?;
+    let WrittenSampling {
+        sampling,
+        reasoning_effort,
+        end_token_bias,
+    } = parse_sampling(object, profile, label)?;
 
     let launch = match object.get("gguf") {
         None => None,
@@ -1514,6 +1562,7 @@ fn parse_face(
         sampling,
         reasoning_effort,
         response_tokens,
+        end_token_bias,
     })
 }
 
@@ -1549,19 +1598,23 @@ fn main_face_only(
 /// | `repeat_penalty` が数でない・範囲の外（`llm::REPEAT_PENALTY_MIN` の表） | [`ShapeReason::SamplingUnusable`] |
 /// | **`sub` 面に `reasoning_effort`**（ADR-0059 §決定1） | [`ShapeReason::MainFaceOnly`]（**知らない鍵と区別する**） |
 /// | `reasoning_effort` が文字列でない・`none` / `low` の外 | [`ShapeReason::SamplingUnusable`]（**書ける綴りを挙げる**） |
+/// | **`sub` 面に `end_token_bias`**（ADR-0066 §決定1） | [`ShapeReason::MainFaceOnly`] |
+/// | `end_token_bias` について | [`parse_end_token_bias`] の表 |
 ///
 /// **`{}` は通す**（何も書いていないのと同じ）。**gguf の有無に関わらず書ける**（値はエンジン・モデル・量子化の組に付く）。
-/// 範囲の規則は `llm::RepeatPenalty::parse` が持つ —— ここに写しを作らない（思考の量の綴りは `llm::ReasoningEffort::parse`）。
+/// 範囲の規則は `llm::RepeatPenalty::parse` が持つ —— ここに写しを作らない（思考の量の綴りは `llm::ReasoningEffort::parse`、
+/// 終わりのトークンの強さは `llm::EndTokenBias::parse`）。
 ///
-/// **返り値の2つ目（思考の量）は [`Sampling`] に入れない** —— 面の設定は `sub` 面の無い構成で裏方へ写る
-/// （ADR-0059 §却下した選択肢）。本文の面の値として別に持つ（[`ProfileFace::reasoning_effort`]）。
+/// **思考の量と終わりのトークンは [`Sampling`] に入れない** —— 面の設定は `sub` 面の無い構成で裏方へ写る
+/// （ADR-0059 §却下した選択肢 / ADR-0066 §決定1）。本文の面の値として別に持つ（[`ProfileFace::reasoning_effort`] /
+/// [`ProfileFace::end_token_bias`]）。
 fn parse_sampling(
     object: &serde_json::Map<String, JsonValue>,
     profile: &str,
     label: &'static str,
-) -> Result<(Sampling, Option<ReasoningEffort>), ProfileError> {
+) -> Result<WrittenSampling, ProfileError> {
     let Some(raw) = object.get(SAMPLING_KEY) else {
-        return Ok((Sampling::default(), None));
+        return Ok(WrittenSampling::default());
     };
     let unusable = |detail: String| {
         shape(
@@ -1596,7 +1649,7 @@ fn parse_sampling(
         ));
     }
 
-    let [repeat_penalty_key, reasoning_effort_key] = SAMPLING_KEYS;
+    let [repeat_penalty_key, reasoning_effort_key, end_token_bias_key] = SAMPLING_KEYS;
     // **思考の量は本文の面だけ**（ADR-0059 §決定1）。**知らない鍵の判定の後に見る** —— 綴りが正しいことを
     // 先に確かめてから、書いた面が違うと言う。
     let reasoning_effort =
@@ -1636,10 +1689,107 @@ fn parse_sampling(
                 },
             )?),
         };
-    Ok((
-        repeat_penalty.map_or_else(Sampling::default, Sampling::with_repeat_penalty),
+    // **終わりのトークンも本文の面だけ**（ADR-0066 §決定1）。思考の量と同じく、知らない鍵の判定の後に見る。
+    let end_token_bias = match fields.get(end_token_bias_key) {
+        None => None,
+        Some(_) if label != MAIN_FACE => {
+            return Err(main_face_only(
+                profile,
+                label,
+                SAMPLING_KEY,
+                &format!("{SAMPLING_KEY} の {end_token_bias_key}"),
+            ));
+        }
+        Some(value) => Some(parse_end_token_bias(value, profile, label)?),
+    };
+    Ok(WrittenSampling {
+        sampling: repeat_penalty.map_or_else(Sampling::default, Sampling::with_repeat_penalty),
         reasoning_effort,
-    ))
+        end_token_bias,
+    })
+}
+
+/// **面の `sampling` から読んだもの**（[`parse_sampling`] の返り値）。**どれも書いていなければ既定**（何も置き換えない）。
+#[derive(Debug, Default)]
+struct WrittenSampling {
+    /// 面の設定（裏方へ写りうる値。いまは `repeat_penalty` だけ）。
+    sampling: Sampling,
+    /// 本文の面だけの思考の量（ADR-0059 §決定1）。
+    reasoning_effort: Option<ReasoningEffort>,
+    /// 本文の面だけの終わりのトークンを下げる値（ADR-0066 §決定1）。
+    end_token_bias: Option<EndTokenBias>,
+}
+
+/// **`sampling.end_token_bias` を読む**（ADR-0066 §決定1 / 作業単位 A-22b）。**本文の面の値だけが来る**（面の判定は呼び出し側）。
+///
+/// | 止める | 理由 |
+/// |---|---|
+/// | オブジェクトでない | [`ShapeReason::SamplingUnusable`] |
+/// | 知らない鍵（[`END_TOKEN_BIAS_FIELDS`] の外） | [`ShapeReason::UnknownSamplingKey`]（**綴りを挙げる**） |
+/// | `token` が無い・整数でない・`u32` に収まらない | [`ShapeReason::SamplingUnusable`] |
+/// | `bias` が無い・数でない・範囲の外（`llm::END_TOKEN_BIAS_MIN` の表） | [`ShapeReason::SamplingUnusable`] |
+///
+/// **どちらも省けない**（personacore は番号も強さも既定を持たない —— ADR-0066 §決定1）。鍵は [`SAMPLING_KEY`]。
+fn parse_end_token_bias(
+    value: &JsonValue,
+    profile: &str,
+    label: &'static str,
+) -> Result<EndTokenBias, ProfileError> {
+    let [token_key, bias_key] = END_TOKEN_BIAS_FIELDS;
+    let unusable = |detail: String| {
+        shape(
+            Fault::key(ShapeReason::SamplingUnusable, profile, label, SAMPLING_KEY),
+            format!(
+                "プロファイル '{profile}' の {label} の {SAMPLING_KEY} の {END_TOKEN_BIAS_KEY} が使えません: {detail}"
+            ),
+        )
+    };
+    let JsonValue::Object(fields) = value else {
+        return Err(unusable(format!(
+            "{{\"{token_key}\": 番号, \"{bias_key}\": 負の数}} のオブジェクトで書いてください: {value}"
+        )));
+    };
+    let unknown: Vec<&str> = fields
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !END_TOKEN_BIAS_FIELDS.contains(key))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(shape(
+            Fault::key(
+                ShapeReason::UnknownSamplingKey,
+                profile,
+                label,
+                SAMPLING_KEY,
+            ),
+            format!(
+                "プロファイル '{profile}' の {label} の {SAMPLING_KEY} の {END_TOKEN_BIAS_KEY} に知らない鍵があります: {}\
+                 （書けるのは {} だけです）",
+                unknown.join(", "),
+                END_TOKEN_BIAS_FIELDS.join(" / ")
+            ),
+        ));
+    }
+    let token = fields
+        .get(token_key)
+        .and_then(JsonValue::as_u64)
+        .and_then(|token| u32::try_from(token).ok())
+        .ok_or_else(|| {
+            unusable(format!(
+                "{token_key} は 0 以上 {} 以下の整数（終わりのトークンの番号）で書いてください: {}",
+                u32::MAX,
+                fields.get(token_key).unwrap_or(&JsonValue::Null)
+            ))
+        })?;
+    let bias = fields.get(bias_key).and_then(JsonValue::as_f64);
+    bias.and_then(|bias| EndTokenBias::parse(token, bias))
+        .ok_or_else(|| {
+            unusable(format!(
+                "{bias_key} は {} 以上 0 未満の数で書いてください: {}",
+                crate::llm::END_TOKEN_BIAS_MIN,
+                fields.get(bias_key).unwrap_or(&JsonValue::Null)
+            ))
+        })
 }
 
 /// **面の鍵を読む**（ADR-0056 §決定1・5 / 作業単位 A-13b-1・A-13b-2）。書いていなければ `None`。
@@ -2761,6 +2911,12 @@ mod tests {
                 "response_tokens",
                 "response_tokens",
             ),
+            // **終わりのトークンも本文の面だけ**（ADR-0066 §決定1 / 作業単位 A-22b）。
+            (
+                serde_json::json!({ "sampling": { "end_token_bias": { "token": 248_046, "bias": -3.0 } } }),
+                "sampling",
+                "end_token_bias",
+            ),
         ] {
             let source = serde_json::json!({ "p": {
                 "main": a18a_face(1, "m", &serde_json::json!({})),
@@ -2789,6 +2945,167 @@ mod tests {
             .to_string();
             parse_profiles(&source, None)
                 .unwrap_or_else(|err| panic!("本文の面なら通ること（{extra}）: {err:?}"));
+        }
+    }
+
+    /// **本文の面は終わりのトークンを下げる値を読み、面の設定（裏方へ写りうる値）には入れない**
+    /// （ADR-0066 §決定1 / 作業単位 A-22b）。
+    ///
+    /// | 書いたもの | 本文の面の値 | 面の設定（本文・裏方） |
+    /// |---|---|---|
+    /// | `end_token_bias` だけ | 番号と強さ | 既定（**`sub` 面が無くても裏方へ写らない**） |
+    /// | `repeat_penalty` と一緒に | 番号と強さ | 罰だけが入る（片方が片方を消さない） |
+    /// | 書かない | `None` | 既定 |
+    ///
+    /// 期待値は手で書く（番号 248046・強さ -3 と -1.5）。強さは `f32` に落とした値で比べる。
+    #[test]
+    fn the_main_face_reads_its_end_token_bias_and_never_puts_it_in_the_sampling() {
+        use crate::llm::{EndTokenBias, RepeatPenalty, Sampling};
+
+        let source = serde_json::json!({
+            "lowered": { "main": a18a_face(1, "m", &serde_json::json!({
+                "sampling": { "end_token_bias": { "token": 248_046, "bias": -3.0 } } })) },
+            "both": { "main": a18a_face(1, "m", &serde_json::json!({
+                "sampling": { "repeat_penalty": 1.05,
+                              "end_token_bias": { "bias": -1.5, "token": 2 } } })) },
+            "plain": { "main": a18a_face(1, "m", &serde_json::json!({})) },
+        })
+        .to_string();
+        let profiles = parse_profiles(&source, None).expect("読めること");
+        let penalty = Sampling::with_repeat_penalty(RepeatPenalty::parse(1.05).expect("範囲の中"));
+        for (name, written, sampling) in [
+            ("lowered", Some((248_046, -3.0_f32)), Sampling::default()),
+            ("both", Some((2, -1.5_f32)), penalty),
+            ("plain", None, Sampling::default()),
+        ] {
+            let profile = profiles.select(name).expect("在ること");
+            let settings = profile.settings();
+            let read = |value: Option<EndTokenBias>| value.map(|bias| (bias.token(), bias.bias()));
+            assert_eq!(
+                read(profile.main().end_token_bias()),
+                written,
+                "{name} の面"
+            );
+            assert_eq!(read(settings.end_token_bias()), written, "{name} の設定");
+            assert_eq!(
+                (settings.sampling(), settings.sub_sampling()),
+                (sampling, sampling),
+                "{name}: 終わりのトークンは面の設定に入らない（裏方へ写らない）"
+            );
+        }
+    }
+
+    /// **`end_token_bias` の形と範囲**（ADR-0066 §決定1 / 作業単位 A-22b）。止めるときは理由と鍵の名前を挙げる。
+    ///
+    /// | 書いたもの | 理由 | 文面が挙げるもの |
+    /// |---|---|---|
+    /// | オブジェクトでない | `SamplingUnusable` | `end_token_bias` |
+    /// | 知らない鍵（`tokens` 等） | `UnknownSamplingKey` | その綴りと `token / bias` |
+    /// | `token` が無い・負・小数・文字列・32 bit の外 | `SamplingUnusable` | `token` |
+    /// | `bias` が無い・0・正・-10 より下・文字列 | `SamplingUnusable` | `bias` と `-10` |
+    ///
+    /// **対照**: 端の値（`token` 0 と `u32::MAX`、`bias` -10 と -0.001）は通る。鍵はどれも `sampling`、面は `main`。
+    #[test]
+    fn an_end_token_bias_out_of_shape_is_refused_naming_the_key() {
+        use serde_json::json;
+        for value in [
+            json!({ "token": 0, "bias": -10.0 }),
+            json!({ "token": u32::MAX, "bias": -0.001 }),
+            json!({ "token": 248_046, "bias": -3 }),
+        ] {
+            let source = json!({ "p": { "main": a18a_face(1, "m", &json!({
+                "sampling": { "end_token_bias": value.clone() } })) } })
+            .to_string();
+            parse_profiles(&source, None).unwrap_or_else(|err| panic!("{value} は通る: {err:?}"));
+        }
+        for (value, reason, named) in [
+            (
+                json!(248_046),
+                ShapeReason::SamplingUnusable,
+                "end_token_bias",
+            ),
+            (
+                json!([248_046, -3.0]),
+                ShapeReason::SamplingUnusable,
+                "end_token_bias",
+            ),
+            (json!(null), ShapeReason::SamplingUnusable, "end_token_bias"),
+            (
+                json!({ "tokens": 248_046, "bias": -3.0 }),
+                ShapeReason::UnknownSamplingKey,
+                "tokens",
+            ),
+            (
+                json!({ "token": 248_046, "bias": -3.0, "logit": 1 }),
+                ShapeReason::UnknownSamplingKey,
+                "token / bias",
+            ),
+            (
+                json!({ "bias": -3.0 }),
+                ShapeReason::SamplingUnusable,
+                "token",
+            ),
+            (
+                json!({ "token": -1, "bias": -3.0 }),
+                ShapeReason::SamplingUnusable,
+                "token",
+            ),
+            (
+                json!({ "token": 1.5, "bias": -3.0 }),
+                ShapeReason::SamplingUnusable,
+                "token",
+            ),
+            (
+                json!({ "token": "248046", "bias": -3.0 }),
+                ShapeReason::SamplingUnusable,
+                "token",
+            ),
+            (
+                json!({ "token": u64::from(u32::MAX) + 1, "bias": -3.0 }),
+                ShapeReason::SamplingUnusable,
+                "token",
+            ),
+            (
+                json!({ "token": 248_046 }),
+                ShapeReason::SamplingUnusable,
+                "bias",
+            ),
+            (
+                json!({ "token": 248_046, "bias": 0.0 }),
+                ShapeReason::SamplingUnusable,
+                "bias",
+            ),
+            (
+                json!({ "token": 248_046, "bias": 3.0 }),
+                ShapeReason::SamplingUnusable,
+                "bias",
+            ),
+            (
+                json!({ "token": 248_046, "bias": -10.5 }),
+                ShapeReason::SamplingUnusable,
+                "-10",
+            ),
+            (
+                json!({ "token": 248_046, "bias": "-3" }),
+                ShapeReason::SamplingUnusable,
+                "bias",
+            ),
+        ] {
+            let source = json!({ "p": { "main": a18a_face(1, "m", &json!({
+                "sampling": { "end_token_bias": value.clone() } })) } })
+            .to_string();
+            let err = parse_profiles(&source, None).expect_err(&value.to_string());
+            let shape = err.shape().expect("形の不正であること");
+            assert_eq!(
+                (shape.reason(), shape.face(), shape.key()),
+                (reason, Some("main"), Some("sampling")),
+                "{value}"
+            );
+            let message = shape.to_string();
+            assert!(
+                message.contains("end_token_bias") && message.contains(named),
+                "鍵の名前を挙げること（{named}）: {message}"
+            );
         }
     }
 

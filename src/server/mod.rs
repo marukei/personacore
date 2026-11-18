@@ -47,6 +47,7 @@ mod context;
 mod counted_plan;
 mod drift;
 mod empty_retry;
+mod end_token;
 mod error;
 mod extract;
 mod fresh;
@@ -523,12 +524,12 @@ impl AppState {
     /// その1リクエストの答え合わせ**（`usage::report`）が別のコンテキスト長と
     /// 突き合わさり、**その回だけ警告が余分に出る／出ない**ことに留まる。
     ///
-    /// # 本文の面の思考の量も、同じ1回の読みで返す（ADR-0059 §決定1 / 作業単位 A-18a）
+    /// # 本文の面の値も、同じ1回の読みで返す（ADR-0059 §決定1 / 作業単位 A-18a・ADR-0066 §決定2 / 作業単位 A-22b）
     ///
-    /// **2つ目は本文の面に書いた `reasoning_effort`**（書いていなければ `None` —— 線は既定の `none`）。
-    /// 予算と同じ器・同じ錠から読む（`context::SharedBudget::turn`）ので、切り替えを跨いだ1ターンが
-    /// 「切り替え先の予算と切り替え前の思考の量」で組まれることは無い。**本文の経路だけが読む**（裏方はこの器を見ない）。
-    pub(crate) fn budget(&self) -> (TokenBudget, Option<crate::llm::ReasoningEffort>) {
+    /// **2つ目は本文の面に書いた値**（思考の量 `reasoning_effort` と、終わりのトークンを下げる値 `end_token_bias`。
+    /// 書いていなければ `None`）。予算と同じ器・同じ錠から読む（`context::SharedBudget::turn`）ので、切り替えを跨いだ
+    /// 1ターンが「切り替え先の予算と切り替え前の値」で組まれることは無い。**本文の経路だけが読む**（裏方はこの器を見ない）。
+    pub(in crate::server) fn budget(&self) -> (TokenBudget, config::BodyFace) {
         self.budget.turn()
     }
 

@@ -185,7 +185,14 @@ const STABILITY_EXTENSION: &str = "x-personacore-stability";
 /// `response_length_max`、新しい失敗 400 `response_length_too_small` / `response_length_too_large` /
 /// `response_length_inverted`。応答の欄・要求の任意の欄・応答の `enum` の値・新しい失敗の追加だけなので小さい側。
 /// **省いた依頼の意味は変えていない**（作成は未設定、`PATCH` は残す）。
-pub const API_VERSION: &str = "1.11";
+///
+/// **`1.12`**（作業単位 A-22b / ADR-0066 §決定1・§決定3）: 上流プロファイルの一覧の面（と保存の応答）の `sampling` と、保存の
+/// 依頼の面の `sampling` に、任意の鍵 `end_token_bias`（`{"token", "bias"}`。本文の面だけ）が入った。応答と要求の任意の鍵の
+/// 追加だけなので小さい側。**省いた依頼の意味（残す）と、`sampling` を丸ごと置き換える規則は変えていない**（API `1.11` までの
+/// 使い手が `sampling` を送ると、手で書いた `end_token_bias` は消える —— 読んでから丸ごと送る。英語のガイド）。
+/// 保存の 422 の `key` / `reason` の値は増えていない（`sampling` / `sampling_unusable` / `unknown_sampling_key` / `main_face_only`）。
+/// chat の要求の形は変わらない（`logit_bias` は personacore が上流へ送る欄で、API の欄ではない）。
+pub const API_VERSION: &str = "1.12";
 
 /// **ルータに届いた要求への全部の応答に付ける、API の版のヘッダの名前**
 /// （HTTP では大文字小文字を区別しない。仕様書の `headers` の鍵もこの綴り）。

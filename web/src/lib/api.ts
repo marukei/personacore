@@ -1267,10 +1267,23 @@ export interface WrittenFace {
  * 鍵の集合は読み込みの `SAMPLING_KEYS`（`upstreams.rs`）。**画面が書ける鍵と一致することは見張り番が見る**
  * （`tests/upstream-profiles.test.ts` の「画面のサンプリングの欄の鍵は `SAMPLING_KEYS` と一致する」）。
  * `reasoning_effort` は本文の面だけ（`"none"` / `"low"`）。
+ * `end_token_bias` も本文の面だけ（ADR-0066 §決定1 / 作業単位 A-22b。[`WrittenEndTokenBias`]）。
  */
 export interface WrittenSampling {
   repeat_penalty?: number;
   reasoning_effort?: string;
+  end_token_bias?: WrittenEndTokenBias;
+}
+
+/**
+ * **終わりのトークンを下げる値**（`sampling.end_token_bias` / ADR-0066 §決定1 / 作業単位 A-22b）。**両方とも要る。**
+ *
+ * 鍵の集合は読み込みの `END_TOKEN_BIAS_FIELDS`（`upstreams.rs`）。`token` は終わりのトークンの番号（0 以上の整数）、
+ * `bias` は足す値（`-10` 以上 `0` 未満）。**番号はモデルごとに違い、personacore は既定を持たない。**
+ */
+export interface WrittenEndTokenBias {
+  token: number;
+  bias: number;
 }
 
 /**

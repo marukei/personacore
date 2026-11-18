@@ -201,7 +201,7 @@ itself. It is served with `--no-ui` too, because it is part of the API, not of t
 carries the API version:
 
 ```
-x-personacore-api-version: 1.11
+x-personacore-api-version: 1.12
 ```
 
 That includes errors, 404 and 405 responses, the event stream and `/openapi.json`.
@@ -642,6 +642,24 @@ background side (`sub`), the profile is refused (reason `main_face_only`). Both 
 profile when you switch, and the startup and switch log says what is sent (whether the
 upstream actually thought is not something personacore can see).
 
+The chat side (`main`) can also lower the end token in conversations that have shrunk
+(`"sampling": { "end_token_bias": { "token": 248046, "bias": -3.0 } }` in `upstreams.json`;
+see ADR-0066). `token` is the number of the model's end token (an integer from 0 to
+2^32−1) and `bias` is added to its logit (a number from −10 up to, but not including, 0).
+personacore has no default for either: the number depends on the model's tokenizer, and
+248046 is the end token of the one model this was measured on (Qwen3.8-Flash-Next). Check
+the number for your model before writing it. Both are required; a
+missing or out-of-range value is refused with reason `sampling_unusable`, a key other than
+`token` and `bias` with reason `unknown_sampling_key`, and the key written on the background
+side with reason `main_face_only`. personacore sends `logit_bias` (`{"<token>": <bias>}`)
+with a chat request only when all of these hold: the side has `end_token_bias`, the
+character has a response length target (see [Response length target](#response-length-target)),
+and at least one stored reply of **that conversation** has fewer characters (Unicode scalar
+values of the reply as received) than the target's lower bound. Once that is true, it stays
+true for the rest of the conversation. Background work never gets it, even when the profile
+has no background side, and the chat request is otherwise unchanged. It follows the profile
+when you switch.
+
 The profile API carries `sampling` and `response_tokens` on each side of a profile.
 `GET /admin/upstream/profiles` always lists both: `sampling` holds only the keys written
 (for example `{ "repeat_penalty": 1.0, "reasoning_effort": "low" }`), and is `null` when
@@ -912,7 +930,7 @@ header.
 
 ## Versioning and compatibility
 
-The current API version is `1.11`.
+The current API version is `1.12`.
 
 The API version is kept separately from the application version and is stated in the
 OpenAPI document (`info.version`) and in the `X-Personacore-Api-Version` header. The
@@ -948,6 +966,15 @@ segment (such as `v1`) into the paths under `/admin`.
   working; requests that reached personacore some other way (for example through another
   host name) may start to be refused within `1.x`. The `Host` / `Origin` checks were added
   this way.
+
+Changes in `1.12` (from `1.11`): `sampling` on the chat side (`main`) of a profile, in the
+profile list, in the response to a save and in a save request, can hold a new optional key,
+`end_token_bias` (`{"token": …, "bias": …}`; see
+[Upstream inference servers](#upstream-inference-servers)). No `key` or `reason` value was added: a value that
+is not usable is refused with the existing `sampling_unusable`, `unknown_sampling_key` and
+`main_face_only`. `sampling` is still replaced as a whole when a save sends it, so a client
+written for `1.11` that sends `sampling` removes an `end_token_bias` written by hand; read the
+profile list and send the whole object back. Chat requests are unchanged.
 
 Changes in `1.11` (from `1.10`): a character has a new field, `response_length` (an object
 `{"min": …, "max": …}` or `null`), in responses, and `POST /admin/characters` and

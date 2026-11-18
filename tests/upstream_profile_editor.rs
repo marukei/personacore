@@ -2096,6 +2096,111 @@ async fn a_long_decimal_repeat_penalty_is_saved_without_a_verify_failure() {
     server.stop().await;
 }
 
+/// **手で書いた終わりのトークンを下げる値（`sampling.end_token_bias`）は、画面から保存しても残る**
+/// （[ADR-0066](../docs/adr/0066-the-end-token-is-lowered-once-a-session-has-shrunk.md) §決定3 / ADR-0058 §決定6 の形 /
+/// 作業単位 A-22b）。
+///
+/// | 回 | 依頼 | ファイルの本文の面の `sampling` |
+/// |---|---|---|
+/// | 1 | `model` だけを直す（`sampling` は送らない —— API 1.11 までの使い手） | **そのまま残る** |
+/// | 2 | **画面と同じ形**: 一覧で読んだ値を下書きに入れ、`repeat_penalty` だけを 0.9 に直して `sampling` を丸ごと送る | `repeat_penalty` だけが変わり、**`end_token_bias` が残る** |
+///
+/// **一覧は書いた値をそのまま返す**（`{"token", "bias"}`。既定で埋めない）。画面は `sampling` を丸ごと置き換えるので、
+/// 画面が欄を持たなければ回2で消える —— 画面の側の見張り番は `web/tests/upstream-profiles.test.ts`。
+#[tokio::test]
+async fn a_hand_written_end_token_bias_survives_a_save_from_the_screen() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let written = json!({ "token": 248_046, "bias": -3.0 });
+    let source = json!({
+        "lowered": {
+            "main": { "endpoint": "http://127.0.0.1:47991", "model": "lowered-main",
+                      "sampling": { "repeat_penalty": 1.05, "end_token_bias": written } }
+        }
+    });
+    let path = write_by_hand(dir.path(), &source);
+    let server = serve(dir.path(), |s| s.with_editable_profiles_file(path.clone())).await;
+    let listing = list(server.port).await;
+    let listed = profile_named(&listing, "lowered")["main"]["sampling"].clone();
+    assert_eq!(
+        listed,
+        json!({ "repeat_penalty": 1.05, "end_token_bias": written }),
+        "一覧が書いた値を返していない: {listing}"
+    );
+
+    // 1. **`sampling` を送らない保存**（`model` だけを直す）。
+    let main = face("http://127.0.0.1:47991", "lowered-main-2", None, None, None);
+    let (status, first) = save(
+        server.port,
+        "lowered",
+        &json!({ "revision": listing["revision"], "main": main }),
+    )
+    .await;
+    assert_eq!(status, 200, "{first}");
+    let disk = disk_of(&path);
+    assert_eq!(
+        (
+            &disk["lowered"]["main"]["model"],
+            &disk["lowered"]["main"]["sampling"]
+        ),
+        (
+            &json!("lowered-main-2"),
+            &json!({ "repeat_penalty": 1.05, "end_token_bias": written })
+        ),
+        "sampling を送らない保存で、手で書いた end_token_bias が消えた: {disk}"
+    );
+
+    // 2. **画面と同じ形**: 読んだ `sampling` の `repeat_penalty` だけを直して丸ごと送る。
+    let mut sampling = listed.clone();
+    sampling["repeat_penalty"] = json!(0.9);
+    let (status, second) = save(
+        server.port,
+        "lowered",
+        &json!({
+            "revision": first["revision"],
+            "main": with_fields(main, &json!({ "sampling": sampling })),
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{second}");
+    assert_eq!(
+        disk_of(&path)["lowered"]["main"]["sampling"],
+        json!({ "repeat_penalty": 0.9, "end_token_bias": written }),
+        "repeat_penalty だけを直した保存で end_token_bias が消えた"
+    );
+    server.stop().await;
+}
+
+/// **桁の多い `end_token_bias.bias` を送っても、保存は書き換えた後に 500 にならない**（作業単位 A-22b）。
+///
+/// [`a_long_decimal_repeat_penalty_is_saved_without_a_verify_failure`] と同じ穴が、`sampling` の中のオブジェクトの中にもある
+/// （読み直しの照合が入れ子のオブジェクトを `Value` の等しさで比べると、1 ULP のずれで
+/// `upstream_profiles_verify_failed` になる）。照合はオブジェクトの中の数も意味で比べる。
+#[tokio::test]
+async fn a_long_decimal_end_token_bias_is_saved_without_a_verify_failure() {
+    let dir = tempfile::tempdir().expect("一時ディレクトリ");
+    let path = write_by_hand(dir.path(), &d21_profiles());
+    let server = serve(dir.path(), |s| s.with_editable_profiles_file(path.clone())).await;
+    let listing = list(server.port).await;
+    let body = format!(
+        r#"{{ "revision": {}, "main": {{ "endpoint": "http://127.0.0.1:47973", "model": "mid-main",
+              "context_tokens": 8192,
+              "sampling": {{ "end_token_bias": {{ "token": 248046, "bias": -1.8893261662489246058 }} }} }},
+              "sub": {} }}"#,
+        listing["revision"],
+        mid_sub()
+    );
+    let (status, saved) = save_raw(server.port, "mid", &body).await;
+    assert_eq!(status, 200, "桁の多い bias の保存が通らない: {saved}");
+    let written = disk_of(&path)["mid"]["main"]["sampling"]["end_token_bias"]["bias"]
+        .as_f64()
+        .expect("数で書かれていること");
+    assert!(
+        (written + 1.889_326_166_248_924_6).abs() < 1e-14,
+        "書いた値が送った値から離れている: {written}"
+    );
+    server.stop().await;
+}
+
 /// **依頼の承認（`allow_key_over_plain_http`）は「送らない＝今の規則 / `true`＝承認する / `false`＝外す」**
 /// （作業単位 A-13b-3 / ADR-0056 §決定5）。**一覧はその面に書いた承認を返す。**
 ///

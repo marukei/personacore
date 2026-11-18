@@ -93,7 +93,7 @@ use super::extract::{EXTRACTION_RESPONSE_TOKENS, SubContext};
 use super::seal::{Outcome, PartsTally, Seal, SentPlan, TurnSeal, UncountableMemory};
 use super::upstream::UpstreamFacts;
 use crate::domain::DriftForm;
-use crate::llm::{ChatRequest, LlmClient, ReasoningEffort, TokenCount};
+use crate::llm::{ChatRequest, EndTokenBias, LlmClient, ReasoningEffort, TokenCount};
 use crate::prompt::{
     BudgetPlan, BuiltPrompt, CountedParts, PromptError, PromptInput, TokenBudget,
     build_prompt_quiet, parts_to_count,
@@ -404,6 +404,11 @@ pub(super) struct Turn<'a> {
     /// **封をする本文と送る本文の両方に載る**（[`Self::request_for`] が1つの本文を作り、封もそれで数える ——
     /// チャットテンプレートの出力が変わるので、封は同じ値で作る / ADR-0052）。
     pub(super) reasoning_effort: Option<ReasoningEffort>,
+    /// **終わりのトークンを下げる値**（その会話が目安の下限を割っていたときだけ `Some` /
+    /// ADR-0066 §決定2 / 作業単位 A-22b / `super::end_token`）。
+    ///
+    /// **封をする本文と送る本文の両方に載る**（思考の量と同じ —— [`Self::request_for`] が1つの本文を作る）。
+    pub(super) end_token_bias: Option<EndTokenBias>,
 }
 
 /// 組み上がった1ターン。**`request` は封をしたものか、バイト数の計画そのもの。**
@@ -421,6 +426,7 @@ impl Turn<'_> {
             temperature: self.temperature,
             max_tokens: Some(self.max_tokens),
             reasoning_effort: self.reasoning_effort,
+            end_token_bias: self.end_token_bias,
         }
     }
 
@@ -967,6 +973,7 @@ mod tests {
             temperature: Some(0.5),
             max_tokens: 700,
             reasoning_effort: None,
+            end_token_bias: None,
         }
     }
 
@@ -1046,6 +1053,38 @@ mod tests {
             llm.sealed.lock().expect("ロックを取れること").as_slice(),
             std::slice::from_ref(&planned.request),
             "封をした本文が送る本文と違う（思考の量を落とした？）"
+        );
+    }
+
+    /// **終わりのトークンを下げる値も、送る本文と封をする本文の両方に載る**（ADR-0066 §決定2 / 作業単位 A-22b）。
+    ///
+    /// 空の本文の引き直しは送った本文をそのまま使う（`super::empty_retry`）ので、ここで載れば引き直しにも載る。
+    #[tokio::test]
+    async fn the_end_token_bias_rides_on_both_the_sent_and_the_sealed_request() {
+        let character = character();
+        let input = input(&character);
+        let llm = Parts::new(|_| Ok(TokenCount::Uncountable));
+        let (uncountable, parts) = (UncountableMemory::default(), PartMemory::default());
+        let generation = generation(0);
+        let lowered = EndTokenBias::parse(248_046, -3.0);
+        let turn = Turn {
+            end_token_bias: lowered,
+            ..turn(
+                &llm,
+                &uncountable,
+                &parts,
+                &generation,
+                WindowSharing::SameUpstream,
+            )
+        };
+        let planned = plan_turn(&turn, &input).await.expect("組めること");
+
+        assert!(lowered.is_some(), "前提: 範囲の中の値");
+        assert_eq!(planned.request.end_token_bias, lowered);
+        assert_eq!(
+            llm.sealed.lock().expect("ロックを取れること").as_slice(),
+            std::slice::from_ref(&planned.request),
+            "封をした本文が送る本文と違う（終わりのトークンを落とした？）"
         );
     }
 

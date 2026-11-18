@@ -38,8 +38,8 @@ use super::upstream::{
     name_that_answered,
 };
 use crate::llm::{
-    ApiKey, ChatRequest, ChatStream, Completion, LlmClient, LlmError, LlmFuture, LmStudioClient,
-    ModelId, ReasoningEffort, Sampling, TokenCount,
+    ApiKey, ChatRequest, ChatStream, Completion, EndTokenBias, LlmClient, LlmError, LlmFuture,
+    LmStudioClient, ModelId, ReasoningEffort, Sampling, TokenCount,
 };
 use crate::measured::ModelFace;
 use crate::prompt::TokenBudget;
@@ -849,12 +849,12 @@ impl SharedBudget {
         self.read().body
     }
 
-    /// **1ターンぶんの予算と思考の量を、1回の読みで取る**（`super::chat` の入口 / ADR-0059 §決定1）。
+    /// **1ターンぶんの予算と本文の面の値を、1回の読みで取る**（`super::chat` の入口 / ADR-0059 §決定1・ADR-0066 §決定2）。
     ///
-    /// 別々に読むと、間に切り替えが挟まった回だけ「切り替え先の予算と切り替え前の思考の量」で組む。
-    pub(in crate::server) fn turn(&self) -> (TokenBudget, Option<ReasoningEffort>) {
+    /// 別々に読むと、間に切り替えが挟まった回だけ「切り替え先の予算と切り替え前の思考の量（終わりのトークン）」で組む。
+    pub(in crate::server) fn turn(&self) -> (TokenBudget, BodyFace) {
         let held = self.read();
-        (held.budget.value, held.body.reasoning_effort)
+        (held.budget.value, held.body)
     }
 
     /// **起動で決めた本文の面の値を入れる**（[`PendingRefresh::with_body`] だけが呼ぶ。予算は触らない）。
@@ -2252,6 +2252,14 @@ impl FaceClients {
 /// `response_tokens_fallback_cause`（戻した理由。窓が上限以下 `window_too_small` か、窓が分からない `window_unknown` か。
 /// 戻していなければ `none` / [`response_fallback_of`]）。
 /// 本文の面に書いた `reasoning_effort` は `overridden` にも並ぶ。
+///
+/// # 終わりのトークンを下げる値も言う（ADR-0066 §決定1・§決定2 / 作業単位 A-22b）
+///
+/// **本文の面の行にだけ `end_token_bias`**（書いた値を線の綴り `{"<番号>":<値>}` で。書いていなければ `none`）。
+/// **書いた値は毎回は送らない**（その会話が目安の下限を割った回だけ —— 掛けた往復は別の `info` の行が言う /
+/// `super::end_token`）ので、この行が言うのは「掛けうる値」まで。書いた値は `overridden` にも並ぶ。
+/// 裏方の行には出さない（裏方へは送らない）。
+///
 /// `body` と `budget` は本文の予算の器のいまの中身（起動では組んだ予算、切り替えでは差し替えて外の上流をその場で
 /// 照会し直した後の器 —— 起こす上流はまだ載っていないので、窓が分からないまま言う）。
 /// **これも「送る値」まで** —— 思考が上流で効いたかは言わない。
@@ -2273,6 +2281,12 @@ pub(in crate::server) fn report_samplers(
                 if body.reasoning_effort.is_some() {
                     overridden.push(crate::server::upstreams::REASONING_EFFORT_KEY);
                 }
+                if body.end_token_bias.is_some() {
+                    overridden.push(crate::server::upstreams::END_TOKEN_BIAS_KEY);
+                }
+                let end_token_bias = body
+                    .end_token_bias
+                    .map_or_else(|| "none".to_owned(), EndTokenBias::wire_spelling);
                 tracing::info!(
                     upstream_face = %face.label(),
                     occasion,
@@ -2286,6 +2300,7 @@ pub(in crate::server) fn report_samplers(
                     response_tokens_written = ?body.response_tokens,
                     response_tokens_fallback = fallback,
                     response_tokens_fallback_cause = %cause,
+                    end_token_bias = %end_token_bias,
                     overridden = ?overridden,
                     "{SAMPLERS_LINE}"
                 );
@@ -3373,8 +3388,8 @@ mod tests {
     /// **[`CARRIED_RESPONSE_TOKENS`] を本文の面の上限として書いた形**（作業単位 A-18a）。
     fn carried_body() -> BodyFace {
         BodyFace {
-            reasoning_effort: None,
             response_tokens: Some(CARRIED_RESPONSE_TOKENS),
+            ..BodyFace::default()
         }
     }
 
@@ -6288,8 +6303,8 @@ mod tests {
     /// **本文の面に返答の上限だけを書いた形**（思考の量は書かない）。
     fn a18a_room(room: u32) -> BodyFace {
         BodyFace {
-            reasoning_effort: None,
             response_tokens: Some(room),
+            ..BodyFace::default()
         }
     }
 
@@ -6637,9 +6652,13 @@ mod tests {
         let budget = pending.shared();
         let sub_context = pending.sub_context();
         let upstream = pending.upstream();
+        // **終わりのトークンも同じ器で差し替わる**（ADR-0066 §決定4 の腕8 の下地 / 作業単位 A-22b）。
+        let lowered = crate::llm::EndTokenBias::parse(248_046, -3.0);
+        assert!(lowered.is_some(), "前提: 範囲の中の値");
         let thinking = BodyFace {
             reasoning_effort: Some(ReasoningEffort::Low),
             response_tokens: Some(2_048),
+            end_token_bias: lowered,
         };
         for (body, expected_after_query, expected_effort) in [
             (thinking, 2_048, Some(ReasoningEffort::Low)),
@@ -6659,12 +6678,17 @@ mod tests {
                     body,
                 },
             );
-            let (now, effort) = budget.turn();
+            let (now, read) = budget.turn();
             assert_eq!(
-                (now.context_tokens(), now.response_tokens(), effort),
+                (
+                    now.context_tokens(),
+                    now.response_tokens(),
+                    read.reasoning_effort
+                ),
                 (8_192, 1_024, expected_effort),
                 "{body:?}: 窓が分からない間は既定の 1024"
             );
+            assert_eq!(read, body, "1回の読みで本文の面の値を丸ごと返す");
             assert_eq!(budget.body(), body, "{body:?}");
             assert!(budget.current().on_fallback_window(), "{body:?}");
 
