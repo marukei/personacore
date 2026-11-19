@@ -1,6 +1,6 @@
 # ADR-0066: 会話が目安の下限を一度割ったら、その会話の間は終わりのトークンを下げる
 
-- 状態: **提案**（2026-11-19。利用者の事後承認を待つ。作業単位 A-22b = marukei/personacore#72）
+- 状態: **採用**（2026-11-19 に利用者が事後承認。作業単位 A-22b = marukei/personacore#72）
 - 日付: 2026-11-19
 - 関連: marukei/personacore#69（A-22。返答が縮んで戻らない）/
   [ADR-0065](0065-the-response-length-target-is-a-character-field.md)（返答の長さの目安）/

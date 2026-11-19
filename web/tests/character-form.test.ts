@@ -563,7 +563,15 @@ describe("画面が利用者の言葉で話す（作業単位 F-8）", () => {
     // **F-5 を実際に捕まえているのは `chat-view-empty.test.ts` の `DEVELOPER_WORDS` の側。**
     //
     // **ここが止めるのは「括弧だけ残して中身を落とす」変異**で、それは実在しうる。
-    expect(text).not.toMatch(/（\s*）/);
+    //
+    // **⚠ 定型文のボタン（作業単位 D-22）だけは読む範囲から外す。** 定型文
+    // 「明確な心情描写は（）で囲む。」は、**空の括弧そのものが指示の中身**
+    // （モデルに書かせる記号の形）であり、落ちた中身ではない。
+    // **外すのはその入れ物（`data-output-format-snippets`）だけ**で、他の文面は今までどおり読む。
+    const outsideSnippets = target.cloneNode(true) as HTMLElement;
+    outsideSnippets.querySelector("[data-output-format-snippets]")?.remove();
+    const textOutsideSnippets = (outsideSnippets.textContent ?? "").replace(/\s+/g, " ");
+    expect(textOutsideSnippets).not.toMatch(/（\s*）/);
 
     await unmount(view, { outro: false });
   });
