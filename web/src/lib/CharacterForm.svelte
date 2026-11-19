@@ -25,6 +25,11 @@
     driftModeChoices,
     isKnownDriftModeChoice,
   } from "./driftModeChoice";
+  import {
+    OUTPUT_FORMAT_SNIPPETS,
+    canInsertSnippet,
+    insertSnippet,
+  } from "./outputFormatSnippets";
 
   interface Props {
     /** **`null` は新規作成。** それ以外はその行の編集。 */
@@ -45,6 +50,14 @@
   }
 
   let { character = null, loadDefaultRunMode, onSaved, onClose }: Props = $props();
+
+  /**
+   * **定型文の案内の id**（作業単位 D-22）。ボタンの `aria-describedby` がこれを指す。
+   * **部品ごとに違う値**（`$props.id()`）にしてある —— いまの一覧は1つずつしか出さないが、
+   * 同じ画面に2つ出たときに、ボタンが他人の案内を指さないように。
+   */
+  const componentId = $props.id();
+  const snippetHintId = `${componentId}-output-format-snippets`;
 
   /**
    * **この画面が作った行。**
@@ -165,6 +178,18 @@
    */
   function counterOf(field: LimitedField): string {
     return `${countChars(draft[field])} / ${LIMITS[field]}`;
+  }
+
+  /**
+   * **定型文を「出力形式指示」の末尾に差し込む**（作業単位 D-22 / `outputFormatSnippets.ts`）。
+   *
+   * **下書きの値を書き換えるだけ。** 差し込んだ後は手で打った文と区別しない。
+   * 押せないとき（同じ行がある・上限を超える・保存中）は**ボタンの `disabled` が止める**
+   * （無効のボタンは `click` を出さない）。ここで同じ条件を二重に見ると、
+   * どのテストからも観測できない分岐が残るので置いていない。
+   */
+  function insertOutputFormatSnippet(snippet: string): void {
+    draft.output_format_instruction = insertSnippet(draft.output_format_instruction, snippet);
   }
 
   function messageOf(failure: unknown): string {
@@ -325,6 +350,27 @@
   <p class="hint" data-hint="output_format_instruction">
     返答の書き方の指示です。空にすると未設定に戻ります（この節はプロンプトから落ちます）。
   </p>
+  <!--
+    **よく使う指示を差し込むボタン**（作業単位 D-22）。文面は `outputFormatSnippets.ts`。
+    **⚠ 出典（ADR の番号）を画面に書かないこと**（作業単位 F-8 / `tests/screen-wording.test.ts`）。
+    **「150」は `LIMITS.output_format_instruction` の写し**（判定はそちらを通る / 見張り番は
+    `tests/character-form-output-format-snippets.test.ts`）。
+  -->
+  <p class="hint" data-hint="output_format_snippets" id={snippetHintId}>
+    下のボタンを押すと、その文が欄の末尾に1行で入ります。入れた後は自由に直せます。同じ行がすでにあるときと、入れると 150 字を超えるときは押せません。
+  </p>
+  <div class="snippets" data-output-format-snippets>
+    {#each OUTPUT_FORMAT_SNIPPETS as snippet (snippet)}
+      <button
+        type="button"
+        aria-describedby={snippetHintId}
+        onclick={() => insertOutputFormatSnippet(snippet)}
+        disabled={saving || !canInsertSnippet(draft.output_format_instruction, snippet)}
+      >
+        {snippet}
+      </button>
+    {/each}
+  </div>
 
   <label>
     <span>性格ステータスの尺度</span>
@@ -465,5 +511,13 @@
   /* **見出しの列の幅にそろえて、入力の真下から始める。** */
   .hint {
     margin: 0 0 0.4rem 10.5rem;
+  }
+
+  /* **定型文のボタン**（作業単位 D-22）。案内と同じ列から始め、折り返して並べる。 */
+  .snippets {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin: 0 0 0.6rem 10.5rem;
   }
 </style>
